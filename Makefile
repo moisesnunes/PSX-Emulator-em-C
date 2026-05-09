@@ -2,7 +2,7 @@ CC      = gcc
 CFLAGS  = -std=c11 -Wall -Wextra -O2
 TARGET  = psx
 
-SRCS    = main.c bios.c ram.c cop0.c interconnect.c cpu.c
+SRCS    = main.c bios.c ram.c cop0.c vram.c raster.c gpu.c interconnect.c cpu.c
 OBJS    = $(SRCS:.c=.o)
 
 $(TARGET): $(OBJS)
