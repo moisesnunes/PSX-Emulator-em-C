@@ -27,15 +27,19 @@ em Rust baseada no [psx-guide](https://github.com/simias/psx-guide)
 | 3 | Entrada de exceção | ✅ Feito | pilha de modo KU/IE |
 | 3 | RFE (Return From Exception) | ✅ Feito | |
 | 3 | Cache isolada (bit 16 do SR) | ✅ Feito | |
-| 4 | GPU — registradores GP0/GP1/GPUSTAT | 🔲 Pendente | stubs em `interconnect.c` |
-| 4 | VRAM 1 MB (512×1024 px 16-bit) | 🔲 Pendente | criar `gpu.c` |
-| 4 | Renderização — triângulos flat/Gouraud | 🔲 Pendente | |
-| 4 | Renderização — retângulos e sprites | 🔲 Pendente | |
-| 4 | Texturas e CLUT | 🔲 Pendente | |
-| 4 | Janela via SDL2 | 🔲 Pendente | |
-| 5 | DMA — 7 canais | 🔲 Pendente | criar `dma.c` |
-| 5 | Modo LinkedList (GPU canal 2) | 🔲 Pendente | |
-| 5 | Modo Request (CDROM canal 3) | 🔲 Pendente | |
+| 4 | VRAM 1 MB (1024×512 px 16-bit BGR555) | ✅ Feito | `vram.c` — tipos `Color`, `Vertex`, `TexCoord` |
+| 4 | GPU — registradores GP0/GP1/GPUSTAT/GPUREAD | ✅ Feito | `gpu.c` — máquina de estado com 18 handlers |
+| 4 | Renderização — triângulos flat e Gouraud | ✅ Feito | `raster.c` — half-space (edge functions) |
+| 4 | Renderização — triângulos texturizados | ✅ Feito | `raster.c` — interp. baricêntrica |
+| 4 | Renderização — retângulos flat e texturizados | ✅ Feito | `raster.c` |
+| 4 | Quads (4 vértices → 2 triângulos) | ✅ Feito | `raster.c` |
+| 4 | Texturas e CLUT (4bpp, 8bpp, 15bpp) | ✅ Feito | `raster.c` — `tex_sample_raw()` |
+| 4 | Transferências CPU↔VRAM e VRAM↔VRAM | ✅ Feito | `gpu.c` — `start_cpu_to_vram`, `copy_vram_to_vram` |
+| 4 | Dump de frame em PPM (`frames/frame_NNNN.ppm`) | ✅ Feito | `gpu_dump_frame()` |
+| 4 | Janela de display via SDL2 | 🔲 Pendente | requer `SDL_CreateWindow` + blitter VRAM→textura |
+| 5 | DMA canal 2 GPU — modo LinkedList (stub) | 🚧 Em andamento | gatilho em `interconnect.c`; percurso da lista pendente |
+| 5 | DMA — 7 canais completos | 🔲 Pendente | criar `dma.c` |
+| 5 | DMA modo Request (CDROM canal 3) | 🔲 Pendente | |
 | 6 | Timers — 3 root counters 16-bit | 🔲 Pendente | criar `timers.c` |
 | 6 | IRQ de timer (VBlank / HBlank) | 🔲 Pendente | |
 | 6 | Controlador de interrupções (IRQ) | 🔲 Pendente | |
@@ -58,7 +62,7 @@ em Rust baseada no [psx-guide](https://github.com/simias/psx-guide)
 | Após etapa | O que acontece ao rodar |
 | --------- | ---------------------- |
 | 1–3 | CPU executa a BIOS; stubs imprimem `[GPU]`, `[DMA]`... no terminal; para no primeiro COP2 ou endereço não mapeado |
-| 4 | Logo da Sony e tela do BIOS aparecem na janela SDL2 |
+| 4 (atual) | GPU renderiza na VRAM e salva frames PPM; logo da Sony visível via SDL2 quando implementado |
 | 5 | GPU recebe dados via DMA sem travar a CPU |
 | 6 | VBlank e HSync corretos; BIOS não trava em loop de espera |
 | 7 | Jogos em formato `.bin/.cue` carregam e executam |
@@ -69,7 +73,7 @@ em Rust baseada no [psx-guide](https://github.com/simias/psx-guide)
 
 ## Arquitetura do Hardware
 
-```
+```text
 ┌──────────────────────────────────────────────────────────┐
 │                      PlayStation 1                       │
 │                                                          │
@@ -110,7 +114,7 @@ em Rust baseada no [psx-guide](https://github.com/simias/psx-guide)
 
 ### Conversão de Regiões Virtuais
 
-```
+```text
 KUSEG  0x00000000–0x7fffffff  →  & 0xffffffff  (já físico)
 KSEG0  0x80000000–0x9fffffff  →  & 0x7fffffff
 KSEG1  0xa0000000–0xbfffffff  →  & 0x1fffffff  (uncached)
@@ -190,9 +194,39 @@ KSEG2  0xc0000000–0xffffffff  →  & 0xffffffff
 
 ---
 
+## Comandos GP0 implementados
+
+| Opcode | Primitiva | Handler |
+| ------ | --------- | ------- |
+| `0x02` | Fill VRAM rect | `GP0H_FILL_VRAM` |
+| `0x20–0x23` | Triângulo flat | `GP0H_POLY_FLAT3` |
+| `0x24–0x27` | Triângulo flat + textura | `GP0H_POLY_FLAT_TEX3` |
+| `0x28–0x2b` | Quad flat | `GP0H_POLY_FLAT4` |
+| `0x2c–0x2f` | Quad flat + textura | `GP0H_POLY_FLAT_TEX4` |
+| `0x30–0x33` | Triângulo Gouraud | `GP0H_POLY_GOURAUD3` |
+| `0x34–0x37` | Triângulo Gouraud + textura | `GP0H_POLY_GOURAUD_TEX3` |
+| `0x38–0x3b` | Quad Gouraud | `GP0H_POLY_GOURAUD4` |
+| `0x3c–0x3f` | Quad Gouraud + textura | `GP0H_POLY_GOURAUD_TEX4` |
+| `0x60–0x63` | Retângulo variável flat | `GP0H_RECT_VARIABLE` |
+| `0x64–0x67` | Retângulo variável + textura | `GP0H_RECT_VARIABLE_TEX` |
+| `0x68–0x6b` | Retângulo 1×1 | `GP0H_RECT_1X1` |
+| `0x70–0x73` | Retângulo 8×8 | `GP0H_RECT_8X8` |
+| `0x78–0x7b` | Retângulo 16×16 | `GP0H_RECT_16X16` |
+| `0x80` | Cópia VRAM→VRAM | `GP0H_COPY_VRAM_VRAM` |
+| `0xa0` | Cópia CPU→VRAM | `GP0H_COPY_CPU_VRAM` |
+| `0xc0` | Cópia VRAM→CPU | `GP0H_COPY_VRAM_CPU` |
+| `0xe1` | Draw mode (tex page, semi-trans) | draw setting |
+| `0xe2` | Texture window | draw setting (ignorado) |
+| `0xe3` | Drawing area top-left | draw setting |
+| `0xe4` | Drawing area bottom-right | draw setting |
+| `0xe5` | Drawing offset | draw setting |
+| `0xe6` | Mask bit | draw setting |
+
+---
+
 ## Estrutura do Projeto
 
-```
+```text
 psx_c/
 ├── Makefile
 ├── README.md
@@ -202,9 +236,13 @@ psx_c/
 ├── bios.h / bios.c    ← Loader da BIOS ROM (512 KB, little-endian)
 ├── ram.h  / ram.c     ← RAM principal (2 MB)
 │
+├── vram.h / vram.c    ← VRAM 1024×512×16bpp; tipos Color, Vertex, TexCoord
+├── raster.h / raster.c← Rasterizador software: triângulos, retângulos, texturas
+├── gpu.h  / gpu.c     ← GPU: GP0/GP1, máquina de estado, transferências VRAM
+│
 ├── cop0.h / cop0.c    ← COP0: SR, Cause, EPC, BadVAddr, exceções
 │
-├── interconnect.h     ← System bus: despacha loads/stores
+├── interconnect.h     ← System bus: despacha loads/stores para cada periférico
 ├── interconnect.c
 │
 ├── cpu.h  / cpu.c     ← CPU R3000A: 67 opcodes, delay slots
@@ -214,9 +252,8 @@ psx_c/
 
 ### Arquivos a criar nas próximas etapas
 
-```
-gpu.h  / gpu.c         ← Etapa 4: GP0/GP1, VRAM, SDL2
-dma.h  / dma.c         ← Etapa 5: 7 canais DMA
+```text
+dma.h  / dma.c         ← Etapa 5: 7 canais DMA completos
 timers.h / timers.c    ← Etapa 6: 3 root counters + IRQ
 cdrom.h / cdrom.c      ← Etapa 7: protocolo CD-ROM
 spu.h  / spu.c         ← Etapa 8: 24 vozes ADPCM + SDL2 Audio
@@ -239,13 +276,18 @@ debug.h / debug.c      ← Disassembler MIPS + dump de registradores
 | `panic!()` | unwind + mensagem | `fprintf(stderr) + abort()` |
 | `unreachable!()` | trap em debug | `abort()` |
 | Módulos | `mod cpu { ... }` | arquivos `.h / .c` separados |
+| `Vec<u32>` (gp0_cmd_buf) | heap, crescimento dinâmico | array fixo `uint32_t[12]` + contador |
+| `Vec<u16>` (read_buf VRAM→CPU) | heap | `malloc/free` no `VramTransfer` |
+| Closures no rasterizador | `Fn(i32,i32,i32)->u16` passada para `rasterize()` | funções separadas por variante (flat/Gouraud/tex) |
+| `&mut self` em loads GPU | borrow mútuo implícito | ponteiro não-const em `inter_load32/16` |
 
 ### Convenções adotadas
 
 - **Endianness:** leitura e escrita manuais byte a byte — portável em qualquer arquitetura host.
 - **Registrador $zero:** `reg_set()` sempre força `regs.r[0] = 0` após qualquer escrita.
 - **Load delay slot:** dois campos (`load_delay_reg`, `load_delay_val`) substituem a tupla Rust.
-- **Sem alocação dinâmica:** todos os componentes (BIOS 512 KB, RAM 2 MB) ficam em structs na stack/BSS. O executável ocupa ~2.5 MB de BSS.
+- **Alocação dinâmica:** apenas o buffer de transferência VRAM→CPU usa `malloc/free`. Todos os outros componentes (BIOS 512 KB, RAM 2 MB, VRAM 1 MB) ficam em structs na stack/BSS. O executável ocupa ~3.5 MB de BSS.
+- **Mutabilidade nos loads:** `inter_load32/16` recebem `Interconnect *` (não-const) porque `gpu_gpuread()` consome o buffer de transferência ao ser lido.
 
 ---
 
@@ -268,24 +310,24 @@ make CFLAGS="-std=c11 -Wall -Wextra -g -fsanitize=address,undefined"
 # Tamanho: 524288 bytes (512 KB)
 ```
 
-### Saída atual (Etapas 1–3 concluídas)
+### Saída atual (Etapas 1–4 concluídas, sem SDL2)
 
-```
+```text
 PSX Emulator - Starting
 Loading BIOS: roms/SCPH1001.BIN
 CPU initialized. PC = 0xbfc00000
 Starting emulation loop...
 
-[IRQ] Store32 0x00000000 at offset 0x0 (stub)
-[GPU] GP1 command: 0x00000000
-[GPU] GP1 command: 0x01000000
-[SPU] Store16 0x0000 at offset 0x... (stub)
+[GPU] GP1 Reset
+[GPU] Display OFF
+[GPU] Display mode: 320x240 15bpp
+[GPU] Frame 1 → frames/frame_0001.ppm
 ...
-[CPU] GTE (COP2) not implemented: ...     ← ponto de parada atual
 ```
 
-O emulador para no primeiro uso do GTE, necessário para a animação do logo da Sony.
-A próxima parada natural, após implementar o GTE, seria a ausência de janela gráfica (Etapa 4).
+Os frames PPM são salvos em `frames/` e podem ser visualizados com qualquer
+visualizador de imagens (GIMP, `feh`, `eog`). O próximo passo é integrar SDL2
+para exibir a VRAM em tempo real.
 
 ---
 
