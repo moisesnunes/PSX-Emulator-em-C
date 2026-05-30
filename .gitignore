@@ -1,0 +1,15 @@
+# Build
+src/*.o
+src/*.debug.o
+ps1_boot
+ps1_boot_debug
+
+# BIOS (arquivos de hardware proprietário)
+bios/
+
+# ROMs de teste
+tests/
+
+# Documentação e plano local
+CONTINUAR_PROJETO.md
+guide.tex
