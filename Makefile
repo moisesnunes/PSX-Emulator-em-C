@@ -18,7 +18,9 @@ SRCS = src/main.c         \
        src/spu.c          \
        src/log.c          \
        src/irq.c          \
-       src/scheduler.c
+       src/scheduler.c    \
+       src/timer.c        \
+       src/exe.c
 
 OBJS       = $(SRCS:.c=.o)
 DEBUG_OBJS = $(SRCS:.c=.debug.o)

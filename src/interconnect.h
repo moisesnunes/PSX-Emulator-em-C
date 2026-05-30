@@ -6,6 +6,7 @@
 #include "spu.h"
 #include "irq.h"
 #include "scheduler.h"
+#include "timer.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -17,6 +18,7 @@ typedef struct {
     Spu       spu;
     Irq       irq;
     Scheduler scheduler;
+    Timers    timers;
 } Interconnect;
 
 /* window may be NULL in headless mode; headless skips audio init */

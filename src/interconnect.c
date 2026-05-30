@@ -1,7 +1,9 @@
 #include "interconnect.h"
+#include "timer.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ---- Memory map ---- */
 typedef struct { uint32_t start, length; } Range;
@@ -182,6 +184,7 @@ static void do_dma(Interconnect *inter, Port port) {
 
 /* ---- Init / destroy ---- */
 int interconnect_init(Interconnect *inter, const char *bios_path, SDL_Window *window, bool headless) {
+    memset(inter, 0, sizeof(*inter));
     if (bios_init(&inter->bios, bios_path) != 0) return -1;
     ram_init(&inter->ram);
     dma_init(&inter->dma);
@@ -189,6 +192,7 @@ int interconnect_init(Interconnect *inter, const char *bios_path, SDL_Window *wi
     if (!headless && spu_init(&inter->spu) != 0) return -1;
     irq_init(&inter->irq);
     scheduler_init(&inter->scheduler);
+    timers_init(&inter->timers);
     return 0;
 }
 
@@ -214,7 +218,7 @@ uint32_t interconnect_load32(Interconnect *inter, uint32_t addr) {
             default: fprintf(stderr, "GPU read: %08X\n", off); exit(1);
         }
     }
-    if (range_contains(MAP_TIMERS, abs, &off)) return 0;
+    if (range_contains(MAP_TIMERS, abs, &off)) return timers_load32(&inter->timers, off);
 
     fprintf(stderr, "Unhandled load32: %08X\n", addr);
     exit(1);
@@ -229,6 +233,7 @@ uint16_t interconnect_load16(Interconnect *inter, uint32_t addr) {
     if (range_contains(MAP_SPU, abs, &off)) return spu_load(&inter->spu, abs, off);
     if (range_contains(MAP_RAM, abs, &off)) return ram_load16(&inter->ram, off);
     if (range_contains(MAP_IRQ_CONTROL, abs, &off)) return irq_load16(&inter->irq, off);
+    if (range_contains(MAP_TIMERS, abs, &off)) return timers_load16(&inter->timers, off);
 
     fprintf(stderr, "Unhandled load16: %08X\n", addr);
     exit(1);
@@ -273,7 +278,7 @@ void interconnect_store32(Interconnect *inter, uint32_t addr, uint32_t val) {
             default: fprintf(stderr, "GPU write: %08X = %08X\n", off, val); exit(1);
         }
     }
-    if (range_contains(MAP_TIMERS, abs, &off)) return;
+    if (range_contains(MAP_TIMERS, abs, &off)) { timers_store32(&inter->timers, off, val, &inter->scheduler); return; }
 
     fprintf(stderr, "Unhandled store32: %08X = %08X\n", addr, val);
     exit(1);
@@ -287,7 +292,7 @@ void interconnect_store16(Interconnect *inter, uint32_t addr, uint16_t val) {
 
     if (range_contains(MAP_RAM,  abs, &off)) { ram_store16(&inter->ram, off, val); return; }
     if (range_contains(MAP_SPU,  abs, &off)) { spu_store(&inter->spu, abs, off, val); return; }
-    if (range_contains(MAP_TIMERS, abs, &off)) return;
+    if (range_contains(MAP_TIMERS, abs, &off)) { timers_store16(&inter->timers, off, val, &inter->scheduler); return; }
     if (range_contains(MAP_IRQ_CONTROL, abs, &off)) { irq_store16(&inter->irq, off, val); return; }
 
     fprintf(stderr, "Unhandled store16: %08X = %04X\n", addr, val);

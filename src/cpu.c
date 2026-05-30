@@ -189,7 +189,7 @@ static void decode_and_execute(Cpu *cpu, uint32_t op) {
         case 0x0F: op_lui(cpu, op);   break;
         case 0x10: op_cop0(cpu, op);  break;
         case 0x11: cpu_exception(cpu, EXC_COPROCESSOR_ERROR); break;
-        case 0x12: fprintf(stderr, "Unhandled GTE: %08X\n", op); exit(1); break;
+        case 0x12: /* COP2 / GTE — stub until Milestone 7 */ break;
         case 0x13: cpu_exception(cpu, EXC_COPROCESSOR_ERROR); break;
         case 0x20: op_lb(cpu, op);    break;
         case 0x21: op_lh(cpu, op);    break;
@@ -205,11 +205,11 @@ static void decode_and_execute(Cpu *cpu, uint32_t op) {
         case 0x2E: op_swr(cpu, op);   break;
         case 0x30: cpu_exception(cpu, EXC_COPROCESSOR_ERROR); break;
         case 0x31: cpu_exception(cpu, EXC_COPROCESSOR_ERROR); break;
-        case 0x32: fprintf(stderr, "Unhandled GTE LWC: %08X\n", op); exit(1); break;
+        case 0x32: /* LWC2 / GTE — stub until Milestone 7 */ break;
         case 0x33: cpu_exception(cpu, EXC_COPROCESSOR_ERROR); break;
         case 0x38: cpu_exception(cpu, EXC_COPROCESSOR_ERROR); break;
         case 0x39: cpu_exception(cpu, EXC_COPROCESSOR_ERROR); break;
-        case 0x3A: fprintf(stderr, "Unhandled GTE SWC: %08X\n", op); exit(1); break;
+        case 0x3A: /* SWC2 / GTE — stub until Milestone 7 */ break;
         case 0x3B: cpu_exception(cpu, EXC_COPROCESSOR_ERROR); break;
         default:   op_illegal(cpu, op); break;
     }
