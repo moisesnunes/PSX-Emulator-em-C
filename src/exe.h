@@ -19,14 +19,15 @@
  */
 
 #define PSX_EXE_HEADER_SIZE 0x800
-#define PSX_DEFAULT_SP      0x801FFFF0u
+#define PSX_DEFAULT_SP 0x801FFFF0u
 
-typedef struct {
-    uint32_t pc;
-    uint32_t gp;
-    uint32_t load_addr;
-    uint32_t load_size;
-    uint32_t sp;        /* final SP value, already computed */
+typedef struct
+{
+   uint32_t pc;
+   uint32_t gp;
+   uint32_t load_addr;
+   uint32_t load_size;
+   uint32_t sp; /* final SP value, already computed */
 } PsxExe;
 
 /* Parse header and return info. Does NOT load payload into RAM.

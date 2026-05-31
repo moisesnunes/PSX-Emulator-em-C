@@ -8,7 +8,8 @@
 /* PS1 CPU runs at ~33.868 MHz */
 #define PS1_CPU_HZ 33868800U
 
-typedef enum {
+typedef enum
+{
     EVENT_VBLANK = 0,
     EVENT_TIMER0,
     EVENT_TIMER1,
@@ -18,15 +19,17 @@ typedef enum {
     EVENT_COUNT
 } EventType;
 
-typedef struct {
-    uint64_t  fire_at; /* absolute cycle number when this event fires */
+typedef struct
+{
+    uint64_t fire_at; /* absolute cycle number when this event fires */
     EventType type;
-    bool      active;
+    bool active;
 } Event;
 
-typedef struct {
+typedef struct
+{
     uint64_t current_cycle;
-    Event    events[EVENT_COUNT];
+    Event events[EVENT_COUNT];
 } Scheduler;
 
 void scheduler_init(Scheduler *s);

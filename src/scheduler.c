@@ -43,7 +43,7 @@ uint32_t scheduler_step(Scheduler *s, uint32_t cycles, Irq *irq) {
         case EVENT_TIMER0: irq_assert(irq, IRQ_TIMER0); break;
         case EVENT_TIMER1: irq_assert(irq, IRQ_TIMER1); break;
         case EVENT_TIMER2: irq_assert(irq, IRQ_TIMER2); break;
-        case EVENT_CDROM_IRQ: irq_assert(irq, IRQ_CDROM); break;
+        case EVENT_CDROM_IRQ: /* cdrom_on_scheduler_event called by caller */ break;
         case EVENT_SPU_SAMPLE: irq_assert(irq, IRQ_SPU); break;
         default: break;
         }

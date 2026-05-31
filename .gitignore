@@ -7,8 +7,10 @@ ps1_boot_debug
 # BIOS (arquivos de hardware proprietário)
 bios/
 
-# ROMs de teste
-tests/
+# Artefatos de teste
+tests/**/*.exe
+tests/**/*.log
+tests/cdrom_test
 
 # Documentação e plano local
 CONTINUAR_PROJETO.md

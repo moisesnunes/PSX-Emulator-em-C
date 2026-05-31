@@ -28,37 +28,55 @@ static const char *FRAG_SRC =
     "  frag = texture(vram_tex, v_uv);\n"
     "}\n";
 
-static GLuint compile_shader(GLenum type, const char *src) {
+static GLuint compile_shader(GLenum type, const char *src)
+{
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, NULL);
     glCompileShader(s);
     GLint ok;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok) { fprintf(stderr, "Shader compile error\n"); exit(1); }
+    if (!ok)
+    {
+        fprintf(stderr, "Shader compile error\n");
+        exit(1);
+    }
     return s;
 }
 
-static GLuint make_program(void) {
-    GLuint vs = compile_shader(GL_VERTEX_SHADER,   VERT_SRC);
+static GLuint make_program(void)
+{
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, VERT_SRC);
     GLuint fs = compile_shader(GL_FRAGMENT_SHADER, FRAG_SRC);
-    GLuint p  = glCreateProgram();
-    glAttachShader(p, vs); glAttachShader(p, fs);
+    GLuint p = glCreateProgram();
+    glAttachShader(p, vs);
+    glAttachShader(p, fs);
     glLinkProgram(p);
-    GLint ok; glGetProgramiv(p, GL_LINK_STATUS, &ok);
-    if (!ok) { fprintf(stderr, "Program link error\n"); exit(1); }
-    glDeleteShader(vs); glDeleteShader(fs);
+    GLint ok;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        fprintf(stderr, "Program link error\n");
+        exit(1);
+    }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
     return p;
 }
 
-void renderer_init(Renderer *r, SDL_Window *window) {
-    r->window     = window;
+void renderer_init(Renderer *r, SDL_Window *window)
+{
+    r->window = window;
     r->gl_context = SDL_GL_CreateContext(window);
-    if (!r->gl_context) {
-        fprintf(stderr, "SDL_GL_CreateContext: %s\n", SDL_GetError()); exit(1);
+    if (!r->gl_context)
+    {
+        fprintf(stderr, "SDL_GL_CreateContext: %s\n", SDL_GetError());
+        exit(1);
     }
     GLenum err = glewInit();
-    if (err != GLEW_OK) {
-        fprintf(stderr, "glewInit: %s\n", glewGetErrorString(err)); exit(1);
+    if (err != GLEW_OK)
+    {
+        fprintf(stderr, "glewInit: %s\n", glewGetErrorString(err));
+        exit(1);
     }
 
     r->program = make_program();
@@ -66,10 +84,22 @@ void renderer_init(Renderer *r, SDL_Window *window) {
     /* fullscreen quad: two triangles, NDC coords + UV */
     static const float quad[] = {
         /* x      y      u      v  */
-        -1.0f,  1.0f,  0.0f, 0.0f,
-        -1.0f, -1.0f,  0.0f, 1.0f,
-         1.0f,  1.0f,  1.0f, 0.0f,
-         1.0f, -1.0f,  1.0f, 1.0f,
+        -1.0f,
+        1.0f,
+        0.0f,
+        0.0f,
+        -1.0f,
+        -1.0f,
+        0.0f,
+        1.0f,
+        1.0f,
+        1.0f,
+        1.0f,
+        0.0f,
+        1.0f,
+        -1.0f,
+        1.0f,
+        1.0f,
     };
     glGenVertexArrays(1, &r->vao);
     glGenBuffers(1, &r->vbo);
@@ -78,11 +108,11 @@ void renderer_init(Renderer *r, SDL_Window *window) {
     glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
 
     GLint pos_loc = glGetAttribLocation(r->program, "pos");
-    GLint uv_loc  = glGetAttribLocation(r->program, "uv");
+    GLint uv_loc = glGetAttribLocation(r->program, "uv");
     glEnableVertexAttribArray(pos_loc);
-    glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)0);
+    glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
     glEnableVertexAttribArray(uv_loc);
-    glVertexAttribPointer(uv_loc,  2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)(2*sizeof(float)));
+    glVertexAttribPointer(uv_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
 
     glBindVertexArray(0);
 
@@ -101,8 +131,10 @@ void renderer_init(Renderer *r, SDL_Window *window) {
 void renderer_display(Renderer *r,
                       const uint16_t *vram,
                       uint16_t display_x, uint16_t display_y,
-                      uint16_t display_w, uint16_t display_h) {
-    if (!r->window) return;
+                      uint16_t display_w, uint16_t display_h)
+{
+    if (!r->window)
+        return;
 
     /* Upload full VRAM each frame — simple and correct */
     glBindTexture(GL_TEXTURE_2D, r->texture);
@@ -116,13 +148,31 @@ void renderer_display(Renderer *r,
     float v1 = (float)(display_y + display_h) / 512.0f;
 
     /* If display is unknown/zero, show full VRAM */
-    if (display_w == 0 || display_h == 0) { u0=0; v0=0; u1=1; v1=1; }
+    if (display_w == 0 || display_h == 0)
+    {
+        u0 = 0;
+        v0 = 0;
+        u1 = 1;
+        v1 = 1;
+    }
 
     float quad[] = {
-        -1.0f,  1.0f,  u0, v0,
-        -1.0f, -1.0f,  u0, v1,
-         1.0f,  1.0f,  u1, v0,
-         1.0f, -1.0f,  u1, v1,
+        -1.0f,
+        1.0f,
+        u0,
+        v0,
+        -1.0f,
+        -1.0f,
+        u0,
+        v1,
+        1.0f,
+        1.0f,
+        u1,
+        v0,
+        1.0f,
+        -1.0f,
+        u1,
+        v1,
     };
     glBindBuffer(GL_ARRAY_BUFFER, r->vbo);
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(quad), quad);
@@ -139,8 +189,10 @@ void renderer_display(Renderer *r,
     SDL_GL_SwapWindow(r->window);
 }
 
-void renderer_destroy(Renderer *r) {
-    if (!r->window) return;
+void renderer_destroy(Renderer *r)
+{
+    if (!r->window)
+        return;
     glDeleteTextures(1, &r->texture);
     glDeleteBuffers(1, &r->vbo);
     glDeleteVertexArrays(1, &r->vao);

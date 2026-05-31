@@ -20,13 +20,15 @@ SRCS = src/main.c         \
        src/irq.c          \
        src/scheduler.c    \
        src/timer.c        \
-       src/exe.c
+       src/exe.c          \
+       src/disc.c         \
+       src/cdrom.c
 
 OBJS       = $(SRCS:.c=.o)
 DEBUG_OBJS = $(SRCS:.c=.debug.o)
 TARGET     = ps1_boot
 
-.PHONY: all clean run debug smoke
+.PHONY: all clean run debug smoke test-cdrom
 
 all: $(TARGET)
 
@@ -44,10 +46,16 @@ run: $(TARGET)
 
 debug: $(DEBUG_OBJS)
 	$(CC) $(DEBUG_OBJS) $(DEBUG_LDFLAGS) -o $(TARGET)_debug
-	./$(TARGET)_debug --bios $(BIOS_PATH)
+	ASAN_OPTIONS=detect_leaks=0 ./$(TARGET)_debug --bios $(BIOS_PATH)
 
 smoke: $(TARGET)
 	./$(TARGET) --bios $(BIOS_PATH) --headless --max-instructions 500000
 
+test-cdrom: src/cdrom.c tests/cdrom_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
+	    tests/cdrom_test.c src/cdrom.c \
+	    -o tests/cdrom_test
+	./tests/cdrom_test
+
 clean:
-	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug
+	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cdrom_test

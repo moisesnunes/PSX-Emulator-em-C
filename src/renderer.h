@@ -3,8 +3,9 @@
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
 
-typedef struct {
-    SDL_Window   *window;
+typedef struct
+{
+    SDL_Window *window;
     SDL_GLContext gl_context;
 
     /* fullscreen-quad program for blitting VRAM */

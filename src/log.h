@@ -3,7 +3,8 @@
 
 #include <stdbool.h>
 
-typedef enum {
+typedef enum
+{
     LOG_CPU,
     LOG_DMA,
     LOG_GPU,
@@ -21,7 +22,11 @@ void log_enable(LogSubsystem s);
 bool log_is_enabled(LogSubsystem s);
 void log_msg(LogSubsystem s, const char *fmt, ...);
 
-#define LOG(subsystem, ...) \
-    do { if (log_is_enabled(subsystem)) log_msg(subsystem, __VA_ARGS__); } while (0)
+#define LOG(subsystem, ...)                  \
+    do                                       \
+    {                                        \
+        if (log_is_enabled(subsystem))       \
+            log_msg(subsystem, __VA_ARGS__); \
+    } while (0)
 
 #endif /* LOG_H */
