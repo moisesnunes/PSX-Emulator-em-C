@@ -1,224 +1,149 @@
 #include "renderer.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
-static const char *VERTEX_SHADER_SRC =
+/*
+ * The renderer's only job: upload gpu->vram as an OpenGL texture and
+ * blit the display window area to the SDL window via a fullscreen quad.
+ *
+ * All rasterization is done in software directly into vram[].
+ */
+
+static const char *VERT_SRC =
     "#version 330 core\n"
-    "in ivec2 vertex_position;\n"
-    "in uvec3 vertex_color;\n"
-    "out vec3 color;\n"
-    "uniform ivec2 offset;\n"
+    "in  vec2 pos;\n"
+    "in  vec2 uv;\n"
+    "out vec2 v_uv;\n"
     "void main() {\n"
-    "  ivec2 position = vertex_position + offset;\n"
-    "  float xpos = (float(position.x) / 512) - 1.0;\n"
-    "  float ypos = 1.0 - (float(position.y) / 256);\n"
-    "  gl_Position.xyzw = vec4(xpos, ypos, 0.0, 1.0);\n"
-    "  color = vec3(\n"
-    "    float(vertex_color.r) / 255,\n"
-    "    float(vertex_color.g) / 255,\n"
-    "    float(vertex_color.b) / 255\n"
-    "  );\n"
+    "  gl_Position = vec4(pos, 0.0, 1.0);\n"
+    "  v_uv = uv;\n"
     "}\n";
 
-static const char *FRAGMENT_SHADER_SRC =
+static const char *FRAG_SRC =
     "#version 330 core\n"
-    "in vec3 color;\n"
-    "out vec4 flag_color;\n"
+    "in  vec2      v_uv;\n"
+    "out vec4      frag;\n"
+    "uniform sampler2D vram_tex;\n"
     "void main() {\n"
-    "  flag_color = vec4(color, 1.0);\n"
+    "  frag = texture(vram_tex, v_uv);\n"
     "}\n";
 
-static GLuint compile_shader(const char *src, GLenum type) {
-    GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &src, NULL);
-    glCompileShader(shader);
-    GLint status;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
-    if (status != GL_TRUE) {
-        fprintf(stderr, "Shader compilation failed!\n");
-        exit(1);
-    }
-    return shader;
+static GLuint compile_shader(GLenum type, const char *src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) { fprintf(stderr, "Shader compile error\n"); exit(1); }
+    return s;
 }
 
-static GLuint link_program(GLuint vs, GLuint fs) {
-    GLuint program = glCreateProgram();
-    glAttachShader(program, vs);
-    glAttachShader(program, fs);
-    glLinkProgram(program);
-    GLint status;
-    glGetProgramiv(program, GL_LINK_STATUS, &status);
-    if (status != GL_TRUE) {
-        fprintf(stderr, "OpenGL program linking failed!\n");
-        exit(1);
-    }
-    return program;
-}
-
-static GLuint find_attrib(GLuint program, const char *name) {
-    GLint index = glGetAttribLocation(program, name);
-    if (index < 0) {
-        fprintf(stderr, "Attribute \"%s\" not found in program\n", name);
-        exit(1);
-    }
-    return (GLuint)index;
-}
-
-static GLint find_uniform(GLuint program, const char *name) {
-    GLint index = glGetUniformLocation(program, name);
-    if (index < 0) {
-        fprintf(stderr, "Uniform \"%s\" not found in program\n", name);
-        exit(1);
-    }
-    return index;
-}
-
-Position position_from_gp0(uint32_t val) {
-    Position p;
-    p.x = (GLshort)(int16_t)(val & 0xFFFF);
-    p.y = (GLshort)(int16_t)(val >> 16);
+static GLuint make_program(void) {
+    GLuint vs = compile_shader(GL_VERTEX_SHADER,   VERT_SRC);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, FRAG_SRC);
+    GLuint p  = glCreateProgram();
+    glAttachShader(p, vs); glAttachShader(p, fs);
+    glLinkProgram(p);
+    GLint ok; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { fprintf(stderr, "Program link error\n"); exit(1); }
+    glDeleteShader(vs); glDeleteShader(fs);
     return p;
 }
 
-Color color_from_gp0(uint32_t val) {
-    Color c;
-    c.r = (GLubyte)(val & 0xFF);
-    c.g = (GLubyte)((val >> 8) & 0xFF);
-    c.b = (GLubyte)((val >> 16) & 0xFF);
-    return c;
-}
-
 void renderer_init(Renderer *r, SDL_Window *window) {
-    r->window = window;
+    r->window     = window;
     r->gl_context = SDL_GL_CreateContext(window);
     if (!r->gl_context) {
-        fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError());
-        exit(1);
+        fprintf(stderr, "SDL_GL_CreateContext: %s\n", SDL_GetError()); exit(1);
     }
-
     GLenum err = glewInit();
     if (err != GLEW_OK) {
-        fprintf(stderr, "glewInit failed: %s\n", glewGetErrorString(err));
-        exit(1);
+        fprintf(stderr, "glewInit: %s\n", glewGetErrorString(err)); exit(1);
     }
 
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    SDL_GL_SwapWindow(window);
+    r->program = make_program();
 
-    r->vertex_shader   = compile_shader(VERTEX_SHADER_SRC,   GL_VERTEX_SHADER);
-    r->fragment_shader = compile_shader(FRAGMENT_SHADER_SRC, GL_FRAGMENT_SHADER);
-    r->program         = link_program(r->vertex_shader, r->fragment_shader);
+    /* fullscreen quad: two triangles, NDC coords + UV */
+    static const float quad[] = {
+        /* x      y      u      v  */
+        -1.0f,  1.0f,  0.0f, 0.0f,
+        -1.0f, -1.0f,  0.0f, 1.0f,
+         1.0f,  1.0f,  1.0f, 0.0f,
+         1.0f, -1.0f,  1.0f, 1.0f,
+    };
+    glGenVertexArrays(1, &r->vao);
+    glGenBuffers(1, &r->vbo);
+    glBindVertexArray(r->vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
 
-    r->nvertices     = 0;
-    r->uniform_offset = find_uniform(r->program, "offset");
-    glUseProgram(r->program);
-    glUniform2i(r->uniform_offset, 0, 0);
+    GLint pos_loc = glGetAttribLocation(r->program, "pos");
+    GLint uv_loc  = glGetAttribLocation(r->program, "uv");
+    glEnableVertexAttribArray(pos_loc);
+    glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)0);
+    glEnableVertexAttribArray(uv_loc);
+    glVertexAttribPointer(uv_loc,  2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)(2*sizeof(float)));
 
-    memset(r->positions, 0, sizeof(r->positions));
-    memset(r->colors,    0, sizeof(r->colors));
-}
-
-void renderer_push_triangle(Renderer *r, Position positions[3], Color colors[3]) {
-    if (r->nvertices + 3 > VERTEX_BUFFER_LEN) {
-        printf("Vertex buffer full, forcing draw\n");
-        renderer_draw(r);
-    }
-    for (int i = 0; i < 3; i++) {
-        r->positions[r->nvertices] = positions[i];
-        r->colors[r->nvertices]    = colors[i];
-        r->nvertices++;
-    }
-}
-
-void renderer_push_quad(Renderer *r, Position positions[4], Color colors[4]) {
-    if (r->nvertices + 6 > VERTEX_BUFFER_LEN)
-        renderer_draw(r);
-
-    for (int i = 0; i < 3; i++) {
-        r->positions[r->nvertices] = positions[i];
-        r->colors[r->nvertices]    = colors[i];
-        r->nvertices++;
-    }
-    for (int i = 1; i < 4; i++) {
-        r->positions[r->nvertices] = positions[i];
-        r->colors[r->nvertices]    = colors[i];
-        r->nvertices++;
-    }
-}
-
-void renderer_draw(Renderer *r) {
-    if (!r->window || r->nvertices == 0) { r->nvertices = 0; return; }
-
-    GLuint position_vbo;
-    glGenBuffers(1, &position_vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, position_vbo);
-    glBufferData(GL_ARRAY_BUFFER,
-                 r->nvertices * sizeof(Position),
-                 r->positions, GL_STATIC_DRAW);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-
-    GLuint color_vbo;
-    glGenBuffers(1, &color_vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, color_vbo);
-    glBufferData(GL_ARRAY_BUFFER,
-                 r->nvertices * sizeof(Color),
-                 r->colors, GL_STATIC_DRAW);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-
-    GLuint vao;
-    glGenVertexArrays(1, &vao);
-    glBindVertexArray(vao);
-
-    glBindBuffer(GL_ARRAY_BUFFER, position_vbo);
-    GLuint pos_idx = find_attrib(r->program, "vertex_position");
-    glEnableVertexAttribArray(pos_idx);
-    glVertexAttribIPointer(pos_idx, 2, GL_SHORT, 0, NULL);
-
-    glBindBuffer(GL_ARRAY_BUFFER, color_vbo);
-    GLuint col_idx = find_attrib(r->program, "vertex_color");
-    glEnableVertexAttribArray(col_idx);
-    glVertexAttribIPointer(col_idx, 3, GL_UNSIGNED_BYTE, 0, NULL);
-
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
 
-    glUseProgram(r->program);
-    glBindVertexArray(vao);
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)r->nvertices);
-
-    GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    for (;;) {
-        GLenum res = glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 10000000);
-        if (res == GL_ALREADY_SIGNALED || res == GL_CONDITION_SATISFIED) break;
-    }
-    glDeleteSync(sync);
-
-    glDeleteBuffers(1, &position_vbo);
-    glDeleteBuffers(1, &color_vbo);
-    glDeleteVertexArrays(1, &vao);
-
-    r->nvertices = 0;
+    /* 1024x512 texture for full VRAM */
+    glGenTextures(1, &r->texture);
+    glBindTexture(GL_TEXTURE_2D, r->texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1,
+                 1024, 512, 0,
+                 GL_BGRA, GL_UNSIGNED_SHORT_1_5_5_5_REV,
+                 NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-void renderer_set_draw_offset(Renderer *r, int16_t x, int16_t y) {
+void renderer_display(Renderer *r,
+                      const uint16_t *vram,
+                      uint16_t display_x, uint16_t display_y,
+                      uint16_t display_w, uint16_t display_h) {
     if (!r->window) return;
-    renderer_draw(r);
-    glUseProgram(r->program);
-    glUniform2i(r->uniform_offset, (GLint)x, (GLint)y);
-}
 
-void renderer_display(Renderer *r) {
-    if (!r->window) return;
-    renderer_draw(r);
+    /* Upload full VRAM each frame — simple and correct */
+    glBindTexture(GL_TEXTURE_2D, r->texture);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, 512,
+                    GL_BGRA, GL_UNSIGNED_SHORT_1_5_5_5_REV, vram);
+
+    /* Compute UV crop so we show only the display area */
+    float u0 = (float)display_x / 1024.0f;
+    float v0 = (float)display_y / 512.0f;
+    float u1 = (float)(display_x + display_w) / 1024.0f;
+    float v1 = (float)(display_y + display_h) / 512.0f;
+
+    /* If display is unknown/zero, show full VRAM */
+    if (display_w == 0 || display_h == 0) { u0=0; v0=0; u1=1; v1=1; }
+
+    float quad[] = {
+        -1.0f,  1.0f,  u0, v0,
+        -1.0f, -1.0f,  u0, v1,
+         1.0f,  1.0f,  u1, v0,
+         1.0f, -1.0f,  u1, v1,
+    };
+    glBindBuffer(GL_ARRAY_BUFFER, r->vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(quad), quad);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(r->program);
+    glBindTexture(GL_TEXTURE_2D, r->texture);
+    glBindVertexArray(r->vao);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
     SDL_GL_SwapWindow(r->window);
 }
 
 void renderer_destroy(Renderer *r) {
     if (!r->window) return;
-    glDeleteShader(r->vertex_shader);
-    glDeleteShader(r->fragment_shader);
+    glDeleteTextures(1, &r->texture);
+    glDeleteBuffers(1, &r->vbo);
+    glDeleteVertexArrays(1, &r->vao);
     glDeleteProgram(r->program);
     SDL_GL_DeleteContext(r->gl_context);
 }

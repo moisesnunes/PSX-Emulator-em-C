@@ -23,14 +23,16 @@ void scheduler_cancel(Scheduler *s, EventType type) {
     s->events[type].active = false;
 }
 
-void scheduler_step(Scheduler *s, uint32_t cycles, Irq *irq) {
+uint32_t scheduler_step(Scheduler *s, uint32_t cycles, Irq *irq) {
     s->current_cycle += cycles;
+    uint32_t fired = 0;
 
     for (int i = 0; i < EVENT_COUNT; i++) {
         Event *e = &s->events[i];
         if (!e->active || s->current_cycle < e->fire_at) continue;
 
         e->active = false;
+        fired |= (1u << i);
 
         switch ((EventType)i) {
         case EVENT_VBLANK:
@@ -38,23 +40,13 @@ void scheduler_step(Scheduler *s, uint32_t cycles, Irq *irq) {
             irq_assert(irq, IRQ_VBLANK);
             scheduler_schedule(s, EVENT_VBLANK, VBLANK_CYCLES);
             break;
-        case EVENT_TIMER0:
-            irq_assert(irq, IRQ_TIMER0);
-            break;
-        case EVENT_TIMER1:
-            irq_assert(irq, IRQ_TIMER1);
-            break;
-        case EVENT_TIMER2:
-            irq_assert(irq, IRQ_TIMER2);
-            break;
-        case EVENT_CDROM_IRQ:
-            irq_assert(irq, IRQ_CDROM);
-            break;
-        case EVENT_SPU_SAMPLE:
-            irq_assert(irq, IRQ_SPU);
-            break;
-        default:
-            break;
+        case EVENT_TIMER0: irq_assert(irq, IRQ_TIMER0); break;
+        case EVENT_TIMER1: irq_assert(irq, IRQ_TIMER1); break;
+        case EVENT_TIMER2: irq_assert(irq, IRQ_TIMER2); break;
+        case EVENT_CDROM_IRQ: irq_assert(irq, IRQ_CDROM); break;
+        case EVENT_SPU_SAMPLE: irq_assert(irq, IRQ_SPU); break;
+        default: break;
         }
     }
+    return fired;
 }

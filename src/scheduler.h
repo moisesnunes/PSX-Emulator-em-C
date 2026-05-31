@@ -33,8 +33,8 @@ void scheduler_init(Scheduler *s);
 void scheduler_schedule(Scheduler *s, EventType type, uint32_t delta_cycles);
 void scheduler_cancel(Scheduler *s, EventType type);
 
-/* Advance by `cycles` and fire any events that have elapsed.
-   Triggered IRQs are asserted into `irq`. */
-void scheduler_step(Scheduler *s, uint32_t cycles, Irq *irq);
+/* Advance by `cycles`, fire elapsed events, assert IRQs.
+   Returns bitmask of EVENT_* that fired (1 << EventType). */
+uint32_t scheduler_step(Scheduler *s, uint32_t cycles, Irq *irq);
 
 #endif /* SCHEDULER_H */
