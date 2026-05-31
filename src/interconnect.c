@@ -35,6 +35,7 @@ static const Range MAP_TIMERS = {0x1F801100, 16 * 3};
 static const Range MAP_DMA = {0x1F801080, 0x80};
 static const Range MAP_GPU = {0x1F801810, 8};
 static const Range MAP_CDROM = {0x1F801800, 4};
+static const Range MAP_SIO   = {0x1F801040, 16};
 
 static const uint32_t REGION_MASK[8] = {
     0xFFFFFFFF,
@@ -269,6 +270,7 @@ int interconnect_init(Interconnect *inter, const char *bios_path, SDL_Window *wi
             fprintf(stderr, "Warning: could not open disc '%s'\n", disc_path);
     }
     cdrom_init(&inter->cdrom, inter->disc_loaded ? &inter->disc : NULL);
+    sio_init(&inter->sio);
     return 0;
 }
 
@@ -338,6 +340,8 @@ uint16_t interconnect_load16(Interconnect *inter, uint32_t addr)
         return irq_load16(&inter->irq, off);
     if (range_contains(MAP_TIMERS, abs, &off))
         return timers_load16(&inter->timers, off);
+    if (range_contains(MAP_SIO, abs, &off))
+        return sio_load16(&inter->sio, off);
 
     fprintf(stderr, "Unhandled load16: %08X\n", addr);
     exit(1);
@@ -355,6 +359,8 @@ uint8_t interconnect_load8(Interconnect *inter, uint32_t addr)
         return ram_load8(&inter->ram, off);
     if (range_contains(MAP_CDROM, abs, &off))
         return cdrom_load8(&inter->cdrom, off);
+    if (range_contains(MAP_SIO, abs, &off))
+        return sio_load8(&inter->sio, off);
     if (range_contains(MAP_EXPANSION1, abs, &off))
         return 0xFF;
 
@@ -471,6 +477,11 @@ void interconnect_store16(Interconnect *inter, uint32_t addr, uint16_t val)
         irq_store16(&inter->irq, off, val);
         return;
     }
+    if (range_contains(MAP_SIO, abs, &off))
+    {
+        sio_store16(&inter->sio, off, val, &inter->irq);
+        return;
+    }
 
     fprintf(stderr, "Unhandled store16: %08X = %04X\n", addr, val);
     exit(1);
@@ -492,6 +503,11 @@ void interconnect_store8(Interconnect *inter, uint32_t addr, uint8_t val)
     if (range_contains(MAP_CDROM, abs, &off))
     {
         cdrom_store8(&inter->cdrom, off, val, &inter->irq, &inter->scheduler);
+        return;
+    }
+    if (range_contains(MAP_SIO, abs, &off))
+    {
+        sio_store8(&inter->sio, off, val, &inter->irq);
         return;
     }
 

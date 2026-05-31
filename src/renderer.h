@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stdbool.h>
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
 
@@ -12,7 +13,8 @@ typedef struct
     GLuint program;
     GLuint vao;
     GLuint vbo;
-    GLuint texture; /* GL_RGB5_A1 1024x512 */
+    GLuint texture; /* GL_RGB8 1024x512 */
+    uint8_t *rgb_buffer;
 } Renderer;
 
 void renderer_init(Renderer *r, SDL_Window *window);
@@ -21,6 +23,7 @@ void renderer_init(Renderer *r, SDL_Window *window);
 void renderer_display(Renderer *r,
                       const uint16_t *vram,
                       uint16_t display_x, uint16_t display_y,
-                      uint16_t display_w, uint16_t display_h);
+                      uint16_t display_w, uint16_t display_h,
+                      bool display_24bit);
 
 void renderer_destroy(Renderer *r);

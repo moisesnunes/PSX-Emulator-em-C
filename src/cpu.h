@@ -1,5 +1,6 @@
 #pragma once
 #include "interconnect.h"
+#include "gte.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -17,6 +18,9 @@ typedef struct
     uint32_t current_pc;
     uint32_t cause;
     uint32_t epc;
+
+    /* COP2 / GTE */
+    Gte gte;
 
     uint8_t load_reg;
     uint32_t load_val;

@@ -238,12 +238,28 @@ static void test_seekl(void)
     irq.status = 0;
 
     send_cmd(&cd, 0x15, &irq, &sched); /* SeekL */
+
+    const uint32_t step = PS1_CPU_HZ / 500;
+    for (uint64_t e = 0; e < (uint64_t)PS1_CPU_HZ; e += step)
+    {
+        uint32_t fired = scheduler_step(&sched, step, &irq);
+        if (fired & (1u << EVENT_CDROM_IRQ))
+            cdrom_on_scheduler_event(&cd, &irq, &sched);
+        if (cdrom_event_log_count() >= 1)
+            break;
+    }
+
+    EXPECT_EQ(cdrom_event_log_count(), 1u);
+    EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT3);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x42u); /* motor on + seeking */
+
     run_until_quiet(&cd, &irq, &sched, 2ULL * PS1_CPU_HZ);
 
     EXPECT_EQ(cdrom_event_log_count(), 2u);
     EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT3);
     EXPECT_EQ(cdrom_event_log_get(1), CDROM_INT2);
     EXPECT_EQ((uint32_t)cd.state, (uint32_t)CDROM_STATE_IDLE);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x02u); /* motor on + idle */
     printf("ok\n");
 }
 

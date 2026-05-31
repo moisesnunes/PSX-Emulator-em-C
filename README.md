@@ -19,6 +19,9 @@ sudo apt install gcc libsdl2-dev libglew-dev
 make              # compila
 make run          # compila e executa (usa bios/BIOS.ROM)
 make smoke        # roda 500k instruções sem janela e sai (CI)
+make test-cdrom   # roda testes unitários do controlador CD-ROM
+make test-sio     # roda testes unitários de SIO/joypad
+make test-gte     # roda testes unitários de registradores básicos do GTE
 make debug        # compila com ASan/UBSan e executa
 make clean        # remove artefatos
 ```
@@ -26,7 +29,7 @@ make clean        # remove artefatos
 Opções do binário:
 
 ```text
-./ps1_boot [--bios <path>] [--headless] [--max-instructions <N>]
+./ps1_boot [--bios <path>] [--exe <path>] [--disc <path>] [--headless] [--max-instructions <N>]
 ```
 
 A BIOS não está incluída no repositório. Coloque o arquivo em `bios/BIOS.ROM`
@@ -50,14 +53,14 @@ Subsistemas: `CPU`, `DMA`, `GPU`, `IRQ`, `CDROM`, `SPU`, `SIO`.
 | Interconnect / mapa de memória | funcional |
 | RAM 2 MB / BIOS 512 KB | funcional |
 | DMA (block + linked-list) | funcional |
-| GPU GP0/GP1 (primitivas coloridas) | parcial |
+| GPU GP0/GP1 (rasterização software + VRAM texture) | parcial |
 | SPU 24 vozes ADPCM | parcial |
 | IRQ control (I_STAT/I_MASK) | implementado |
 | Scheduler / VBlank | implementado |
-| Timers (root counters) | stub |
-| CD-ROM | não implementado |
-| GTE / COP2 | não implementado |
-| SIO / Joypad | não implementado |
+| Timers (root counters) | implementado |
+| CD-ROM (.bin raw + comandos básicos + DMA3) | parcial |
+| SIO / Joypad digital | parcial |
+| GTE / COP2 | parcial |
 
 ## Referências
 

@@ -66,12 +66,15 @@ static GLuint make_program(void)
 void renderer_init(Renderer *r, SDL_Window *window)
 {
     r->window = window;
+    r->rgb_buffer = NULL;
     r->gl_context = SDL_GL_CreateContext(window);
     if (!r->gl_context)
     {
         fprintf(stderr, "SDL_GL_CreateContext: %s\n", SDL_GetError());
         exit(1);
     }
+    /* Disable vsync — we throttle via nanosleep in the main loop. */
+    SDL_GL_SetSwapInterval(0);
     GLenum err = glewInit();
     if (err != GLEW_OK)
     {
@@ -116,12 +119,19 @@ void renderer_init(Renderer *r, SDL_Window *window)
 
     glBindVertexArray(0);
 
+    r->rgb_buffer = malloc(1024u * 512u * 3u);
+    if (!r->rgb_buffer)
+    {
+        fprintf(stderr, "renderer: RGB buffer alloc failed\n");
+        exit(1);
+    }
+
     /* 1024x512 texture for full VRAM */
     glGenTextures(1, &r->texture);
     glBindTexture(GL_TEXTURE_2D, r->texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8,
                  1024, 512, 0,
-                 GL_BGRA, GL_UNSIGNED_SHORT_1_5_5_5_REV,
+                 GL_RGB, GL_UNSIGNED_BYTE,
                  NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -131,30 +141,66 @@ void renderer_init(Renderer *r, SDL_Window *window)
 void renderer_display(Renderer *r,
                       const uint16_t *vram,
                       uint16_t display_x, uint16_t display_y,
-                      uint16_t display_w, uint16_t display_h)
+                      uint16_t display_w, uint16_t display_h,
+                      bool display_24bit)
 {
     if (!r->window)
         return;
 
-    /* Upload full VRAM each frame — simple and correct */
-    glBindTexture(GL_TEXTURE_2D, r->texture);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, 512,
-                    GL_BGRA, GL_UNSIGNED_SHORT_1_5_5_5_REV, vram);
-
-    /* Compute UV crop so we show only the display area */
-    float u0 = (float)display_x / 1024.0f;
-    float v0 = (float)display_y / 512.0f;
-    float u1 = (float)(display_x + display_w) / 1024.0f;
-    float v1 = (float)(display_y + display_h) / 512.0f;
-
-    /* If display is unknown/zero, show full VRAM */
     if (display_w == 0 || display_h == 0)
     {
-        u0 = 0;
-        v0 = 0;
-        u1 = 1;
-        v1 = 1;
+        display_w = 1024;
+        display_h = 512;
+        display_x = 0;
+        display_y = 0;
+        display_24bit = false;
     }
+
+    for (uint32_t y = 0; y < display_h; y++)
+    {
+        for (uint32_t x = 0; x < display_w; x++)
+        {
+            uint8_t r8, g8, b8;
+            if (display_24bit)
+            {
+                uint32_t byte_base = (((display_y + y) & 511u) * 1024u +
+                                      (display_x & 1023u)) * 2u + x * 3u;
+                uint16_t w0 = vram[(byte_base / 2u) & (1024u * 512u - 1u)];
+                uint16_t w1 = vram[((byte_base / 2u) + 1u) & (1024u * 512u - 1u)];
+                uint32_t bytes = ((uint32_t)w1 << 16) | w0;
+                if (byte_base & 1u)
+                    bytes >>= 8;
+                r8 = bytes & 0xFFu;
+                g8 = (bytes >> 8) & 0xFFu;
+                b8 = (bytes >> 16) & 0xFFu;
+            }
+            else
+            {
+                uint16_t c = vram[((display_y + y) & 511u) * 1024u +
+                                  ((display_x + x) & 1023u)];
+                uint8_t r5 = c & 0x1Fu;
+                uint8_t g5 = (c >> 5) & 0x1Fu;
+                uint8_t b5 = (c >> 10) & 0x1Fu;
+                r8 = (uint8_t)((r5 << 3) | (r5 >> 2));
+                g8 = (uint8_t)((g5 << 3) | (g5 >> 2));
+                b8 = (uint8_t)((b5 << 3) | (b5 >> 2));
+            }
+            uint32_t out = (y * (uint32_t)display_w + x) * 3u;
+            r->rgb_buffer[out + 0u] = r8;
+            r->rgb_buffer[out + 1u] = g8;
+            r->rgb_buffer[out + 2u] = b8;
+        }
+    }
+
+    /* Upload the decoded display window at the texture origin. */
+    glBindTexture(GL_TEXTURE_2D, r->texture);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, display_w, display_h,
+                    GL_RGB, GL_UNSIGNED_BYTE, r->rgb_buffer);
+
+    float u0 = 0.0f;
+    float v0 = 0.0f;
+    float u1 = (float)display_w / 1024.0f;
+    float v1 = (float)display_h / 512.0f;
 
     float quad[] = {
         -1.0f,
@@ -197,5 +243,7 @@ void renderer_destroy(Renderer *r)
     glDeleteBuffers(1, &r->vbo);
     glDeleteVertexArrays(1, &r->vao);
     glDeleteProgram(r->program);
+    free(r->rgb_buffer);
+    r->rgb_buffer = NULL;
     SDL_GL_DeleteContext(r->gl_context);
 }

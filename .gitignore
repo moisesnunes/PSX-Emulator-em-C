@@ -11,6 +11,8 @@ bios/
 tests/**/*.exe
 tests/**/*.log
 tests/cdrom_test
+tests/sio_test
+tests/gte_test
 
 # Documentação e plano local
 CONTINUAR_PROJETO.md

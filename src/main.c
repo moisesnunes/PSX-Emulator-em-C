@@ -2,6 +2,7 @@
 #include "exe.h"
 #include "gpu.h"
 #include "cdrom.h"
+#include "sio.h"
 #include "log.h"
 #include "scheduler.h"
 #include "timer.h"
@@ -12,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* Cpu is too large (~3 MB with RAM) to live on the stack — use heap. */
 
 static uint64_t now_nanos(void)
 {
@@ -100,10 +103,20 @@ int main(int argc, char **argv)
         }
     }
 
-    Cpu cpu;
-    if (cpu_init(&cpu, bios_path, window, headless, disc_path) != 0)
+    Cpu *cpu = (Cpu *)malloc(sizeof(Cpu));
+    if (!cpu)
+    {
+        fprintf(stderr, "Failed to allocate CPU\n");
+        if (window)
+            SDL_DestroyWindow(window);
+        if (!headless)
+            SDL_Quit();
+        return 1;
+    }
+    if (cpu_init(cpu, bios_path, window, headless, disc_path) != 0)
     {
         fprintf(stderr, "Failed to init CPU/BIOS\n");
+        free(cpu);
         if (window)
             SDL_DestroyWindow(window);
         if (!headless)
@@ -115,25 +128,28 @@ int main(int argc, char **argv)
     {
         PsxExe exe;
         if (exe_parse(exe_path, &exe) != 0 ||
-            exe_load(exe_path, &exe, cpu.inter.ram.data, RAM_SIZE) != 0)
+            exe_load(exe_path, &exe, cpu->inter.ram.data, RAM_SIZE) != 0)
         {
             fprintf(stderr, "Failed to load EXE: %s\n", exe_path);
-            cpu_destroy(&cpu);
+            cpu_destroy(cpu);
+            free(cpu);
             if (window)
                 SDL_DestroyWindow(window);
             if (!headless)
                 SDL_Quit();
             return 1;
         }
-        cpu.pc = exe.pc;
-        cpu.next_pc = exe.pc + 4;
-        cpu.regs[28] = exe.gp;
-        cpu.regs[29] = exe.sp;
-        cpu.regs[30] = exe.sp;
-        cpu.out_regs[28] = exe.gp;
-        cpu.out_regs[29] = exe.sp;
-        cpu.out_regs[30] = exe.sp;
-        cpu.next_instruction = 0;
+        cpu->pc = exe.pc;
+        cpu->next_pc = exe.pc + 4;
+        memset(cpu->regs, 0, sizeof(cpu->regs));
+        memset(cpu->out_regs, 0, sizeof(cpu->out_regs));
+        cpu->regs[28] = exe.gp;
+        cpu->regs[29] = exe.sp;
+        cpu->regs[30] = exe.sp;
+        cpu->out_regs[28] = exe.gp;
+        cpu->out_regs[29] = exe.sp;
+        cpu->out_regs[30] = exe.sp;
+        cpu->next_instruction = 0;
         fprintf(stderr, "EXE loaded: PC=0x%08X GP=0x%08X SP=0x%08X\n",
                 exe.pc, exe.gp, exe.sp);
     }
@@ -141,74 +157,119 @@ int main(int argc, char **argv)
     if (headless)
     {
         uint64_t count = 0;
+        const char *trace_interval_env = getenv("PS1_TRACE_INTERVAL");
+        uint64_t trace_interval = trace_interval_env ? strtoull(trace_interval_env, NULL, 10) : 0;
         for (;;)
         {
-            uint32_t cycles = cpu_run_next_instruction(&cpu);
-            uint32_t fired = scheduler_step(&cpu.inter.scheduler, cycles, &cpu.inter.irq);
-            timers_step(&cpu.inter.timers, cycles, &cpu.inter.irq, &cpu.inter.scheduler);
+            uint32_t cycles = cpu_run_next_instruction(cpu);
+            uint32_t fired = scheduler_step(&cpu->inter.scheduler, cycles, &cpu->inter.irq);
+            timers_step(&cpu->inter.timers, cycles, &cpu->inter.irq, &cpu->inter.scheduler);
+            if (fired & (1u << EVENT_VBLANK))
+            {
+                gpu_vblank(&cpu->inter.gpu);
+            }
             if (fired & (1u << EVENT_CDROM_IRQ))
             {
-                cdrom_on_scheduler_event(&cpu.inter.cdrom, &cpu.inter.irq,
-                                         &cpu.inter.scheduler);
+                cdrom_on_scheduler_event(&cpu->inter.cdrom, &cpu->inter.irq,
+                                         &cpu->inter.scheduler);
             }
             count++;
+            if (trace_interval > 0 && (count % trace_interval) == 0)
+            {
+                uint32_t op = interconnect_load32(&cpu->inter, cpu->current_pc);
+                fprintf(stderr,
+                        "TRACE %llu PC=0x%08X OP=0x%08X SR=0x%08X CAUSE=0x%08X EPC=0x%08X K0=0x%08X\n",
+                        (unsigned long long)count, cpu->current_pc, op, cpu->sr,
+                        cpu->cause, cpu->epc, cpu->regs[26]);
+            }
             if (max_instr > 0 && count >= max_instr)
             {
-                fprintf(stderr, "Smoke: ran %llu instructions without abort.\n",
-                        (unsigned long long)count);
-                cpu_destroy(&cpu);
+                uint32_t op = interconnect_load32(&cpu->inter, cpu->current_pc);
+                fprintf(stderr,
+                        "Smoke: ran %llu instructions without abort. PC=0x%08X OP=0x%08X SR=0x%08X CAUSE=0x%08X CYC=%llu VBL=%d@%llu\n",
+                        (unsigned long long)count, cpu->current_pc, op, cpu->sr, cpu->cause,
+                        (unsigned long long)cpu->inter.scheduler.current_cycle,
+                        cpu->inter.scheduler.events[EVENT_VBLANK].active,
+                        (unsigned long long)cpu->inter.scheduler.events[EVENT_VBLANK].fire_at);
+                cpu_destroy(cpu);
+                free(cpu);
                 return 0;
             }
         }
     }
 
-    const uint64_t SPU_INTERVAL = 1000000000ULL / 44100;
+    /* Run ~564k cycles per frame (33.868MHz / 60Hz), poll SDL once per frame. */
+    const uint32_t CYCLES_PER_FRAME = 33868800U / 60U;
+    const uint64_t FRAME_NS         = 1000000000ULL / 60ULL;
+    const uint64_t SPU_INTERVAL     = 1000000000ULL / 44100ULL;
+    uint64_t frame_deadline = now_nanos() + FRAME_NS;
     uint64_t spu_now = now_nanos();
     uint64_t spu_acc = 0;
 
     for (;;)
     {
+        /* Run one full frame's worth of CPU cycles before polling SDL. */
+        uint32_t frame_cycles = 0;
+        while (frame_cycles < CYCLES_PER_FRAME)
+        {
+            uint32_t cycles = cpu_run_next_instruction(cpu);
+            uint32_t fired  = scheduler_step(&cpu->inter.scheduler, cycles, &cpu->inter.irq);
+            timers_step(&cpu->inter.timers, cycles, &cpu->inter.irq, &cpu->inter.scheduler);
+            frame_cycles += cycles;
+
+            if (fired & (1u << EVENT_VBLANK))
+                gpu_vblank(&cpu->inter.gpu);
+
+            if (fired & (1u << EVENT_CDROM_IRQ))
+                cdrom_on_scheduler_event(&cpu->inter.cdrom, &cpu->inter.irq,
+                                         &cpu->inter.scheduler);
+        }
+
+        /* SPU clock — catch up for this frame */
+        {
+            uint64_t now = now_nanos();
+            spu_acc += now - spu_now;
+            spu_now  = now;
+            while (spu_acc >= SPU_INTERVAL)
+            {
+                spu_acc -= SPU_INTERVAL;
+                spu_clock(&cpu->inter.spu);
+            }
+        }
+
+        /* SDL events */
         SDL_Event event;
         while (SDL_PollEvent(&event))
         {
             if (event.type == SDL_QUIT)
             {
-                cpu_destroy(&cpu);
+                cpu_destroy(cpu);
+                free(cpu);
                 SDL_DestroyWindow(window);
                 SDL_Quit();
                 return 0;
             }
+            if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP)
+                sio_on_key(&cpu->inter.sio, event.key.keysym.scancode,
+                           event.type == SDL_KEYDOWN);
         }
 
-        uint32_t cycles = cpu_run_next_instruction(&cpu);
-        uint32_t fired = scheduler_step(&cpu.inter.scheduler, cycles, &cpu.inter.irq);
-        timers_step(&cpu.inter.timers, cycles, &cpu.inter.irq, &cpu.inter.scheduler);
-
-        /* Present frame on VBlank */
-        if (fired & (1u << EVENT_VBLANK))
+        /* Sleep until next frame deadline to cap at 60 Hz */
         {
-            gpu_vblank(&cpu.inter.gpu);
-        }
-
-        /* CD-ROM sector delivery / ack */
-        if (fired & (1u << EVENT_CDROM_IRQ))
-        {
-            cdrom_on_scheduler_event(&cpu.inter.cdrom, &cpu.inter.irq,
-                                     &cpu.inter.scheduler);
-        }
-
-        /* SPU clock */
-        uint64_t now = now_nanos();
-        uint64_t dt = now - spu_now;
-        if (dt > SPU_INTERVAL * 20)
-        {
-            spu_acc += dt;
-            while (spu_acc >= SPU_INTERVAL)
+            uint64_t now = now_nanos();
+            if (now < frame_deadline)
             {
-                spu_acc -= SPU_INTERVAL;
-                spu_clock(&cpu.inter.spu);
+                uint64_t wait_ns = frame_deadline - now;
+                struct timespec ts = { (time_t)(wait_ns / 1000000000ULL),
+                                       (long)(wait_ns % 1000000000ULL) };
+                nanosleep(&ts, NULL);
             }
-            spu_now = now;
+            frame_deadline += FRAME_NS;
+            /* Fell behind — resync so we don't try to catch up indefinitely */
+            now = now_nanos();
+            if (now > frame_deadline)
+                frame_deadline = now + FRAME_NS;
         }
+
     }
 }

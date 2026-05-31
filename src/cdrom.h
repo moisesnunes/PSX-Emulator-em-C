@@ -29,7 +29,8 @@ typedef enum
 typedef enum
 {
     CDROM_PHASE_ACK = 0,       /* deliver irq_type from queue, done */
-    CDROM_PHASE_SEEK_COMPLETE, /* deliver INT3 ack, enqueue INT2 seek-done */
+    CDROM_PHASE_SEEK_ACK,      /* deliver INT3 seek ack, enqueue seek-done */
+    CDROM_PHASE_SEEK_DONE,     /* prepare idle stat and deliver INT2 */
     CDROM_PHASE_READ_DATA,     /* deliver INT3 ack, enqueue first SECTOR event */
     CDROM_PHASE_SECTOR,        /* load + deliver one sector (INT1), re-enqueue self */
 } CdromPhase;

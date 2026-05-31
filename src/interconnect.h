@@ -9,6 +9,7 @@
 #include "timer.h"
 #include "cdrom.h"
 #include "disc.h"
+#include "sio.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -23,6 +24,7 @@ typedef struct
     Scheduler scheduler;
     Timers timers;
     Cdrom cdrom;
+    Sio sio;
     Disc disc;
     bool disc_loaded;
 } Interconnect;

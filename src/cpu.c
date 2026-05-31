@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include "gte.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,6 +84,8 @@ static void cpu_exception(Cpu *cpu, Exception cause)
     }
     cpu->pc = handler;
     cpu->next_pc = handler + 4;
+    LOG(LOG_CPU, "exception cause=%u pc=0x%08X epc=0x%08X handler=0x%08X sr=0x%08X",
+        cause, cpu->current_pc, cpu->epc, handler, cpu->sr);
 }
 
 /* ---- Opcode handlers (forward declarations) ---- */
@@ -146,6 +149,9 @@ static void op_lwr(Cpu *cpu, uint32_t op);
 static void op_swl(Cpu *cpu, uint32_t op);
 static void op_swr(Cpu *cpu, uint32_t op);
 static void op_illegal(Cpu *cpu, uint32_t op);
+static void op_cop2(Cpu *cpu, uint32_t op);
+static void op_lwc2(Cpu *cpu, uint32_t op);
+static void op_swc2(Cpu *cpu, uint32_t op);
 
 /* ---- Decode and execute ---- */
 static void decode_and_execute(Cpu *cpu, uint32_t op)
@@ -295,7 +301,8 @@ static void decode_and_execute(Cpu *cpu, uint32_t op)
     case 0x11:
         cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
         break;
-    case 0x12: /* COP2 / GTE — stub until Milestone 7 */
+    case 0x12:
+        op_cop2(cpu, op);
         break;
     case 0x13:
         cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
@@ -342,7 +349,8 @@ static void decode_and_execute(Cpu *cpu, uint32_t op)
     case 0x31:
         cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
         break;
-    case 0x32: /* LWC2 / GTE — stub until Milestone 7 */
+    case 0x32:
+        op_lwc2(cpu, op);
         break;
     case 0x33:
         cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
@@ -353,7 +361,8 @@ static void decode_and_execute(Cpu *cpu, uint32_t op)
     case 0x39:
         cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
         break;
-    case 0x3A: /* SWC2 / GTE — stub until Milestone 7 */
+    case 0x3A:
+        op_swc2(cpu, op);
         break;
     case 0x3B:
         cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
@@ -383,6 +392,7 @@ int cpu_init(Cpu *cpu, const char *bios_path, SDL_Window *window, bool headless,
     cpu->hi = cpu->lo = 0xDEADBEEF;
     cpu->branch = false;
     cpu->delay_slot = false;
+    gte_init(&cpu->gte);
 
     return interconnect_init(&cpu->inter, bios_path, window, headless, disc_path);
 }
@@ -401,6 +411,9 @@ uint32_t cpu_run_next_instruction(Cpu *cpu)
     {
         LOG(LOG_IRQ, "CPU interrupt: SR=0x%08x status=0x%04x mask=0x%04x",
             cpu->sr, cpu->inter.irq.status, cpu->inter.irq.mask);
+        cpu->current_pc = cpu->pc;
+        cpu->delay_slot = false;
+        cpu->branch = false;
         cpu_exception(cpu, EXC_INTERRUPT);
         return 2;
     }
@@ -530,6 +543,53 @@ static void op_cop0(Cpu *cpu, uint32_t op)
         fprintf(stderr, "Unhandled cop0: %08X\n", op);
         exit(1);
     }
+}
+
+/* ---- COP2 / GTE handlers ---- */
+
+static void op_cop2(Cpu *cpu, uint32_t op)
+{
+    uint32_t cop_op = instr_cop_opcode(op);
+    if (cop_op & 0x10) {
+        /* bit 25 set → execute GTE command */
+        gte_execute(&cpu->gte, op & 0x1FFFFFF);
+        return;
+    }
+    uint32_t reg = instr_d(op);
+    switch (cop_op) {
+    case 0b00000: /* MFC2 — move from GTE data reg */
+        cpu_set_reg(cpu, instr_t(op), gte_read_data(&cpu->gte, reg));
+        break;
+    case 0b00010: /* CFC2 — move from GTE ctrl reg */
+        cpu_set_reg(cpu, instr_t(op), gte_read_ctrl(&cpu->gte, reg));
+        break;
+    case 0b00100: /* MTC2 — move to GTE data reg */
+        gte_write_data(&cpu->gte, reg, cpu_reg(cpu, instr_t(op)));
+        break;
+    case 0b00110: /* CTC2 — move to GTE ctrl reg */
+        gte_write_ctrl(&cpu->gte, reg, cpu_reg(cpu, instr_t(op)));
+        break;
+    default:
+        fprintf(stderr, "Unhandled COP2 op: %08X\n", op);
+        break;
+    }
+}
+
+static void op_lwc2(Cpu *cpu, uint32_t op)
+{
+    if (cpu->sr & 0x10000) return; /* cache isolated */
+    uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
+    if (addr % 4 != 0) { cpu_exception(cpu, EXC_LOAD_ADDRESS_ERROR); return; }
+    uint32_t val = cpu_load32(cpu, addr);
+    gte_load(&cpu->gte, instr_t(op), val);
+}
+
+static void op_swc2(Cpu *cpu, uint32_t op)
+{
+    if (cpu->sr & 0x10000) return;
+    uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
+    if (addr % 4 != 0) { cpu_exception(cpu, EXC_STORE_ADDRESS_ERROR); return; }
+    cpu_store32(cpu, addr, gte_store(&cpu->gte, instr_t(op)));
 }
 
 static void op_bne(Cpu *cpu, uint32_t op)
@@ -775,6 +835,8 @@ static void op_slt(Cpu *cpu, uint32_t op)
 static void op_syscall(Cpu *cpu, uint32_t op)
 {
     (void)op;
+    LOG(LOG_CPU, "syscall at 0x%08X r4=0x%08X r9=0x%08X",
+        cpu->current_pc, cpu_reg(cpu, 4), cpu_reg(cpu, 9));
     cpu_exception(cpu, EXC_SYSCALL);
 }
 static void op_break(Cpu *cpu, uint32_t op)

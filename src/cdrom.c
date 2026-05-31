@@ -196,8 +196,8 @@ static void cmd_setloc(Cdrom *cd, Scheduler *sched)
 }
 
 /* SeekL (0x15):
-   event 1 (ACK phase)           → INT3 + seeking stat
-   event 2 (SEEK_COMPLETE phase) → INT2 + idle stat */
+   event 1 (SEEK_ACK phase)  → INT3 + seeking stat
+   event 2 (SEEK_DONE phase) → INT2 + idle stat */
 static void cmd_seekl(Cdrom *cd, Scheduler *sched)
 {
     if (cd->seek_pending)
@@ -208,7 +208,7 @@ static void cmd_seekl(Cdrom *cd, Scheduler *sched)
     cd->state = CDROM_STATE_SEEKING;
     resp_clear(cd);
     resp_push(cd, make_stat(cd)); /* stat with SEEKING bit set */
-    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_SEEK_COMPLETE, CDROM_ACK_DELAY);
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_SEEK_ACK, CDROM_ACK_DELAY);
     LOG(LOG_CDROM, "SeekL LBA=%u", cd->cur_lba);
 }
 
@@ -489,16 +489,22 @@ void cdrom_on_scheduler_event(Cdrom *cd, Irq *irq, Scheduler *sched)
         log_irq_event(ev.int_type);
         break;
 
-    case CDROM_PHASE_SEEK_COMPLETE:
+    case CDROM_PHASE_SEEK_ACK:
         /* Deliver INT3 ack (seeking stat already in resp FIFO). */
         commit_irq(cd, irq, ev.int_type);
         log_irq_event(ev.int_type);
-        /* Prepare and enqueue INT2 seek-complete. */
+        evq_push(&cd->evq, CDROM_INT2, CDROM_PHASE_SEEK_DONE, CDROM_SEEK_DELAY);
+        LOG(LOG_CDROM, "SeekL ack INT3, queued INT2 LBA=%u", cd->cur_lba);
+        break;
+
+    case CDROM_PHASE_SEEK_DONE:
+        /* Prepare and deliver INT2 seek-complete. */
         cd->state = CDROM_STATE_IDLE;
         resp_clear(cd);
         resp_push(cd, make_stat(cd));
-        evq_push(&cd->evq, CDROM_INT2, CDROM_PHASE_ACK, CDROM_SEEK_DELAY);
-        LOG(LOG_CDROM, "SeekL ack INT3, queued INT2 LBA=%u", cd->cur_lba);
+        commit_irq(cd, irq, ev.int_type);
+        log_irq_event(ev.int_type);
+        LOG(LOG_CDROM, "SeekL complete INT2 LBA=%u", cd->cur_lba);
         break;
 
     case CDROM_PHASE_READ_DATA:

@@ -1,5 +1,5 @@
 CC           = gcc
-CFLAGS       = -std=c11 -Wall -Wextra -O2 $(shell sdl2-config --cflags)
+CFLAGS       = -std=c11 -Wall -Wextra -O2 -fno-strict-aliasing $(shell sdl2-config --cflags)
 DEBUG_CFLAGS = -std=c11 -Wall -Wextra -O0 -g -fsanitize=address,undefined $(shell sdl2-config --cflags)
 LDFLAGS      = $(shell sdl2-config --libs) -lGL -lGLEW
 DEBUG_LDFLAGS= $(LDFLAGS) -fsanitize=address,undefined
@@ -22,13 +22,15 @@ SRCS = src/main.c         \
        src/timer.c        \
        src/exe.c          \
        src/disc.c         \
-       src/cdrom.c
+       src/cdrom.c        \
+       src/sio.c          \
+       src/gte.c
 
 OBJS       = $(SRCS:.c=.o)
 DEBUG_OBJS = $(SRCS:.c=.debug.o)
 TARGET     = ps1_boot
 
-.PHONY: all clean run debug smoke test-cdrom
+.PHONY: all clean run debug smoke test-cdrom test-sio test-gte
 
 all: $(TARGET)
 
@@ -57,5 +59,17 @@ test-cdrom: src/cdrom.c tests/cdrom_test.c
 	    -o tests/cdrom_test
 	./tests/cdrom_test
 
+test-sio: src/sio.c tests/sio_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc $(shell sdl2-config --cflags) \
+	    tests/sio_test.c src/sio.c \
+	    -o tests/sio_test
+	./tests/sio_test
+
+test-gte: src/gte.c tests/gte_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
+	    tests/gte_test.c src/gte.c \
+	    -o tests/gte_test
+	./tests/gte_test
+
 clean:
-	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cdrom_test
+	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cdrom_test tests/sio_test tests/gte_test

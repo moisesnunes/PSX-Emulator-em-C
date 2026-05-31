@@ -1,7 +1,9 @@
 #include "gpu.h"
+#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #define VRAM_W 1024
 #define VRAM_H 512
@@ -477,6 +479,7 @@ void gpu_gp0(Gpu *gpu, uint32_t val) {
                 fprintf(stderr, "Unhandled GP0 0x%02X (word 0x%08X)\n", op, val);
                 return; /* tolerate instead of exit */
         }
+        LOG(LOG_GPU, "GP0 op=0x%02X val=0x%08X len=%u", op, val, len);
         gpu->gp0_words_remaining = len;
         gpu->gp0_command_method  = method;
         cb_clear(&gpu->gp0_command);
@@ -884,6 +887,8 @@ static void gp0_image_load(Gpu *gpu) {
     uint16_t x = dest & 0x3FF, y = (dest >> 16) & 0x1FF;
     uint16_t w = res & 0xFFFF,  h = res >> 16;
     if (w == 0 || h == 0) return;
+    LOG(LOG_GPU, "GP0 image load dst=%u,%u size=%ux%u words=%u",
+        x, y, w, h, ((uint32_t)w * h + 1u) / 2u);
     gpu->image_load_x = x; gpu->image_load_y = y;
     gpu->image_load_w = w; gpu->image_load_h = h;
     gpu->image_load_cur_x = gpu->image_load_cur_y = 0;
@@ -911,6 +916,7 @@ static void gp1_reset_command_buffer(Gpu *gpu);
 
 void gpu_gp1(Gpu *gpu, uint32_t val) {
     uint32_t op = (val >> 24) & 0xFF;
+    LOG(LOG_GPU, "GP1 op=0x%02X val=0x%08X", op, val);
     switch (op) {
         case 0x00: gp1_reset(gpu);                                    break;
         case 0x01: gp1_reset_command_buffer(gpu);                     break;
@@ -988,9 +994,64 @@ static void gp1_reset_command_buffer(Gpu *gpu) {
 
 /* Called externally (e.g. from scheduler VBlank) to present the frame */
 void gpu_vblank(Gpu *gpu) {
+    /* Toggle interlace field each VBlank so GPUSTAT bit 13 reflects the current
+       field. The BIOS checks this to decide which scanlines to draw into. */
+    if (gpu->interlaced)
+        gpu->field = (gpu->field == FIELD_TOP) ? FIELD_BOTTOM : FIELD_TOP;
+
     uint16_t w = hres_width(gpu->hres);
     uint16_t h = (gpu->vres == VRES_480) ? 480 : 240;
+    bool display_24bit = gpu->display_depth == DISPLAY_DEPTH_24;
     renderer_display(&gpu->renderer, gpu->vram,
-                     gpu->display_vram_x_start, gpu->display_vram_y_start, w, h);
+                     gpu->display_vram_x_start, gpu->display_vram_y_start, w, h,
+                     display_24bit);
     gpu->frame_updated = true;
+
+    static bool dumped = false;
+    static uint32_t frame_count = 0;
+    frame_count++;
+    const char *dump_path = getenv("PS1_DUMP_VRAM_PPM");
+    const char *dump_frame_env = getenv("PS1_DUMP_FRAME");
+    bool dump_full_vram = getenv("PS1_DUMP_FULL_VRAM") != NULL;
+    uint32_t dump_frame = dump_frame_env ? (uint32_t)strtoul(dump_frame_env, NULL, 10) : 120u;
+    if (dump_path && !dumped && frame_count >= dump_frame) {
+        FILE *f = fopen(dump_path, "wb");
+        if (f) {
+            uint32_t dump_w = dump_full_vram ? 1024u : w;
+            uint32_t dump_h = dump_full_vram ? 512u : h;
+            fprintf(f, "P6\n%u %u\n255\n", dump_w, dump_h);
+            for (uint32_t y = 0; y < dump_h; y++) {
+                for (uint32_t x = 0; x < dump_w; x++) {
+                    uint8_t r8, g8, b8;
+                    if (!dump_full_vram && display_24bit) {
+                        uint32_t byte_base = (((gpu->display_vram_y_start + y) & 511u) * 1024u +
+                                              (gpu->display_vram_x_start & 1023u)) * 2u + x * 3u;
+                        uint16_t w0 = gpu->vram[(byte_base / 2u) & (1024u * 512u - 1u)];
+                        uint16_t w1 = gpu->vram[((byte_base / 2u) + 1u) & (1024u * 512u - 1u)];
+                        uint32_t bytes = ((uint32_t)w1 << 16) | w0;
+                        if (byte_base & 1u)
+                            bytes >>= 8;
+                        r8 = bytes & 0xFFu;
+                        g8 = (bytes >> 8) & 0xFFu;
+                        b8 = (bytes >> 16) & 0xFFu;
+                    } else {
+                        uint32_t sx = dump_full_vram ? x : ((gpu->display_vram_x_start + x) & 1023u);
+                        uint32_t sy = dump_full_vram ? y : ((gpu->display_vram_y_start + y) & 511u);
+                        uint16_t c = gpu->vram[sy * 1024u + sx];
+                        uint8_t r5 = c & 0x1Fu;
+                        uint8_t g5 = (c >> 5) & 0x1Fu;
+                        uint8_t b5 = (c >> 10) & 0x1Fu;
+                        r8 = (r5 << 3) | (r5 >> 2);
+                        g8 = (g5 << 3) | (g5 >> 2);
+                        b8 = (b5 << 3) | (b5 >> 2);
+                    }
+                    fputc(r8, f);
+                    fputc(g8, f);
+                    fputc(b8, f);
+                }
+            }
+            fclose(f);
+        }
+        dumped = true;
+    }
 }
