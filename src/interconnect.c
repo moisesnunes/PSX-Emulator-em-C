@@ -175,6 +175,9 @@ static void do_dma_block(Interconnect *inter, Port port)
             case PORT_GPU:
                 gpu_gp0(&inter->gpu, src);
                 break;
+            case PORT_SPU:
+                spu_dma_write(&inter->spu, src);
+                break;
             default:
                 fprintf(stderr, "Unhandled DMA dest port %d\n", port);
                 exit(1);
@@ -192,6 +195,9 @@ static void do_dma_block(Interconnect *inter, Port port)
                 break;
             case PORT_CDROM:
                 src = cdrom_dma_read(&inter->cdrom);
+                break;
+            case PORT_GPU:
+                src = gpu_read(&inter->gpu);
                 break;
             default:
                 fprintf(stderr, "Unhandled DMA src port %d\n", port);

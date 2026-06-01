@@ -119,6 +119,8 @@ int disc_open(Disc *disc, const char *path)
     (void)path;
     disc->fp = (FILE *)1; /* non-NULL sentinel */
     disc->sector_count = 300;
+    disc->track_count = 1;
+    disc->tracks[1].start_lba = 0;
     return 0;
 }
 
@@ -130,6 +132,21 @@ int disc_read_sector(Disc *disc, uint32_t lba, uint8_t buf[DISC_SECTOR_SIZE])
     (void)lba;
     memset(buf, 0xAA, DISC_SECTOR_SIZE);
     return 0;
+}
+
+uint8_t disc_track_count_bcd(const Disc *disc)
+{
+    return to_bcd(disc->track_count);
+}
+
+Msf disc_track_start_msf(const Disc *disc, uint8_t track_bcd)
+{
+    uint8_t t = from_bcd(track_bcd);
+    if (t == 0)
+        return msf_from_lba(disc->sector_count > 150 ? disc->sector_count - 150 : 0);
+    if (t < 1 || t > disc->track_count)
+        return msf_from_lba(0);
+    return msf_from_lba(disc->tracks[t].start_lba);
 }
 
 /* =========================================================================

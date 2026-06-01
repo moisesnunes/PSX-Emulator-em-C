@@ -36,7 +36,34 @@ int disc_open(Disc *disc, const char *path)
     long size = ftell(disc->fp);
     rewind(disc->fp);
     disc->sector_count = (uint32_t)(size / DISC_SECTOR_SIZE);
+
+    /* Build a minimal single-track TOC.
+       PS1 data discs are almost always single-track (track 1 = data).
+       Track 1 starts at LBA 0 (absolute sector DISC_LEAD_IN_SECTORS for MSF).
+       A proper CUE parser would populate all tracks; for now one track suffices
+       for GetTN/GetTD to work with standard data discs. */
+    disc->track_count = 1;
+    disc->tracks[1].start_lba = 0; /* LBA 0 = first user sector */
+
     return 0;
+}
+
+uint8_t disc_track_count_bcd(const Disc *disc)
+{
+    return to_bcd(disc->track_count);
+}
+
+Msf disc_track_start_msf(const Disc *disc, uint8_t track_bcd)
+{
+    uint8_t t = from_bcd(track_bcd);
+    /* Track 0 = lead-out: report end of disc */
+    if (t == 0)
+        return msf_from_lba(disc->sector_count > DISC_LEAD_IN_SECTORS
+                            ? disc->sector_count - DISC_LEAD_IN_SECTORS
+                            : 0);
+    if (t < 1 || t > disc->track_count)
+        return msf_from_lba(0);
+    return msf_from_lba(disc->tracks[t].start_lba);
 }
 
 void disc_close(Disc *disc)

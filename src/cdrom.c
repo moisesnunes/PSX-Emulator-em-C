@@ -112,6 +112,48 @@ static void log_irq_event(uint8_t int_type)
 
 /* ---- Command handlers ---- */
 
+/* GetTN (0x13) — first and last track number */
+static void cmd_gettn(Cdrom *cd, Scheduler *sched)
+{
+    resp_clear(cd);
+    resp_push(cd, make_stat(cd));
+    if (!cd->disc)
+    {
+        resp_push(cd, 0x01);
+        resp_push(cd, 0x01);
+    }
+    else
+    {
+        resp_push(cd, to_bcd(1));
+        resp_push(cd, disc_track_count_bcd(cd->disc));
+    }
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+    LOG(LOG_CDROM, "GetTN last=%02X", cd->disc ? disc_track_count_bcd(cd->disc) : 1);
+}
+
+/* GetTD (0x14) — track start MSF position */
+static void cmd_gettd(Cdrom *cd, Scheduler *sched)
+{
+    uint8_t track = param_pop(cd);
+    resp_clear(cd);
+    resp_push(cd, make_stat(cd));
+    if (cd->disc)
+    {
+        Msf pos = disc_track_start_msf(cd->disc, track);
+        resp_push(cd, pos.m);
+        resp_push(cd, pos.s);
+    }
+    else
+    {
+        resp_push(cd, 0x00);
+        resp_push(cd, 0x00);
+    }
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+    LOG(LOG_CDROM, "GetTD track=%02X m=%02X s=%02X",
+        track,
+        cd->resp_fifo[1], cd->resp_fifo[2]);
+}
+
 /* Getstat (0x01) */
 static void cmd_getstat(Cdrom *cd, Scheduler *sched)
 {
@@ -274,6 +316,12 @@ static void execute_command(Cdrom *cd, uint8_t cmd, Scheduler *sched)
         break;
     case 0x0E:
         cmd_setmode(cd, sched);
+        break;
+    case 0x13:
+        cmd_gettn(cd, sched);
+        break;
+    case 0x14:
+        cmd_gettd(cd, sched);
         break;
     case 0x15:
         cmd_seekl(cd, sched);

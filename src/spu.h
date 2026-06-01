@@ -103,3 +103,5 @@ uint16_t spu_load(const Spu *spu, uint32_t abs_addr, uint32_t offset);
 void spu_store(Spu *spu, uint32_t abs_addr, uint32_t offset, uint16_t val);
 void spu_clock(Spu *spu);
 void spu_destroy(Spu *spu);
+/* DMA channel 4 (RAM→SPU): writes one 32-bit word (two 16-bit samples) to sound RAM. */
+void spu_dma_write(Spu *spu, uint32_t word);

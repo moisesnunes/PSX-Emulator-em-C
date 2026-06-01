@@ -379,6 +379,31 @@ uint32_t gpu_read(Gpu *gpu) {
     return ((uint32_t)p1 << 16) | p0;
 }
 
+/* ---- Bresenham line rasterizer ---- */
+static void draw_line(Gpu *gpu,
+                      int32_t x0, int32_t y0, uint8_t r0, uint8_t g0, uint8_t b0,
+                      int32_t x1, int32_t y1, uint8_t r1, uint8_t g1, uint8_t b1,
+                      bool semi)
+{
+    int32_t dx = x1 - x0, dy = y1 - y0;
+    int32_t ax = dx < 0 ? -dx : dx;
+    int32_t ay = dy < 0 ? -dy : dy;
+    int32_t steps = (ax > ay) ? ax : ay;
+    if (steps == 0) {
+        draw_pixel(gpu, x0, y0, rgb_to_1555(r0, g0, b0), semi);
+        return;
+    }
+    for (int32_t i = 0; i <= steps; i++) {
+        int32_t t = (i << 16) / steps;
+        int32_t x = x0 + (dx * t >> 16);
+        int32_t y = y0 + (dy * t >> 16);
+        uint8_t cr = (uint8_t)(r0 + ((int32_t)(r1 - r0) * t >> 16));
+        uint8_t cg = (uint8_t)(g0 + ((int32_t)(g1 - g0) * t >> 16));
+        uint8_t cb = (uint8_t)(b0 + ((int32_t)(b1 - b0) * t >> 16));
+        draw_pixel(gpu, x, y, rgb_to_1555(cr, cg, cb), semi);
+    }
+}
+
 /* ---- GP0 handlers (forward decls) ---- */
 static void gp0_nop(Gpu *g);
 static void gp0_fill_rect(Gpu *g);
@@ -399,6 +424,8 @@ static void gp0_rect_variable_tex_opaque(Gpu *g);
 static void gp0_rect_1x1_tex_opaque(Gpu *g);
 static void gp0_rect_8x8_tex_opaque(Gpu *g);
 static void gp0_rect_16x16_tex_opaque(Gpu *g);
+static void gp0_line_mono(Gpu *g);
+static void gp0_line_shaded(Gpu *g);
 static void gp0_image_load(Gpu *g);
 static void gp0_image_store(Gpu *g);
 static void gp0_draw_mode(Gpu *g);
@@ -441,6 +468,18 @@ void gpu_gp0(Gpu *gpu, uint32_t val) {
             /* shaded+textured quads: 0x3C-0x3F */
             case 0x3C: case 0x3D: case 0x3E: case 0x3F:
                 len=12;method=gp0_quad_shaded_tex_opaque;    break;
+            /* mono lines: 0x40-0x4F (0x48-0x4F = polyline sentinel variant) */
+            case 0x40: case 0x41: case 0x42: case 0x43:
+            case 0x44: case 0x45: case 0x46: case 0x47:
+            case 0x48: case 0x49: case 0x4A: case 0x4B:
+            case 0x4C: case 0x4D: case 0x4E: case 0x4F:
+                len=3; method=gp0_line_mono;                 break;
+            /* shaded lines: 0x50-0x5F (0x58-0x5F = polyline sentinel variant) */
+            case 0x50: case 0x51: case 0x52: case 0x53:
+            case 0x54: case 0x55: case 0x56: case 0x57:
+            case 0x58: case 0x59: case 0x5A: case 0x5B:
+            case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+                len=4; method=gp0_line_shaded;               break;
             /* variable rectangles: 0x60-0x63 */
             case 0x60: case 0x61: case 0x62: case 0x63:
                 len=3; method=gp0_rect_variable_opaque;      break;
@@ -908,6 +947,38 @@ static void gp0_image_store(Gpu *gpu) {
     gpu->image_store_cur_x = gpu->image_store_cur_y = 0;
     gpu->image_store_words_remaining = ((uint32_t)w * h + 1) / 2;
     gpu->gp0_mode = GP0_MODE_IMAGE_STORE;
+}
+
+/* 0x40-0x4F: mono line (single segment; polylines share the same handler via
+   sentinel-driven re-dispatch but we handle only two-point here — sufficient
+   for the vast majority of PS1 games). */
+static void gp0_line_mono(Gpu *gpu) {
+    uint32_t op  = gpu->gp0_command.buffer[0];
+    uint32_t v0w = gpu->gp0_command.buffer[1];
+    uint32_t v1w = gpu->gp0_command.buffer[2];
+    bool semi    = (op >> 25) & 1;
+    uint8_t r = op & 0xFF, g = (op >> 8) & 0xFF, b = (op >> 16) & 0xFF;
+    int32_t x0 = (int32_t)((int16_t)(v0w & 0xFFFF)) + gpu->drawing_x_offset;
+    int32_t y0 = (int32_t)((int16_t)(v0w >> 16))    + gpu->drawing_y_offset;
+    int32_t x1 = (int32_t)((int16_t)(v1w & 0xFFFF)) + gpu->drawing_x_offset;
+    int32_t y1 = (int32_t)((int16_t)(v1w >> 16))    + gpu->drawing_y_offset;
+    draw_line(gpu, x0, y0, r, g, b, x1, y1, r, g, b, semi);
+}
+
+/* 0x50-0x5F: shaded line */
+static void gp0_line_shaded(Gpu *gpu) {
+    uint32_t c0w = gpu->gp0_command.buffer[0];
+    uint32_t v0w = gpu->gp0_command.buffer[1];
+    uint32_t c1w = gpu->gp0_command.buffer[2];
+    uint32_t v1w = gpu->gp0_command.buffer[3];
+    bool semi    = (c0w >> 25) & 1;
+    uint8_t r0 = c0w & 0xFF, g0 = (c0w >> 8) & 0xFF, b0 = (c0w >> 16) & 0xFF;
+    uint8_t r1 = c1w & 0xFF, g1 = (c1w >> 8) & 0xFF, b1 = (c1w >> 16) & 0xFF;
+    int32_t x0 = (int32_t)((int16_t)(v0w & 0xFFFF)) + gpu->drawing_x_offset;
+    int32_t y0 = (int32_t)((int16_t)(v0w >> 16))    + gpu->drawing_y_offset;
+    int32_t x1 = (int32_t)((int16_t)(v1w & 0xFFFF)) + gpu->drawing_x_offset;
+    int32_t y1 = (int32_t)((int16_t)(v1w >> 16))    + gpu->drawing_y_offset;
+    draw_line(gpu, x0, y0, r0, g0, b0, x1, y1, r1, g1, b1, semi);
 }
 
 /* ---- GP1 ---- */
