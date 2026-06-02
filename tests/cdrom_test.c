@@ -25,6 +25,7 @@
 /* ---- irq.c stub ---- */
 void irq_init(Irq *irq) { memset(irq, 0, sizeof(*irq)); }
 void irq_assert(Irq *irq, IrqFlag f) { irq->status |= (uint16_t)f; }
+void irq_deassert(Irq *irq, IrqFlag f) { irq->status &= ~(uint16_t)f; }
 bool irq_pending(const Irq *irq) { return (irq->status & irq->mask) != 0; }
 uint32_t irq_load32(const Irq *irq, uint32_t offset)
 {
@@ -215,6 +216,13 @@ static void send_cmd(Cdrom *cd, uint8_t cmd, Irq *irq, Scheduler *sched)
     reg_write(cd, 1, cmd, irq, sched);
 }
 
+static void ack_cdrom_irq(Cdrom *cd, Irq *irq, Scheduler *sched)
+{
+    reg_write(cd, 0, 1, irq, sched);    /* index = 1 */
+    reg_write(cd, 3, 0x1F, irq, sched); /* acknowledge pending INT */
+    reg_write(cd, 3, 0x40, irq, sched); /* reset param FIFO */
+}
+
 /* =========================================================================
  * Tests
  * ========================================================================= */
@@ -251,6 +259,7 @@ static void test_seekl(void)
     push_param(&cd, 0x00, &irq, &sched);
     send_cmd(&cd, 0x02, &irq, &sched); /* Setloc */
     run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+    ack_cdrom_irq(&cd, &irq, &sched);
     cdrom_event_log_reset();
     irq.status = 0;
 
@@ -294,6 +303,7 @@ static void test_readn(void)
     push_param(&cd, 0x00, &irq, &sched);
     send_cmd(&cd, 0x02, &irq, &sched); /* Setloc */
     run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+    ack_cdrom_irq(&cd, &irq, &sched);
     cdrom_event_log_reset();
     irq.status = 0;
 
@@ -325,6 +335,7 @@ static void test_readn(void)
     EXPECT_EQ((uint32_t)cd.state, (uint32_t)CDROM_STATE_READING);
 
     /* Pause → IDLE */
+    ack_cdrom_irq(&cd, &irq, &sched);
     send_cmd(&cd, 0x09, &irq, &sched);
     run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
     EXPECT_EQ((uint32_t)cd.state, (uint32_t)CDROM_STATE_IDLE);
@@ -349,8 +360,143 @@ static void test_getid_no_disc(void)
     send_cmd(&cd, 0x1A, &irq, &sched); /* GetID */
     run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
 
+    EXPECT_EQ(cdrom_event_log_count(), 2u);
+    EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT3);
+    EXPECT_EQ(cdrom_event_log_get(1), CDROM_INT5);
+    printf("ok\n");
+}
+
+static void test_getid_disc(void)
+{
+    printf("test_getid_disc ... ");
+    Cdrom cd;
+    Irq irq;
+    Scheduler sched;
+    Disc disc;
+    setup(&cd, &irq, &sched, &disc);
+
+    send_cmd(&cd, 0x1A, &irq, &sched); /* GetID */
+
+    const uint32_t step = PS1_CPU_HZ / 500;
+    for (uint64_t e = 0; e < (uint64_t)PS1_CPU_HZ; e += step)
+    {
+        uint32_t fired = scheduler_step(&sched, step, &irq);
+        if (fired & (1u << EVENT_CDROM_IRQ))
+            cdrom_on_scheduler_event(&cd, &irq, &sched);
+        if (cdrom_event_log_count() >= 1)
+            break;
+    }
+
     EXPECT_EQ(cdrom_event_log_count(), 1u);
-    EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT5);
+    EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT3);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x02u);
+
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+
+    EXPECT_EQ(cdrom_event_log_count(), 2u);
+    EXPECT_EQ(cdrom_event_log_get(1), CDROM_INT2);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x02u);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x00u);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x20u);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x00u);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 'S');
+    EXPECT_EQ(cdrom_load8(&cd, 1), 'C');
+    EXPECT_EQ(cdrom_load8(&cd, 1), 'E');
+    EXPECT_EQ(cdrom_load8(&cd, 1), 'A');
+    printf("ok\n");
+}
+
+static void test_test_version(void)
+{
+    printf("test_test_version ... ");
+    Cdrom cd;
+    Irq irq;
+    Scheduler sched;
+    Disc disc;
+    setup(&cd, &irq, &sched, &disc);
+
+    push_param(&cd, 0x20, &irq, &sched);
+    send_cmd(&cd, 0x19, &irq, &sched); /* Test version */
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+
+    EXPECT_EQ(cdrom_event_log_count(), 1u);
+    EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT3);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x97u);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x01u);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x10u);
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0xC2u);
+    printf("ok\n");
+}
+
+static void test_readtoc(void)
+{
+    printf("test_readtoc ... ");
+    Cdrom cd;
+    Irq irq;
+    Scheduler sched;
+    Disc disc;
+    setup(&cd, &irq, &sched, &disc);
+
+    send_cmd(&cd, 0x1E, &irq, &sched); /* ReadTOC */
+    run_until_quiet(&cd, &irq, &sched, 2ULL * PS1_CPU_HZ);
+
+    EXPECT_EQ(cdrom_event_log_count(), 2u);
+    EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT3);
+    EXPECT_EQ(cdrom_event_log_get(1), CDROM_INT2);
+    EXPECT_EQ((uint32_t)cd.state, (uint32_t)CDROM_STATE_IDLE);
+    printf("ok\n");
+}
+
+/* Crash Bandicoot boot sequence: Setloc issued, SeekL deferred until INT3 ack,
+   then SeekL completes INT2, ReadN deferred until INT2 ack, then starts reading. */
+static void test_deferred_seekl_readn(void)
+{
+    printf("test_deferred_seekl_readn ... ");
+    Cdrom cd;
+    Irq irq;
+    Scheduler sched;
+    Disc disc;
+    setup(&cd, &irq, &sched, &disc);
+    irq.mask = IRQ_CDROM; /* enable CDROM in I_MASK */
+
+    /* Step 1: Setloc 00:02:04 — delivers INT3 */
+    push_param(&cd, 0x00, &irq, &sched);
+    push_param(&cd, 0x02, &irq, &sched);
+    push_param(&cd, 0x04, &irq, &sched);
+    send_cmd(&cd, 0x02, &irq, &sched);
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+    EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT3);
+    EXPECT_TRUE(irq.status & IRQ_CDROM);
+
+    /* Step 2: SeekL sent while INT3 is still pending — must be deferred */
+    send_cmd(&cd, 0x15, &irq, &sched);
+    EXPECT_TRUE(cd.pending_cmd_valid);
+    EXPECT_EQ(cd.pending_cmd, 0x15u);
+
+    /* Step 3: BIOS acks INT3 — SeekL is released, INT3 ack queued */
+    ack_cdrom_irq(&cd, &irq, &sched);
+    EXPECT_TRUE(!cd.pending_cmd_valid); /* SeekL was dispatched */
+    run_until_quiet(&cd, &irq, &sched, 2ULL * PS1_CPU_HZ);
+
+    /* SeekL delivers INT3 ack + INT2 complete */
+    EXPECT_EQ(cdrom_event_log_count(), 3u);
+    EXPECT_EQ(cdrom_event_log_get(1), CDROM_INT3); /* SeekL ack */
+    EXPECT_EQ(cdrom_event_log_get(2), CDROM_INT2); /* SeekL done */
+    EXPECT_EQ((uint32_t)cd.state, (uint32_t)CDROM_STATE_IDLE);
+
+    /* Step 4: INT2 already delivered by run_until_quiet (irq_flag=2).
+       Send ReadN while INT2 is still pending — must be deferred. */
+    EXPECT_EQ(cd.irq_flag, 2u); /* INT2 is current pending flag */
+    EXPECT_TRUE(irq.status & IRQ_CDROM);
+    send_cmd(&cd, 0x06, &irq, &sched); /* ReadN while INT2 pending */
+    EXPECT_TRUE(cd.pending_cmd_valid);
+    EXPECT_EQ(cd.pending_cmd, 0x06u);
+
+    /* Step 5: BIOS acks INT2 — ReadN released, state switches to READING */
+    ack_cdrom_irq(&cd, &irq, &sched);
+    EXPECT_TRUE(!cd.pending_cmd_valid);
+    EXPECT_EQ((uint32_t)cd.state, (uint32_t)CDROM_STATE_READING);
+
     printf("ok\n");
 }
 
@@ -407,6 +553,10 @@ int main(void)
     test_seekl();
     test_readn();
     test_getid_no_disc();
+    test_getid_disc();
+    test_test_version();
+    test_readtoc();
+    test_deferred_seekl_readn();
     test_overlap_cmd_during_readn();
     printf("========================\n");
     printf("pass: %d  fail: %d\n", g_pass, g_fail);

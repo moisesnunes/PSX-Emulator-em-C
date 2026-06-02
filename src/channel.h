@@ -44,6 +44,8 @@ void channel_set_control(Channel *ch, uint32_t val);
 uint32_t channel_base(const Channel *ch);
 void channel_set_base(Channel *ch, uint32_t val);
 uint32_t channel_block_control(const Channel *ch);
+uint16_t channel_block_size(const Channel *ch);
+uint16_t channel_block_count(const Channel *ch);
 void channel_set_block_control(Channel *ch, uint32_t val);
 bool channel_active(const Channel *ch);
 Direction channel_direction(const Channel *ch);

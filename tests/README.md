@@ -96,6 +96,47 @@ Name                     | Description
 -------------------------|------------
 diffvram                 | Diff two images and write diff png if image contents aren't exactly the same
 
+## Local emulator runner
+
+This repository adds a local runner for the bundled PS-X EXE tests:
+
+```
+make test-psx-list
+make test-psx-cpu
+make test-psx-dma
+make test-psx-gpu
+make test-psx-gte
+make test-psx-gte-fuzz
+make test-psx-input
+make test-psx-mdec
+make test-psx-spu
+make test-psx-timer-dump
+make test-psx-timers
+make test-psx-cdrom
+make test-psx-psxtest-cpu
+make test-psx-psxtest-cpx
+make test-psx-psxtest-gpu
+make test-psx-psxtest-gte
+make test-psx-resolution
+make test-psx-extras
+make test-psx-all
+```
+
+Every test runs as a headless PS-X EXE smoke test. Tests that include a
+reference `vram.png`/`vram-15bit.png`/`vram-24bit.png` also dump full VRAM and
+compare it with `tests/tools/diffvram/diffvram-linux-amd64`.
+
+Useful overrides:
+
+```
+make test-psx-gpu PSX_TEST_ARGS="--name gpu/triangle"
+make test-psx-gpu PSX_TEST_ARGS="--no-diff"
+make test-psx-all PSX_TEST_ARGS="--timeout 60 --max-instructions 50000000"
+```
+
+Outputs are written under `tests/out/psx-tests/`. When a VRAM comparison fails,
+the runner leaves the generated `vram.png`, `diff.png`, and `run.log` there.
+
 ## Examples
 
 <img src="mdec/movie/vram-15bit.png" height="256">

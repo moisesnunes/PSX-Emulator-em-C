@@ -12,6 +12,7 @@ typedef enum
     LOG_CDROM,
     LOG_SPU,
     LOG_SIO,
+    LOG_MDEC,
     LOG_SUBSYSTEM_COUNT
 } LogSubsystem;
 

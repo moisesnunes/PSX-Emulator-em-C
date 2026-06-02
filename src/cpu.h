@@ -15,6 +15,7 @@ typedef struct
 
     /* COP0 */
     uint32_t sr;
+    uint32_t badvaddr;
     uint32_t current_pc;
     uint32_t cause;
     uint32_t epc;
@@ -30,6 +31,7 @@ typedef struct
 
     bool branch;
     bool delay_slot;
+    bool hle_bios_vectors;
 } Cpu;
 
 int cpu_init(Cpu *cpu, const char *bios_path, SDL_Window *window, bool headless, const char *disc_path);

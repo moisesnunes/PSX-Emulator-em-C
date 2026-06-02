@@ -6,6 +6,8 @@
 #include "log.h"
 #include "scheduler.h"
 #include "timer.h"
+#include "renderer.h"
+#include "ui.h"
 #include <SDL2/SDL.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -26,13 +28,73 @@ static uint64_t now_nanos(void)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [options]\n"
+            "Usage: %s [options] [file.exe | file.bin]\n"
             "  --bios <path>              BIOS ROM path (default: bios/BIOS.ROM)\n"
             "  --exe  <path>              PS-X EXE to load after BIOS init\n"
             "  --disc <path>              Disc image (.bin) to mount\n"
             "  --headless                 Run without window or audio\n"
-            "  --max-instructions <N>     Exit after N instructions (headless smoke test)\n",
+            "  --max-instructions <N>     Exit after N instructions (headless smoke test)\n"
+            "\n"
+            "  Positional argument: .exe loads as PS-X EXE, .bin mounts as disc image.\n",
             prog);
+}
+
+static uint32_t debug_load32(Interconnect *inter, uint32_t addr)
+{
+    if (addr & 3u)
+        return 0xCACACACA;
+    return interconnect_load32(inter, addr);
+}
+
+/* ---- UI callback flags (set by static trampoline functions) ---- */
+static bool     g_req_quit   = false;
+static bool     g_req_reset  = false;
+static bool     g_req_pause_toggle = false;
+static char     g_req_load[512] = {0};
+
+static void ui_cb_quit(void)          { g_req_quit = true; }
+static void ui_cb_reset(void)         { g_req_reset = true; }
+static void ui_cb_pause_toggle(void)  { g_req_pause_toggle = true; }
+static void ui_cb_load_exe(const char *p)
+{
+    strncpy(g_req_load, p, sizeof(g_req_load) - 1);
+    g_req_load[sizeof(g_req_load) - 1] = '\0';
+}
+static void ui_cb_load_disc(const char *p)
+{
+    strncpy(g_req_load, p, sizeof(g_req_load) - 1);
+    g_req_load[sizeof(g_req_load) - 1] = '\0';
+}
+
+static void maybe_dump_ram(Cpu *cpu)
+{
+    const char *spec = getenv("PS1_DUMP_RAM");
+    if (!spec)
+        return;
+
+    char buf[512];
+    strncpy(buf, spec, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *addr_s = strtok(buf, ",");
+    char *len_s = strtok(NULL, ",");
+    char *path_s = strtok(NULL, "");
+    if (!addr_s || !len_s || !path_s)
+        return;
+
+    uint32_t addr = (uint32_t)strtoul(addr_s, NULL, 0);
+    uint32_t len = (uint32_t)strtoul(len_s, NULL, 0);
+    uint32_t off = addr & 0x001FFFFFu;
+    if (off >= RAM_SIZE)
+        return;
+    if (len > RAM_SIZE - off)
+        len = RAM_SIZE - off;
+
+    FILE *f = fopen(path_s, "wb");
+    if (!f)
+        return;
+    fwrite(cpu->inter.ram.data + off, 1, len, f);
+    fclose(f);
 }
 
 int main(int argc, char **argv)
@@ -69,6 +131,22 @@ int main(int argc, char **argv)
         {
             usage(argv[0]);
             return 0;
+        }
+        else if (argv[i][0] != '-')
+        {
+            /* positional: auto-detect by extension */
+            const char *arg = argv[i];
+            size_t len = strlen(arg);
+            if (len > 4 && strcasecmp(arg + len - 4, ".exe") == 0)
+                exe_path = arg;
+            else if (len > 4 && strcasecmp(arg + len - 4, ".bin") == 0)
+                disc_path = arg;
+            else
+            {
+                fprintf(stderr, "Unknown file type: %s (expected .exe or .bin)\n", arg);
+                usage(argv[0]);
+                return 1;
+            }
         }
         else
         {
@@ -150,6 +228,7 @@ int main(int argc, char **argv)
         cpu->out_regs[29] = exe.sp;
         cpu->out_regs[30] = exe.sp;
         cpu->next_instruction = 0;
+        cpu->hle_bios_vectors = true;
         fprintf(stderr, "EXE loaded: PC=0x%08X GP=0x%08X SP=0x%08X\n",
                 exe.pc, exe.gp, exe.sp);
     }
@@ -159,6 +238,61 @@ int main(int argc, char **argv)
         uint64_t count = 0;
         const char *trace_interval_env = getenv("PS1_TRACE_INTERVAL");
         uint64_t trace_interval = trace_interval_env ? strtoull(trace_interval_env, NULL, 10) : 0;
+        const char *break_pc_env = getenv("PS1_BREAK_PC");
+        uint32_t break_pc = break_pc_env ? (uint32_t)strtoul(break_pc_env, NULL, 0) : 0;
+        bool break_pc_enabled = break_pc_env != NULL;
+
+        /* PS1_WATCH_PC=0xADDR[,0xADDR,...] — dump regs once per unique hit, then
+         * every PS1_WATCH_PC_REPEAT hits (default 1 = every hit). */
+#define WATCH_PC_MAX 16
+        uint32_t watch_pcs[WATCH_PC_MAX];
+        uint32_t watch_pc_count = 0;
+        uint64_t watch_pc_hits[WATCH_PC_MAX];
+        uint64_t watch_pc_repeat = 1;
+        {
+            const char *e = getenv("PS1_WATCH_PC");
+            if (e)
+            {
+                char buf[256];
+                strncpy(buf, e, sizeof(buf) - 1);
+                buf[sizeof(buf) - 1] = '\0';
+                char *tok = strtok(buf, ",");
+                while (tok && watch_pc_count < WATCH_PC_MAX)
+                {
+                    watch_pcs[watch_pc_count] = (uint32_t)strtoul(tok, NULL, 0);
+                    watch_pc_hits[watch_pc_count] = 0;
+                    watch_pc_count++;
+                    tok = strtok(NULL, ",");
+                }
+            }
+            const char *r = getenv("PS1_WATCH_PC_REPEAT");
+            if (r) watch_pc_repeat = (uint64_t)strtoull(r, NULL, 10);
+            if (watch_pc_repeat < 1) watch_pc_repeat = 1;
+        }
+
+        /* PS1_WATCH_RAM=0xADDR[,0xADDR,...] — print when word at address changes. */
+#define WATCH_RAM_MAX 8
+        uint32_t watch_ram_addr[WATCH_RAM_MAX];
+        uint32_t watch_ram_prev[WATCH_RAM_MAX];
+        uint32_t watch_ram_count = 0;
+        {
+            const char *e = getenv("PS1_WATCH_RAM");
+            if (e)
+            {
+                char buf[256];
+                strncpy(buf, e, sizeof(buf) - 1);
+                buf[sizeof(buf) - 1] = '\0';
+                char *tok = strtok(buf, ",");
+                while (tok && watch_ram_count < WATCH_RAM_MAX)
+                {
+                    watch_ram_addr[watch_ram_count] = (uint32_t)strtoul(tok, NULL, 0);
+                    watch_ram_prev[watch_ram_count] = 0xDEADBEEF;
+                    watch_ram_count++;
+                    tok = strtok(NULL, ",");
+                }
+            }
+        }
+
         for (;;)
         {
             uint32_t cycles = cpu_run_next_instruction(cpu);
@@ -174,23 +308,98 @@ int main(int argc, char **argv)
                                          &cpu->inter.scheduler);
             }
             count++;
+
+            /* PS1_WATCH_PC hits */
+            for (uint32_t wi = 0; wi < watch_pc_count; wi++)
+            {
+                if (cpu->current_pc != watch_pcs[wi]) continue;
+                watch_pc_hits[wi]++;
+                if (watch_pc_hits[wi] != 1 && (watch_pc_hits[wi] % watch_pc_repeat) != 0)
+                    continue;
+                fprintf(stderr,
+                        "WATCH_PC[%u] hit=%llu PC=0x%08X SR=0x%08X EPC=0x%08X "
+                        "I_STAT=0x%04X I_MASK=0x%04X\n",
+                        wi, (unsigned long long)watch_pc_hits[wi],
+                        cpu->current_pc, cpu->sr, cpu->epc,
+                        cpu->inter.irq.status, cpu->inter.irq.mask);
+                for (int r = 0; r < 32; r += 4)
+                    fprintf(stderr, "  R%02d=%08X R%02d=%08X R%02d=%08X R%02d=%08X\n",
+                            r,   cpu->regs[r],
+                            r+1, cpu->regs[r+1],
+                            r+2, cpu->regs[r+2],
+                            r+3, cpu->regs[r+3]);
+                /* Print s0 area: 8 words around cpu->regs[16] if it looks like RAM */
+                uint32_t s0 = cpu->regs[16];
+                if (s0 >= 0x80000000u && s0 < 0x80200000u)
+                {
+                    fprintf(stderr, "  s0=0x%08X context:\n", s0);
+                    for (int d = -4; d <= 12; d++)
+                    {
+                        uint32_t a = s0 + (uint32_t)(d * 4);
+                        fprintf(stderr, "    [s0%+d]=0x%08X\n", d*4,
+                                debug_load32(&cpu->inter, a));
+                    }
+                }
+            }
+
+            /* PS1_WATCH_RAM change detector */
+            for (uint32_t wi = 0; wi < watch_ram_count; wi++)
+            {
+                uint32_t cur = interconnect_load32(&cpu->inter, watch_ram_addr[wi]);
+                if (cur != watch_ram_prev[wi])
+                {
+                    fprintf(stderr,
+                            "WATCH_RAM 0x%08X: 0x%08X -> 0x%08X  (instr=%llu PC=0x%08X)\n",
+                            watch_ram_addr[wi], watch_ram_prev[wi], cur,
+                            (unsigned long long)count, cpu->current_pc);
+                    watch_ram_prev[wi] = cur;
+                }
+            }
+
+            if (break_pc_enabled && cpu->current_pc == break_pc)
+            {
+                uint32_t op = debug_load32(&cpu->inter, cpu->current_pc);
+                fprintf(stderr,
+                        "BREAK_PC %llu PC=0x%08X OP=0x%08X SR=0x%08X CAUSE=0x%08X EPC=0x%08X I_STAT=0x%04X I_MASK=0x%04X\n",
+                        (unsigned long long)count, cpu->current_pc, op, cpu->sr,
+                        cpu->cause, cpu->epc, cpu->inter.irq.status, cpu->inter.irq.mask);
+                for (int r = 0; r < 32; r += 4)
+                {
+                    fprintf(stderr,
+                            "R%02d=0x%08X R%02d=0x%08X R%02d=0x%08X R%02d=0x%08X\n",
+                            r, cpu->regs[r], r + 1, cpu->regs[r + 1],
+                            r + 2, cpu->regs[r + 2], r + 3, cpu->regs[r + 3]);
+                }
+                for (int i = -8; i <= 8; i++)
+                {
+                    uint32_t addr = cpu->current_pc + (uint32_t)(i * 4);
+                    fprintf(stderr, "CODE 0x%08X: 0x%08X\n",
+                            addr, debug_load32(&cpu->inter, addr));
+                }
+                cpu_destroy(cpu);
+                free(cpu);
+                return 0;
+            }
             if (trace_interval > 0 && (count % trace_interval) == 0)
             {
-                uint32_t op = interconnect_load32(&cpu->inter, cpu->current_pc);
+                uint32_t op = debug_load32(&cpu->inter, cpu->current_pc);
                 fprintf(stderr,
-                        "TRACE %llu PC=0x%08X OP=0x%08X SR=0x%08X CAUSE=0x%08X EPC=0x%08X K0=0x%08X\n",
+                        "TRACE %llu PC=0x%08X OP=0x%08X SR=0x%08X CAUSE=0x%08X EPC=0x%08X K0=0x%08X I_STAT=0x%04X I_MASK=0x%04X\n",
                         (unsigned long long)count, cpu->current_pc, op, cpu->sr,
-                        cpu->cause, cpu->epc, cpu->regs[26]);
+                        cpu->cause, cpu->epc, cpu->regs[26],
+                        cpu->inter.irq.status, cpu->inter.irq.mask);
             }
             if (max_instr > 0 && count >= max_instr)
             {
-                uint32_t op = interconnect_load32(&cpu->inter, cpu->current_pc);
+                uint32_t op = debug_load32(&cpu->inter, cpu->current_pc);
                 fprintf(stderr,
-                        "Smoke: ran %llu instructions without abort. PC=0x%08X OP=0x%08X SR=0x%08X CAUSE=0x%08X CYC=%llu VBL=%d@%llu\n",
+                        "Smoke: ran %llu instructions without abort. PC=0x%08X OP=0x%08X SR=0x%08X CAUSE=0x%08X CYC=%llu VBL=%d@%llu I_STAT=0x%04X I_MASK=0x%04X\n",
                         (unsigned long long)count, cpu->current_pc, op, cpu->sr, cpu->cause,
                         (unsigned long long)cpu->inter.scheduler.current_cycle,
                         cpu->inter.scheduler.events[EVENT_VBLANK].active,
-                        (unsigned long long)cpu->inter.scheduler.events[EVENT_VBLANK].fire_at);
+                        (unsigned long long)cpu->inter.scheduler.events[EVENT_VBLANK].fire_at,
+                        cpu->inter.irq.status, cpu->inter.irq.mask);
+                maybe_dump_ram(cpu);
                 cpu_destroy(cpu);
                 free(cpu);
                 return 0;
@@ -198,38 +407,173 @@ int main(int argc, char **argv)
         }
     }
 
+    /* ---- UI state & callbacks ---- */
+    bool ui_running = false;
+    bool ui_paused  = false;
+    char ui_loaded_path[512] = {0};
+
+    UiState ui_state = {0};
+    ui_state.cb.on_load_exe      = ui_cb_load_exe;
+    ui_state.cb.on_load_disc     = ui_cb_load_disc;
+    ui_state.cb.on_pause_toggle  = ui_cb_pause_toggle;
+    ui_state.cb.on_reset         = ui_cb_reset;
+    ui_state.cb.on_quit          = ui_cb_quit;
+
+    /* Initialize Dear ImGui using the renderer's existing GL context */
+    ui_init(window, cpu->inter.gpu.renderer.gl_context);
+
+    /* Enable SDL drag-and-drop */
+    SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
+
+    /* If an exe/disc was passed on the command line, mark as running */
+    if (exe_path || disc_path)
+    {
+        ui_running = true;
+        strncpy(ui_loaded_path, exe_path ? exe_path : disc_path, sizeof(ui_loaded_path) - 1);
+    }
+
     /* Run ~564k cycles per frame (33.868MHz / 60Hz), poll SDL once per frame. */
     const uint32_t CYCLES_PER_FRAME = 33868800U / 60U;
-    const uint64_t FRAME_NS         = 1000000000ULL / 60ULL;
-    const uint64_t SPU_INTERVAL     = 1000000000ULL / 44100ULL;
+    const uint64_t FRAME_NS = 1000000000ULL / 60ULL;
+    const uint64_t SPU_INTERVAL = 1000000000ULL / 44100ULL;
     uint64_t frame_deadline = now_nanos() + FRAME_NS;
     uint64_t spu_now = now_nanos();
     uint64_t spu_acc = 0;
 
+    /* FPS counter */
+    uint64_t fps_frame_count = 0;
+    uint64_t fps_last_ns     = now_nanos();
+    float    fps_display     = 60.0f;
+
+    bool fullscreen = false;
+
     for (;;)
     {
-        /* Run one full frame's worth of CPU cycles before polling SDL. */
-        uint32_t frame_cycles = 0;
-        while (frame_cycles < CYCLES_PER_FRAME)
+        /* ---- SDL events ---- */
+        SDL_Event event;
+        while (SDL_PollEvent(&event))
         {
-            uint32_t cycles = cpu_run_next_instruction(cpu);
-            uint32_t fired  = scheduler_step(&cpu->inter.scheduler, cycles, &cpu->inter.irq);
-            timers_step(&cpu->inter.timers, cycles, &cpu->inter.irq, &cpu->inter.scheduler);
-            frame_cycles += cycles;
+            ui_process_event(&event);
 
-            if (fired & (1u << EVENT_VBLANK))
-                gpu_vblank(&cpu->inter.gpu);
-
-            if (fired & (1u << EVENT_CDROM_IRQ))
-                cdrom_on_scheduler_event(&cpu->inter.cdrom, &cpu->inter.irq,
-                                         &cpu->inter.scheduler);
+            if (event.type == SDL_QUIT)
+            {
+                g_req_quit = true;
+            }
+            else if (event.type == SDL_DROPFILE)
+            {
+                strncpy(g_req_load, event.drop.file, sizeof(g_req_load) - 1);
+                SDL_free(event.drop.file);
+            }
+            else if (event.type == SDL_KEYDOWN)
+            {
+                SDL_Keycode key = event.key.keysym.sym;
+                if (key == SDLK_ESCAPE && ui_running)
+                    g_req_pause_toggle = true;
+                else if (key == SDLK_F11)
+                {
+                    fullscreen = !fullscreen;
+                    SDL_SetWindowFullscreen(window, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                }
+                sio_on_key(&cpu->inter.sio, event.key.keysym.scancode, true);
+            }
+            else if (event.type == SDL_KEYUP)
+            {
+                sio_on_key(&cpu->inter.sio, event.key.keysym.scancode, false);
+            }
         }
 
-        /* SPU clock — catch up for this frame */
+        /* ---- Process deferred load (drag-drop or UI button) ---- */
+        if (g_req_load[0])
         {
+            size_t rlen = strlen(g_req_load);
+            bool is_exe  = rlen > 4 && SDL_strcasecmp(g_req_load + rlen - 4, ".exe") == 0;
+            bool is_disc = rlen > 4 && SDL_strcasecmp(g_req_load + rlen - 4, ".bin") == 0;
+            if (is_exe)
+            {
+                PsxExe loaded_exe;
+                if (exe_parse(g_req_load, &loaded_exe) == 0 &&
+                    exe_load(g_req_load, &loaded_exe, cpu->inter.ram.data, RAM_SIZE) == 0)
+                {
+                    cpu->pc               = loaded_exe.pc;
+                    cpu->next_pc          = loaded_exe.pc + 4;
+                    memset(cpu->regs, 0, sizeof(cpu->regs));
+                    memset(cpu->out_regs, 0, sizeof(cpu->out_regs));
+                    cpu->regs[28]         = loaded_exe.gp;
+                    cpu->regs[29]         = loaded_exe.sp;
+                    cpu->regs[30]         = loaded_exe.sp;
+                    cpu->out_regs[28]     = loaded_exe.gp;
+                    cpu->out_regs[29]     = loaded_exe.sp;
+                    cpu->out_regs[30]     = loaded_exe.sp;
+                    cpu->next_instruction = 0;
+                    cpu->hle_bios_vectors = true;
+                    strncpy(ui_loaded_path, g_req_load, sizeof(ui_loaded_path) - 1);
+                    ui_running = true;
+                    ui_paused  = false;
+                    fprintf(stderr, "EXE loaded: %s\n", g_req_load);
+                }
+                else
+                {
+                    fprintf(stderr, "Failed to load EXE: %s\n", g_req_load);
+                }
+            }
+            else if (is_disc)
+            {
+                /* Disc hot-swap not yet implemented; inform user */
+                fprintf(stderr, "Disc hot-swap not supported yet: %s\n", g_req_load);
+                strncpy(ui_loaded_path, g_req_load, sizeof(ui_loaded_path) - 1);
+            }
+            g_req_load[0] = '\0';
+        }
+
+        /* ---- Process pause toggle ---- */
+        if (g_req_pause_toggle)
+        {
+            g_req_pause_toggle = false;
+            ui_paused = !ui_paused;
+        }
+
+        /* ---- Process deferred reset ---- */
+        if (g_req_reset)
+        {
+            g_req_reset = false;
+            if (ui_loaded_path[0])
+                strncpy(g_req_load, ui_loaded_path, sizeof(g_req_load) - 1);
+        }
+
+        /* ---- Process quit ---- */
+        if (g_req_quit)
+        {
+            ui_destroy();
+            cpu_destroy(cpu);
+            free(cpu);
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return 0;
+        }
+
+        /* ---- Emulation tick (skip when paused or no game loaded) ---- */
+        if (ui_running && !ui_paused)
+        {
+            uint32_t frame_cycles = 0;
+            while (frame_cycles < CYCLES_PER_FRAME)
+            {
+                uint32_t cycles = cpu_run_next_instruction(cpu);
+                uint32_t fired  = scheduler_step(&cpu->inter.scheduler, cycles, &cpu->inter.irq);
+                timers_step(&cpu->inter.timers, cycles, &cpu->inter.irq, &cpu->inter.scheduler);
+                frame_cycles += cycles;
+
+                if (fired & (1u << EVENT_VBLANK))
+                    gpu_vblank(&cpu->inter.gpu);
+
+                if (fired & (1u << EVENT_CDROM_IRQ))
+                    cdrom_on_scheduler_event(&cpu->inter.cdrom, &cpu->inter.irq,
+                                             &cpu->inter.scheduler);
+            }
+
+            /* SPU clock — catch up for this frame */
             uint64_t now = now_nanos();
             spu_acc += now - spu_now;
-            spu_now  = now;
+            spu_now = now;
             while (spu_acc >= SPU_INTERVAL)
             {
                 spu_acc -= SPU_INTERVAL;
@@ -237,39 +581,42 @@ int main(int argc, char **argv)
             }
         }
 
-        /* SDL events */
-        SDL_Event event;
-        while (SDL_PollEvent(&event))
+        /* ---- FPS counter ---- */
+        fps_frame_count++;
         {
-            if (event.type == SDL_QUIT)
+            uint64_t now = now_nanos();
+            uint64_t elapsed = now - fps_last_ns;
+            if (elapsed >= 500000000ULL) /* update every 0.5s */
             {
-                cpu_destroy(cpu);
-                free(cpu);
-                SDL_DestroyWindow(window);
-                SDL_Quit();
-                return 0;
+                fps_display    = (float)fps_frame_count * 1e9f / (float)elapsed;
+                fps_frame_count = 0;
+                fps_last_ns    = now;
             }
-            if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP)
-                sio_on_key(&cpu->inter.sio, event.key.keysym.scancode,
-                           event.type == SDL_KEYDOWN);
         }
 
-        /* Sleep until next frame deadline to cap at 60 Hz */
+        /* ---- Render: ImGui overlay on top of PSX frame ---- */
+        /* gpu_vblank() already called renderer_upload_frame() during emulation;
+           ui_render() composites ImGui on top and calls SwapWindow. */
+        ui_state.running     = ui_running;
+        ui_state.paused      = ui_paused;
+        ui_state.loaded_path = ui_loaded_path;
+        ui_state.fps         = fps_display;
+        ui_render(&ui_state);
+
+        /* ---- Sleep until next frame deadline to cap at 60 Hz ---- */
         {
             uint64_t now = now_nanos();
             if (now < frame_deadline)
             {
                 uint64_t wait_ns = frame_deadline - now;
-                struct timespec ts = { (time_t)(wait_ns / 1000000000ULL),
-                                       (long)(wait_ns % 1000000000ULL) };
+                struct timespec ts = {(time_t)(wait_ns / 1000000000ULL),
+                                      (long)(wait_ns % 1000000000ULL)};
                 nanosleep(&ts, NULL);
             }
             frame_deadline += FRAME_NS;
-            /* Fell behind — resync so we don't try to catch up indefinitely */
             now = now_nanos();
             if (now > frame_deadline)
                 frame_deadline = now + FRAME_NS;
         }
-
     }
 }

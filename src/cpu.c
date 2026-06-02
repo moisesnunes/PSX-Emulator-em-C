@@ -33,6 +33,16 @@ static inline uint32_t instr_cop_opcode(uint32_t op) { return (op >> 21) & 0x1F;
 /* ---- CPU helpers ---- */
 static inline uint32_t cpu_reg(const Cpu *cpu, uint32_t idx) { return cpu->regs[idx]; }
 
+static inline uint32_t cpu_external_irq_cause(const Cpu *cpu)
+{
+    return irq_pending(&cpu->inter.irq) ? (1u << 10) : 0;
+}
+
+static inline bool cpu_is_bios_vector(uint32_t pc)
+{
+    return pc == 0x000000A0u || pc == 0x000000B0u || pc == 0x000000C0u;
+}
+
 static inline void cpu_set_reg(Cpu *cpu, uint32_t idx, uint32_t val)
 {
     cpu->out_regs[idx] = val;
@@ -75,7 +85,7 @@ static void cpu_exception(Cpu *cpu, Exception cause)
     uint32_t handler = (cpu->sr & (1 << 22)) ? 0xBFC00180 : 0x80000080;
     uint32_t mode = cpu->sr & 0x3F;
     cpu->sr = (cpu->sr & ~0x3Fu) | ((mode << 2) & 0x3F);
-    cpu->cause = (uint32_t)cause << 2;
+    cpu->cause = ((uint32_t)cause << 2) | cpu_external_irq_cause(cpu);
     cpu->epc = cpu->current_pc;
     if (cpu->delay_slot)
     {
@@ -384,6 +394,7 @@ int cpu_init(Cpu *cpu, const char *bios_path, SDL_Window *window, bool headless,
     cpu->next_pc = 0xBFC00004;
     cpu->next_instruction = 0;
     cpu->sr = 0;
+    cpu->badvaddr = 0;
     cpu->current_pc = 0;
     cpu->cause = 0;
     cpu->epc = 0;
@@ -392,6 +403,7 @@ int cpu_init(Cpu *cpu, const char *bios_path, SDL_Window *window, bool headless,
     cpu->hi = cpu->lo = 0xDEADBEEF;
     cpu->branch = false;
     cpu->delay_slot = false;
+    cpu->hle_bios_vectors = false;
     gte_init(&cpu->gte);
 
     return interconnect_init(&cpu->inter, bios_path, window, headless, disc_path);
@@ -405,23 +417,45 @@ void cpu_destroy(Cpu *cpu)
 /* ---- Main step ---- */
 uint32_t cpu_run_next_instruction(Cpu *cpu)
 {
-    /* Check for pending hardware interrupt before fetching the next instruction.
-       SR bit 0 (IEc) enables interrupts at the CPU level. */
-    if ((cpu->sr & 0x1) && irq_pending(&cpu->inter.irq))
+    cpu->current_pc = cpu->pc;
+
+    /* Hardware interrupts are sampled between instructions, but not between a
+       branch and its delay slot. Let the delay slot retire, then take the IRQ
+       at the branch target on the next step. */
+    if (!cpu->branch && (cpu->sr & 0x1) && irq_pending(&cpu->inter.irq))
     {
-        LOG(LOG_IRQ, "CPU interrupt: SR=0x%08x status=0x%04x mask=0x%04x",
-            cpu->sr, cpu->inter.irq.status, cpu->inter.irq.mask);
-        cpu->current_pc = cpu->pc;
+        LOG(LOG_IRQ, "CPU interrupt: SR=0x%08x status=0x%04x mask=0x%04x pc=0x%08x",
+            cpu->sr, cpu->inter.irq.status, cpu->inter.irq.mask, cpu->current_pc);
         cpu->delay_slot = false;
         cpu->branch = false;
         cpu_exception(cpu, EXC_INTERRUPT);
         return 2;
     }
 
-    cpu->current_pc = cpu->pc;
     if (cpu->current_pc % 4 != 0)
     {
+        cpu->badvaddr = cpu->current_pc;
         cpu_exception(cpu, EXC_LOAD_ADDRESS_ERROR);
+        return 2;
+    }
+
+    if (cpu->hle_bios_vectors && cpu_is_bios_vector(cpu->current_pc))
+    {
+        uint32_t vector = cpu->current_pc;
+        uint32_t call = cpu->regs[9]; /* t1 */
+
+        cpu_set_reg(cpu, cpu->load_reg, cpu->load_val);
+        cpu->load_reg = 0;
+        cpu->load_val = 0;
+
+        LOG(LOG_CPU, "HLE BIOS call vector=0x%02X call=0x%02X ra=0x%08X",
+            vector, call, cpu->regs[31]);
+        cpu_set_reg(cpu, 2, 0);
+        cpu->pc = cpu->regs[31];
+        cpu->next_pc = cpu->pc + 4;
+        cpu->delay_slot = false;
+        cpu->branch = false;
+        memcpy(cpu->regs, cpu->out_regs, sizeof(cpu->regs));
         return 2;
     }
     uint32_t op = cpu_load32(cpu, cpu->pc);
@@ -465,6 +499,7 @@ static void op_sw(Cpu *cpu, uint32_t op)
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     if (addr % 4 != 0)
     {
+        cpu->badvaddr = addr;
         cpu_exception(cpu, EXC_STORE_ADDRESS_ERROR);
         return;
     }
@@ -550,13 +585,15 @@ static void op_cop0(Cpu *cpu, uint32_t op)
 static void op_cop2(Cpu *cpu, uint32_t op)
 {
     uint32_t cop_op = instr_cop_opcode(op);
-    if (cop_op & 0x10) {
+    if (cop_op & 0x10)
+    {
         /* bit 25 set → execute GTE command */
         gte_execute(&cpu->gte, op & 0x1FFFFFF);
         return;
     }
     uint32_t reg = instr_d(op);
-    switch (cop_op) {
+    switch (cop_op)
+    {
     case 0b00000: /* MFC2 — move from GTE data reg */
         cpu_set_reg(cpu, instr_t(op), gte_read_data(&cpu->gte, reg));
         break;
@@ -577,18 +614,30 @@ static void op_cop2(Cpu *cpu, uint32_t op)
 
 static void op_lwc2(Cpu *cpu, uint32_t op)
 {
-    if (cpu->sr & 0x10000) return; /* cache isolated */
+    if (cpu->sr & 0x10000)
+        return; /* cache isolated */
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
-    if (addr % 4 != 0) { cpu_exception(cpu, EXC_LOAD_ADDRESS_ERROR); return; }
+    if (addr % 4 != 0)
+    {
+        cpu->badvaddr = addr;
+        cpu_exception(cpu, EXC_LOAD_ADDRESS_ERROR);
+        return;
+    }
     uint32_t val = cpu_load32(cpu, addr);
     gte_load(&cpu->gte, instr_t(op), val);
 }
 
 static void op_swc2(Cpu *cpu, uint32_t op)
 {
-    if (cpu->sr & 0x10000) return;
+    if (cpu->sr & 0x10000)
+        return;
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
-    if (addr % 4 != 0) { cpu_exception(cpu, EXC_STORE_ADDRESS_ERROR); return; }
+    if (addr % 4 != 0)
+    {
+        cpu->badvaddr = addr;
+        cpu_exception(cpu, EXC_STORE_ADDRESS_ERROR);
+        return;
+    }
     cpu_store32(cpu, addr, gte_store(&cpu->gte, instr_t(op)));
 }
 
@@ -616,6 +665,7 @@ static void op_lw(Cpu *cpu, uint32_t op)
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     if (addr % 4 != 0)
     {
+        cpu->badvaddr = addr;
         cpu_exception(cpu, EXC_LOAD_ADDRESS_ERROR);
         return;
     }
@@ -640,6 +690,7 @@ static void op_sh(Cpu *cpu, uint32_t op)
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     if (addr % 2 != 0)
     {
+        cpu->badvaddr = addr;
         cpu_exception(cpu, EXC_STORE_ADDRESS_ERROR);
         return;
     }
@@ -690,14 +741,28 @@ static void op_mfc0(Cpu *cpu, uint32_t op)
     uint32_t v;
     switch (cop_r)
     {
+    case 3:
+    case 5:
+    case 6:
+    case 7:
+    case 9:
+    case 11:
+        v = 0;
+        break;
+    case 8:
+        v = cpu->badvaddr;
+        break;
     case 12:
         v = cpu->sr;
         break;
     case 13:
-        v = cpu->cause;
+        v = cpu->cause | cpu_external_irq_cause(cpu);
         break;
     case 14:
         v = cpu->epc;
+        break;
+    case 15:
+        v = 0x00000002; /* PRId: R3000A */
         break;
     default:
         fprintf(stderr, "Unhandled mfc0 r%u\n", cop_r);
@@ -756,7 +821,7 @@ static void op_bxx(Cpu *cpu, uint32_t op)
     int32_t v = (int32_t)cpu_reg(cpu, instr_s(op));
     uint32_t test = ((uint32_t)(v < 0)) ^ is_bgez;
     if (is_link)
-        cpu_set_reg(cpu, 31, cpu->pc);
+        cpu_set_reg(cpu, 31, cpu->next_pc);
     if (test)
         cpu_branch(cpu, instr_imm_se(op));
 }
@@ -835,6 +900,13 @@ static void op_slt(Cpu *cpu, uint32_t op)
 static void op_syscall(Cpu *cpu, uint32_t op)
 {
     (void)op;
+    uint32_t code = cpu_reg(cpu, 4);
+    if (cpu->hle_bios_vectors && (code == 1 || code == 2))
+    {
+        LOG(LOG_CPU, "HLE syscall %u at 0x%08X", code, cpu->current_pc);
+        cpu_set_reg(cpu, 2, 0);
+        return;
+    }
     LOG(LOG_CPU, "syscall at 0x%08X r4=0x%08X r9=0x%08X",
         cpu->current_pc, cpu_reg(cpu, 4), cpu_reg(cpu, 9));
     cpu_exception(cpu, EXC_SYSCALL);
@@ -869,6 +941,7 @@ static void op_lhu(Cpu *cpu, uint32_t op)
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     if (addr % 2 != 0)
     {
+        cpu->badvaddr = addr;
         cpu_exception(cpu, EXC_LOAD_ADDRESS_ERROR);
         return;
     }
@@ -884,6 +957,12 @@ static void op_sllv(Cpu *cpu, uint32_t op)
 static void op_lh(Cpu *cpu, uint32_t op)
 {
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
+    if (addr % 2 != 0)
+    {
+        cpu->badvaddr = addr;
+        cpu_exception(cpu, EXC_LOAD_ADDRESS_ERROR);
+        return;
+    }
     cpu->load_reg = instr_t(op);
     cpu->load_val = (uint32_t)(int32_t)(int16_t)cpu_load16(cpu, addr);
 }

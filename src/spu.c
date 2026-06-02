@@ -682,10 +682,10 @@ void spu_clock(Spu *spu)
 void spu_dma_write(Spu *spu, uint32_t word)
 {
     uint32_t addr = spu->sound_ram_start_address & (SOUND_RAM_SIZE - 1u);
-    spu->sound_ram[addr]     = (uint8_t)(word & 0xFF);
+    spu->sound_ram[addr] = (uint8_t)(word & 0xFF);
     spu->sound_ram[addr + 1] = (uint8_t)((word >> 8) & 0xFF);
     uint32_t addr2 = (addr + 2u) & (SOUND_RAM_SIZE - 1u);
-    spu->sound_ram[addr2]     = (uint8_t)((word >> 16) & 0xFF);
+    spu->sound_ram[addr2] = (uint8_t)((word >> 16) & 0xFF);
     spu->sound_ram[addr2 + 1] = (uint8_t)((word >> 24) & 0xFF);
     spu->sound_ram_start_address = (addr + 4u) & (SOUND_RAM_SIZE - 1u);
 }

@@ -21,6 +21,7 @@ static const struct
     {"CDROM", LOG_CDROM},
     {"SPU", LOG_SPU},
     {"SIO", LOG_SIO},
+    {"MDEC", LOG_MDEC},
 };
 
 static const char *subsystem_prefix[] = {
@@ -31,6 +32,7 @@ static const char *subsystem_prefix[] = {
     [LOG_CDROM] = "CDROM",
     [LOG_SPU] = "SPU",
     [LOG_SIO] = "SIO",
+    [LOG_MDEC] = "MDEC",
 };
 
 void log_init(void)

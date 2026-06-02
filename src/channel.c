@@ -65,6 +65,16 @@ uint32_t channel_block_control(const Channel *ch)
     return ((uint32_t)ch->block_count << 16) | ch->block_size;
 }
 
+uint16_t channel_block_size(const Channel *ch)
+{
+    return ch->block_size;
+}
+
+uint16_t channel_block_count(const Channel *ch)
+{
+    return ch->block_count;
+}
+
 void channel_set_block_control(Channel *ch, uint32_t val)
 {
     ch->block_size = (uint16_t)(val);

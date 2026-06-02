@@ -1,4 +1,5 @@
 #include "dma.h"
+#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -54,6 +55,11 @@ static bool dma_irq(const Dma *dma)
     return dma->force_irq || (dma->irq_en && channel_irq != 0);
 }
 
+bool dma_irq_pending(const Dma *dma)
+{
+    return dma_irq(dma);
+}
+
 uint32_t dma_interrupt(const Dma *dma)
 {
     return (uint32_t)dma->irq_dummy | ((uint32_t)dma->force_irq << 15) | ((uint32_t)dma->channel_irq_en << 16) | ((uint32_t)dma->irq_en << 23) | ((uint32_t)dma->channel_irq_flags << 24) | ((uint32_t)dma_irq(dma) << 31);
@@ -61,12 +67,23 @@ uint32_t dma_interrupt(const Dma *dma)
 
 void dma_set_interrupt(Dma *dma, uint32_t val)
 {
+    uint32_t before = dma_interrupt(dma);
     dma->irq_dummy = val & 0x3F;
     dma->force_irq = (val >> 15) & 1;
     dma->channel_irq_en = (val >> 16) & 0x7F;
     dma->irq_en = (val >> 23) & 1;
-    uint8_t ack = (val >> 24) & 0x3F;
+    uint8_t ack = (val >> 24) & 0x7F;
     dma->channel_irq_flags = dma->channel_irq_flags & ~ack;
+    LOG(LOG_DMA, "DICR write val=0x%08X before=0x%08X after=0x%08X ack=0x%02X",
+        val, before, dma_interrupt(dma), ack);
+}
+
+void dma_mark_channel_done(Dma *dma, Port port)
+{
+    dma->channel_irq_flags |= (uint8_t)(1u << (uint8_t)port);
+    LOG(LOG_DMA, "done port=%u flags=0x%02X en=0x%02X irq_en=%u pending=%u dicr=0x%08X",
+        (unsigned)port, dma->channel_irq_flags, dma->channel_irq_en,
+        dma->irq_en ? 1u : 0u, dma_irq(dma) ? 1u : 0u, dma_interrupt(dma));
 }
 
 Channel *dma_channel(Dma *dma, Port port)

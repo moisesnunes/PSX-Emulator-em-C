@@ -154,6 +154,50 @@ static void cmd_gettd(Cdrom *cd, Scheduler *sched)
         cd->resp_fifo[1], cd->resp_fifo[2]);
 }
 
+/* Test (0x19) — CD-ROM controller subcommands.
+   The retail BIOS commonly uses 19h,20h to query controller version. */
+static void cmd_test(Cdrom *cd, Scheduler *sched)
+{
+    uint8_t sub = param_pop(cd);
+    resp_clear(cd);
+    switch (sub)
+    {
+    case 0x20: /* version: 10 Jan 1997, vC2 (US/EUR PU-18) */
+        resp_push(cd, 0x97);
+        resp_push(cd, 0x01);
+        resp_push(cd, 0x10);
+        resp_push(cd, 0xC2);
+        queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+        break;
+    case 0x21: /* switches: head not at POS0, door closed */
+        resp_push(cd, 0x00);
+        queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+        break;
+    case 0x22: { /* region string */
+        static const uint8_t region[] = {'f', 'o', 'r', ' ', 'U', '/', 'C'};
+        for (size_t i = 0; i < sizeof(region); i++)
+            resp_push(cd, region[i]);
+        queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+        break;
+    }
+    case 0x04: /* start/read SCEx string */
+        resp_push(cd, make_stat(cd));
+        queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+        break;
+    case 0x05: /* SCEx counters: licensed disc */
+        resp_push(cd, cd->disc ? 0x01 : 0x00);
+        resp_push(cd, cd->disc ? 0x01 : 0x00);
+        queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+        break;
+    default:
+        resp_push(cd, 0x11);
+        resp_push(cd, 0x10);
+        queue_event(cd, sched, CDROM_INT5, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+        break;
+    }
+    LOG(LOG_CDROM, "Test sub=0x%02X", sub);
+}
+
 /* Getstat (0x01) */
 static void cmd_getstat(Cdrom *cd, Scheduler *sched)
 {
@@ -166,6 +210,7 @@ static void cmd_getstat(Cdrom *cd, Scheduler *sched)
 /* Init (0x0A) */
 static void cmd_init(Cdrom *cd, Scheduler *sched)
 {
+    evq_clear(&cd->evq);
     cd->double_speed = false;
     cd->xa_adpcm_en = false;
     cd->report_mode = false;
@@ -174,7 +219,7 @@ static void cmd_init(Cdrom *cd, Scheduler *sched)
     cd->state = CDROM_STATE_IDLE;
     resp_clear(cd);
     resp_push(cd, make_stat(cd));
-    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_CMD_DELAY);
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_INIT_ACK, CDROM_CMD_DELAY);
     LOG(LOG_CDROM, "Init");
 }
 
@@ -196,30 +241,8 @@ static void cmd_setmode(Cdrom *cd, Scheduler *sched)
 static void cmd_getid(Cdrom *cd, Scheduler *sched)
 {
     resp_clear(cd);
-    if (!cd->disc)
-    {
-        resp_push(cd, 0x08); /* error stat: motor off */
-        resp_push(cd, 0x40); /* no disc */
-        resp_push(cd, 0x00);
-        resp_push(cd, 0x00);
-        resp_push(cd, 0x00);
-        resp_push(cd, 0x00);
-        resp_push(cd, 0x00);
-        resp_push(cd, 0x00);
-        queue_event(cd, sched, CDROM_INT5, CDROM_PHASE_ACK, CDROM_CMD_DELAY);
-    }
-    else
-    {
-        resp_push(cd, make_stat(cd));
-        resp_push(cd, 0x00); /* licensed */
-        resp_push(cd, 0x20); /* mode 2 data */
-        resp_push(cd, 0x00);
-        resp_push(cd, 'S');
-        resp_push(cd, 'C');
-        resp_push(cd, 'E');
-        resp_push(cd, 'I');
-        queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_CMD_DELAY);
-    }
+    resp_push(cd, make_stat(cd));
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_GETID_ACK, CDROM_ACK_DELAY);
     LOG(LOG_CDROM, "GetID disc=%s", cd->disc ? "present" : "absent");
 }
 
@@ -240,7 +263,7 @@ static void cmd_setloc(Cdrom *cd, Scheduler *sched)
 /* SeekL (0x15):
    event 1 (SEEK_ACK phase)  → INT3 + seeking stat
    event 2 (SEEK_DONE phase) → INT2 + idle stat */
-static void cmd_seekl(Cdrom *cd, Scheduler *sched)
+static void cmd_seek(Cdrom *cd, Scheduler *sched, const char *name)
 {
     if (cd->seek_pending)
     {
@@ -251,13 +274,24 @@ static void cmd_seekl(Cdrom *cd, Scheduler *sched)
     resp_clear(cd);
     resp_push(cd, make_stat(cd)); /* stat with SEEKING bit set */
     queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_SEEK_ACK, CDROM_ACK_DELAY);
-    LOG(LOG_CDROM, "SeekL LBA=%u", cd->cur_lba);
+    LOG(LOG_CDROM, "%s LBA=%u", name, cd->cur_lba);
 }
 
-/* ReadN (0x06):
+static void cmd_seekl(Cdrom *cd, Scheduler *sched)
+{
+    cmd_seek(cd, sched, "SeekL");
+}
+
+static void cmd_seekp(Cdrom *cd, Scheduler *sched)
+{
+    cmd_seek(cd, sched, "SeekP");
+}
+
+/* ReadN (0x06) / ReadS (0x1B):
    event 1 (ACK phase)       → INT3 + reading stat
-   event 2 (READ_DATA phase) → INT1 + sector data  */
-static void cmd_readn(Cdrom *cd, Scheduler *sched)
+   event 2 (READ_DATA phase) → INT1 + sector data
+   ReadS skips sub-header checking; behaviour is identical for Mode 1 data. */
+static void cmd_read(Cdrom *cd, uint8_t cmd, Scheduler *sched)
 {
     if (cd->seek_pending)
     {
@@ -268,16 +302,17 @@ static void cmd_readn(Cdrom *cd, Scheduler *sched)
     resp_clear(cd);
     resp_push(cd, make_stat(cd)); /* stat with READING bit set */
     queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_READ_DATA, CDROM_ACK_DELAY);
-    LOG(LOG_CDROM, "ReadN LBA=%u", cd->cur_lba);
+    LOG(LOG_CDROM, "Read%c LBA=%u", cmd == 0x06 ? 'N' : 'S', cd->cur_lba);
 }
 
 /* Pause (0x09) */
 static void cmd_pause(Cdrom *cd, Scheduler *sched)
 {
     cd->state = CDROM_STATE_IDLE;
+    evq_clear(&cd->evq);
     resp_clear(cd);
     resp_push(cd, make_stat(cd));
-    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_PAUSE_ACK, CDROM_ACK_DELAY);
     LOG(LOG_CDROM, "Pause");
 }
 
@@ -289,6 +324,28 @@ static void cmd_stop(Cdrom *cd, Scheduler *sched)
     resp_push(cd, make_stat(cd));
     queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
     LOG(LOG_CDROM, "Stop");
+}
+
+/* Mute (0x0B) / Demute (0x0C).
+   Audio output is not implemented yet, but BIOS/game code expects the command
+   to acknowledge successfully while configuring CD-DA playback state. */
+static void cmd_audio_mute(Cdrom *cd, Scheduler *sched, bool muted)
+{
+    resp_clear(cd);
+    resp_push(cd, make_stat(cd));
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+    LOG(LOG_CDROM, "%s", muted ? "Mute" : "Demute");
+}
+
+/* ReadTOC (0x1E) — reload table of contents.
+   Minimal single-track images already have TOC data in Disc. */
+static void cmd_readtoc(Cdrom *cd, Scheduler *sched)
+{
+    cd->state = CDROM_STATE_SEEKING;
+    resp_clear(cd);
+    resp_push(cd, make_stat(cd));
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_READTOC_ACK, CDROM_ACK_DELAY);
+    LOG(LOG_CDROM, "ReadTOC");
 }
 
 /* ---- Dispatch ---- */
@@ -303,7 +360,8 @@ static void execute_command(Cdrom *cd, uint8_t cmd, Scheduler *sched)
         cmd_setloc(cd, sched);
         break;
     case 0x06:
-        cmd_readn(cd, sched);
+    case 0x1B:
+        cmd_read(cd, cmd, sched);
         break;
     case 0x08:
         cmd_stop(cd, sched);
@@ -313,6 +371,12 @@ static void execute_command(Cdrom *cd, uint8_t cmd, Scheduler *sched)
         break;
     case 0x0A:
         cmd_init(cd, sched);
+        break;
+    case 0x0B:
+        cmd_audio_mute(cd, sched, true);
+        break;
+    case 0x0C:
+        cmd_audio_mute(cd, sched, false);
         break;
     case 0x0E:
         cmd_setmode(cd, sched);
@@ -326,8 +390,17 @@ static void execute_command(Cdrom *cd, uint8_t cmd, Scheduler *sched)
     case 0x15:
         cmd_seekl(cd, sched);
         break;
+    case 0x16:
+        cmd_seekp(cd, sched);
+        break;
+    case 0x19:
+        cmd_test(cd, sched);
+        break;
     case 0x1A:
         cmd_getid(cd, sched);
+        break;
+    case 0x1E:
+        cmd_readtoc(cd, sched);
         break;
     default:
         resp_clear(cd);
@@ -337,6 +410,37 @@ static void execute_command(Cdrom *cd, uint8_t cmd, Scheduler *sched)
         LOG(LOG_CDROM, "Unknown command 0x%02X", cmd);
         break;
     }
+}
+
+static void execute_or_defer_command(Cdrom *cd, uint8_t cmd, Scheduler *sched)
+{
+    if (cd->irq_flag != 0)
+    {
+        cd->pending_cmd_valid = true;
+        cd->pending_cmd = cmd;
+        cd->pending_param_len = cd->param_len;
+        memcpy(cd->pending_param_fifo, cd->param_fifo, cd->param_len);
+        cd->param_len = 0;
+        LOG(LOG_CDROM, "Command 0x%02X deferred while INT%d pending", cmd, cd->irq_flag);
+        return;
+    }
+
+    execute_command(cd, cmd, sched);
+}
+
+static void execute_pending_command(Cdrom *cd, Scheduler *sched)
+{
+    if (!cd->pending_cmd_valid || cd->irq_flag != 0)
+        return;
+
+    uint8_t cmd = cd->pending_cmd;
+    cd->pending_cmd_valid = false;
+    cd->param_len = cd->pending_param_len;
+    memcpy(cd->param_fifo, cd->pending_param_fifo, cd->pending_param_len);
+    cd->pending_param_len = 0;
+
+    LOG(LOG_CDROM, "Command 0x%02X released after IRQ ack", cmd);
+    execute_command(cd, cmd, sched);
 }
 
 /* ---- Public API ---- */
@@ -404,7 +508,7 @@ void cdrom_store8(Cdrom *cd, uint32_t offset, uint8_t val,
         switch (cd->index)
         {
         case 0:
-            execute_command(cd, val, sched);
+            execute_or_defer_command(cd, val, sched);
             return;
         default:
             return; /* sound map / other — ignore */
@@ -432,8 +536,13 @@ void cdrom_store8(Cdrom *cd, uint32_t offset, uint8_t val,
         case 1:
             /* Interrupt flag acknowledge: writing 1 clears the bit */
             cd->irq_flag &= ~(val & 0x1F);
+            if (val & 0x1F)
+                resp_clear(cd);
+            if (cd->irq_flag == 0)
+                irq_deassert(irq, IRQ_CDROM);
             if (val & 0x40)
                 cd->param_len = 0; /* reset param FIFO */
+            execute_pending_command(cd, sched);
             return;
         default:
             return;
@@ -537,6 +646,21 @@ void cdrom_on_scheduler_event(Cdrom *cd, Irq *irq, Scheduler *sched)
         log_irq_event(ev.int_type);
         break;
 
+    case CDROM_PHASE_INIT_ACK:
+        commit_irq(cd, irq, ev.int_type);
+        log_irq_event(ev.int_type);
+        evq_push(&cd->evq, CDROM_INT2, CDROM_PHASE_INIT_DONE, CDROM_CMD_DELAY);
+        break;
+
+    case CDROM_PHASE_INIT_DONE:
+        cd->state = CDROM_STATE_IDLE;
+        resp_clear(cd);
+        resp_push(cd, make_stat(cd));
+        commit_irq(cd, irq, ev.int_type);
+        log_irq_event(ev.int_type);
+        LOG(LOG_CDROM, "Init complete");
+        break;
+
     case CDROM_PHASE_SEEK_ACK:
         /* Deliver INT3 ack (seeking stat already in resp FIFO). */
         commit_irq(cd, irq, ev.int_type);
@@ -553,6 +677,73 @@ void cdrom_on_scheduler_event(Cdrom *cd, Irq *irq, Scheduler *sched)
         commit_irq(cd, irq, ev.int_type);
         log_irq_event(ev.int_type);
         LOG(LOG_CDROM, "SeekL complete INT2 LBA=%u", cd->cur_lba);
+        break;
+
+    case CDROM_PHASE_GETID_ACK:
+        /* Deliver INT3 ack (stat already in resp FIFO), then queue ID result. */
+        commit_irq(cd, irq, ev.int_type);
+        log_irq_event(ev.int_type);
+        evq_push(&cd->evq, cd->disc ? CDROM_INT2 : CDROM_INT5,
+                 CDROM_PHASE_GETID_DONE, CDROM_CMD_DELAY);
+        break;
+
+    case CDROM_PHASE_GETID_DONE:
+        /* Prepare and deliver the second GetID response. */
+        resp_clear(cd);
+        if (!cd->disc)
+        {
+            resp_push(cd, 0x08); /* error stat: motor off */
+            resp_push(cd, 0x40); /* no disc */
+            resp_push(cd, 0x00);
+            resp_push(cd, 0x00);
+            resp_push(cd, 0x00);
+            resp_push(cd, 0x00);
+            resp_push(cd, 0x00);
+            resp_push(cd, 0x00);
+        }
+        else
+        {
+            resp_push(cd, make_stat(cd));
+            resp_push(cd, 0x00); /* licensed */
+            resp_push(cd, 0x20); /* mode 2 data */
+            resp_push(cd, 0x00);
+            resp_push(cd, 'S');
+            resp_push(cd, 'C');
+            resp_push(cd, 'E');
+            resp_push(cd, 'A');
+        }
+        commit_irq(cd, irq, ev.int_type);
+        log_irq_event(ev.int_type);
+        break;
+
+    case CDROM_PHASE_READTOC_ACK:
+        commit_irq(cd, irq, ev.int_type);
+        log_irq_event(ev.int_type);
+        evq_push(&cd->evq, CDROM_INT2, CDROM_PHASE_READTOC_DONE, CDROM_SEEK_DELAY);
+        break;
+
+    case CDROM_PHASE_READTOC_DONE:
+        cd->state = CDROM_STATE_IDLE;
+        resp_clear(cd);
+        resp_push(cd, make_stat(cd));
+        commit_irq(cd, irq, ev.int_type);
+        log_irq_event(ev.int_type);
+        LOG(LOG_CDROM, "ReadTOC complete");
+        break;
+
+    case CDROM_PHASE_PAUSE_ACK:
+        commit_irq(cd, irq, ev.int_type);
+        log_irq_event(ev.int_type);
+        evq_push(&cd->evq, CDROM_INT2, CDROM_PHASE_PAUSE_DONE, CDROM_CMD_DELAY);
+        break;
+
+    case CDROM_PHASE_PAUSE_DONE:
+        cd->state = CDROM_STATE_IDLE;
+        resp_clear(cd);
+        resp_push(cd, make_stat(cd));
+        commit_irq(cd, irq, ev.int_type);
+        log_irq_event(ev.int_type);
+        LOG(LOG_CDROM, "Pause complete");
         break;
 
     case CDROM_PHASE_READ_DATA:

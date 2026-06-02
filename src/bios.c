@@ -18,6 +18,11 @@ uint32_t bios_load32(const Bios *bios, uint32_t offset)
     return (uint32_t)bios->data[offset] | ((uint32_t)bios->data[offset + 1] << 8) | ((uint32_t)bios->data[offset + 2] << 16) | ((uint32_t)bios->data[offset + 3] << 24);
 }
 
+uint16_t bios_load16(const Bios *bios, uint32_t offset)
+{
+    return (uint16_t)bios->data[offset] | ((uint16_t)bios->data[offset + 1] << 8);
+}
+
 uint8_t bios_load8(const Bios *bios, uint32_t offset)
 {
     return bios->data[offset];

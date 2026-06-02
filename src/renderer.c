@@ -138,11 +138,11 @@ void renderer_init(Renderer *r, SDL_Window *window)
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-void renderer_display(Renderer *r,
-                      const uint16_t *vram,
-                      uint16_t display_x, uint16_t display_y,
-                      uint16_t display_w, uint16_t display_h,
-                      bool display_24bit)
+void renderer_upload_frame(Renderer *r,
+                           const uint16_t *vram,
+                           uint16_t display_x, uint16_t display_y,
+                           uint16_t display_w, uint16_t display_h,
+                           bool display_24bit)
 {
     if (!r->window)
         return;
@@ -203,22 +203,10 @@ void renderer_display(Renderer *r,
     float v1 = (float)display_h / 512.0f;
 
     float quad[] = {
-        -1.0f,
-        1.0f,
-        u0,
-        v0,
-        -1.0f,
-        -1.0f,
-        u0,
-        v1,
-        1.0f,
-        1.0f,
-        u1,
-        v0,
-        1.0f,
-        -1.0f,
-        u1,
-        v1,
+        -1.0f,  1.0f, u0, v0,
+        -1.0f, -1.0f, u0, v1,
+         1.0f,  1.0f, u1, v0,
+         1.0f, -1.0f, u1, v1,
     };
     glBindBuffer(GL_ARRAY_BUFFER, r->vbo);
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(quad), quad);
@@ -231,8 +219,24 @@ void renderer_display(Renderer *r,
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
     glBindTexture(GL_TEXTURE_2D, 0);
+}
 
+void renderer_present(Renderer *r)
+{
+    if (!r->window)
+        return;
     SDL_GL_SwapWindow(r->window);
+}
+
+void renderer_display(Renderer *r,
+                      const uint16_t *vram,
+                      uint16_t display_x, uint16_t display_y,
+                      uint16_t display_w, uint16_t display_h,
+                      bool display_24bit)
+{
+    renderer_upload_frame(r, vram, display_x, display_y,
+                          display_w, display_h, display_24bit);
+    renderer_present(r);
 }
 
 void renderer_destroy(Renderer *r)

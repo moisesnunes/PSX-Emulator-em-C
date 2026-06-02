@@ -25,6 +25,7 @@ typedef enum
 
 void irq_init(Irq *irq);
 void irq_assert(Irq *irq, IrqFlag flag);
+void irq_deassert(Irq *irq, IrqFlag flag);
 bool irq_pending(const Irq *irq);
 uint32_t irq_load32(const Irq *irq, uint32_t offset);
 uint16_t irq_load16(const Irq *irq, uint32_t offset);

@@ -24,18 +24,21 @@ static int range_contains(Range r, uint32_t addr, uint32_t *offset)
 
 static const Range MAP_RAM = {0x00000000, 2 * 1024 * 1024};
 static const Range MAP_BIOS = {0x1FC00000, 512 * 1024};
+static const Range MAP_SCRATCHPAD = {0x1F800000, 1024};
 static const Range MAP_MEM_CONTROL = {0x1F801000, 36};
 static const Range MAP_RAM_SIZE = {0x1F801060, 4};
 static const Range MAP_CACHE_CTRL = {0xFFFE0130, 4};
 static const Range MAP_SPU = {0x1F801C00, 640};
 static const Range MAP_EXPANSION2 = {0x1F802000, 66};
 static const Range MAP_EXPANSION1 = {0x1F000000, 512 * 1024};
+static const Range MAP_EXPANSION3 = {0x1FA00000, 2 * 1024 * 1024};
 static const Range MAP_IRQ_CONTROL = {0x1F801070, 8};
 static const Range MAP_TIMERS = {0x1F801100, 16 * 3};
 static const Range MAP_DMA = {0x1F801080, 0x80};
 static const Range MAP_GPU = {0x1F801810, 8};
+static const Range MAP_MDEC = {0x1F801820, 8};
 static const Range MAP_CDROM = {0x1F801800, 4};
-static const Range MAP_SIO   = {0x1F801040, 16};
+static const Range MAP_SIO = {0x1F801040, 32};
 
 static const uint32_t REGION_MASK[8] = {
     0xFFFFFFFF,
@@ -51,6 +54,34 @@ static const uint32_t REGION_MASK[8] = {
 static uint32_t mask_region(uint32_t addr)
 {
     return addr & REGION_MASK[addr >> 29];
+}
+
+static uint32_t scratch_load32(const Interconnect *inter, uint32_t offset)
+{
+    return (uint32_t)inter->scratchpad[offset] |
+           ((uint32_t)inter->scratchpad[offset + 1] << 8) |
+           ((uint32_t)inter->scratchpad[offset + 2] << 16) |
+           ((uint32_t)inter->scratchpad[offset + 3] << 24);
+}
+
+static uint16_t scratch_load16(const Interconnect *inter, uint32_t offset)
+{
+    return (uint16_t)inter->scratchpad[offset] |
+           ((uint16_t)inter->scratchpad[offset + 1] << 8);
+}
+
+static void scratch_store32(Interconnect *inter, uint32_t offset, uint32_t val)
+{
+    inter->scratchpad[offset] = (uint8_t)val;
+    inter->scratchpad[offset + 1] = (uint8_t)(val >> 8);
+    inter->scratchpad[offset + 2] = (uint8_t)(val >> 16);
+    inter->scratchpad[offset + 3] = (uint8_t)(val >> 24);
+}
+
+static void scratch_store16(Interconnect *inter, uint32_t offset, uint16_t val)
+{
+    inter->scratchpad[offset] = (uint8_t)val;
+    inter->scratchpad[offset + 1] = (uint8_t)(val >> 8);
 }
 
 /* ---- DMA register helpers ---- */
@@ -162,6 +193,10 @@ static void do_dma_block(Interconnect *inter, Port port)
         fprintf(stderr, "Couldn't figure out DMA block transfer size\n");
         exit(1);
     }
+    if (remsz == 0 && port == PORT_MDEC_OUT)
+        remsz = channel_block_count(ch) ? channel_block_count(ch) : channel_block_size(ch);
+    LOG(LOG_DMA, "DMA block port=%d dir=%d addr=0x%06X bs=%u bc=%u words=%u", port,
+        channel_direction(ch), addr, channel_block_size(ch), channel_block_count(ch), remsz);
     while (remsz > 0)
     {
         uint32_t cur_addr = addr & 0x001FFFFC;
@@ -172,6 +207,9 @@ static void do_dma_block(Interconnect *inter, Port port)
             uint32_t src = ram_load32(&inter->ram, cur_addr);
             switch (port)
             {
+            case PORT_MDEC_IN:
+                mdec_dma_write(&inter->mdec, src);
+                break;
             case PORT_GPU:
                 gpu_gp0(&inter->gpu, src);
                 break;
@@ -189,6 +227,9 @@ static void do_dma_block(Interconnect *inter, Port port)
             uint32_t src;
             switch (port)
             {
+            case PORT_MDEC_OUT:
+                src = mdec_dma_read(&inter->mdec);
+                break;
             case PORT_OTC:
                 src = (remsz == 1) ? 0x00FFFFFF
                                    : (addr - 4) & 0x001FFFFF;
@@ -211,6 +252,7 @@ static void do_dma_block(Interconnect *inter, Port port)
         remsz--;
     }
     channel_done(ch);
+    LOG(LOG_DMA, "DMA done port=%d", port);
 }
 
 static void do_dma_linked_list(Interconnect *inter, Port port)
@@ -262,6 +304,7 @@ int interconnect_init(Interconnect *inter, const char *bios_path, SDL_Window *wi
     ram_init(&inter->ram);
     dma_init(&inter->dma);
     gpu_init(&inter->gpu, window);
+    mdec_init(&inter->mdec);
     if (!headless && spu_init(&inter->spu) != 0)
         return -1;
     irq_init(&inter->irq);
@@ -301,12 +344,16 @@ uint32_t interconnect_load32(Interconnect *inter, uint32_t addr)
 
     if (range_contains(MAP_BIOS, abs, &off))
         return bios_load32(&inter->bios, off);
+    if (range_contains(MAP_SCRATCHPAD, abs, &off))
+        return scratch_load32(inter, off);
     if (range_contains(MAP_RAM, abs, &off))
         return ram_load32(&inter->ram, off);
     if (range_contains(MAP_IRQ_CONTROL, abs, &off))
         return irq_load32(&inter->irq, off);
     if (range_contains(MAP_DMA, abs, &off))
         return dma_reg_read(inter, off);
+    if (range_contains(MAP_MDEC, abs, &off))
+        return mdec_load32(&inter->mdec, off);
     if (range_contains(MAP_GPU, abs, &off))
     {
         switch (off)
@@ -322,6 +369,12 @@ uint32_t interconnect_load32(Interconnect *inter, uint32_t addr)
     }
     if (range_contains(MAP_TIMERS, abs, &off))
         return timers_load32(&inter->timers, off);
+    if (range_contains(MAP_EXPANSION1, abs, &off))
+        return 0xFFFFFFFF;
+    if (range_contains(MAP_EXPANSION2, abs, &off))
+        return 0xFFFFFFFF;
+    if (range_contains(MAP_EXPANSION3, abs, &off))
+        return 0xFFFFFFFF;
 
     fprintf(stderr, "Unhandled load32: %08X\n", addr);
     exit(1);
@@ -340,6 +393,10 @@ uint16_t interconnect_load16(Interconnect *inter, uint32_t addr)
 
     if (range_contains(MAP_SPU, abs, &off))
         return spu_load(&inter->spu, abs, off);
+    if (range_contains(MAP_BIOS, abs, &off))
+        return bios_load16(&inter->bios, off);
+    if (range_contains(MAP_SCRATCHPAD, abs, &off))
+        return scratch_load16(inter, off);
     if (range_contains(MAP_RAM, abs, &off))
         return ram_load16(&inter->ram, off);
     if (range_contains(MAP_IRQ_CONTROL, abs, &off))
@@ -348,6 +405,12 @@ uint16_t interconnect_load16(Interconnect *inter, uint32_t addr)
         return timers_load16(&inter->timers, off);
     if (range_contains(MAP_SIO, abs, &off))
         return sio_load16(&inter->sio, off);
+    if (range_contains(MAP_EXPANSION1, abs, &off))
+        return 0xFFFF;
+    if (range_contains(MAP_EXPANSION2, abs, &off))
+        return 0xFFFF;
+    if (range_contains(MAP_EXPANSION3, abs, &off))
+        return 0xFFFF;
 
     fprintf(stderr, "Unhandled load16: %08X\n", addr);
     exit(1);
@@ -361,6 +424,8 @@ uint8_t interconnect_load8(Interconnect *inter, uint32_t addr)
 
     if (range_contains(MAP_BIOS, abs, &off))
         return bios_load8(&inter->bios, off);
+    if (range_contains(MAP_SCRATCHPAD, abs, &off))
+        return inter->scratchpad[off];
     if (range_contains(MAP_RAM, abs, &off))
         return ram_load8(&inter->ram, off);
     if (range_contains(MAP_CDROM, abs, &off))
@@ -368,6 +433,10 @@ uint8_t interconnect_load8(Interconnect *inter, uint32_t addr)
     if (range_contains(MAP_SIO, abs, &off))
         return sio_load8(&inter->sio, off);
     if (range_contains(MAP_EXPANSION1, abs, &off))
+        return 0xFF;
+    if (range_contains(MAP_EXPANSION2, abs, &off))
+        return 0xFF;
+    if (range_contains(MAP_EXPANSION3, abs, &off))
         return 0xFF;
 
     fprintf(stderr, "Unhandled load8: %08X\n", addr);
@@ -417,6 +486,11 @@ void interconnect_store32(Interconnect *inter, uint32_t addr, uint32_t val)
         ram_store32(&inter->ram, off, val);
         return;
     }
+    if (range_contains(MAP_SCRATCHPAD, abs, &off))
+    {
+        scratch_store32(inter, off, val);
+        return;
+    }
     if (range_contains(MAP_IRQ_CONTROL, abs, &off))
     {
         irq_store32(&inter->irq, off, val);
@@ -425,6 +499,11 @@ void interconnect_store32(Interconnect *inter, uint32_t addr, uint32_t val)
     if (range_contains(MAP_DMA, abs, &off))
     {
         dma_reg_write(inter, off, val);
+        return;
+    }
+    if (range_contains(MAP_MDEC, abs, &off))
+    {
+        mdec_store32(&inter->mdec, off, val);
         return;
     }
     if (range_contains(MAP_GPU, abs, &off))
@@ -468,6 +547,11 @@ void interconnect_store16(Interconnect *inter, uint32_t addr, uint16_t val)
         ram_store16(&inter->ram, off, val);
         return;
     }
+    if (range_contains(MAP_SCRATCHPAD, abs, &off))
+    {
+        scratch_store16(inter, off, val);
+        return;
+    }
     if (range_contains(MAP_SPU, abs, &off))
     {
         spu_store(&inter->spu, abs, off, val);
@@ -504,6 +588,11 @@ void interconnect_store8(Interconnect *inter, uint32_t addr, uint8_t val)
     if (range_contains(MAP_RAM, abs, &off))
     {
         ram_store8(&inter->ram, off, val);
+        return;
+    }
+    if (range_contains(MAP_SCRATCHPAD, abs, &off))
+    {
+        inter->scratchpad[off] = val;
         return;
     }
     if (range_contains(MAP_CDROM, abs, &off))

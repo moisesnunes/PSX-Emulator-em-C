@@ -32,5 +32,7 @@ uint32_t dma_control(const Dma *dma);
 void dma_set_control(Dma *dma, uint32_t val);
 uint32_t dma_interrupt(const Dma *dma);
 void dma_set_interrupt(Dma *dma, uint32_t val);
+void dma_mark_channel_done(Dma *dma, Port port);
+bool dma_irq_pending(const Dma *dma);
 Channel *dma_channel(Dma *dma, Port port);
 const Channel *dma_channel_const(const Dma *dma, Port port);

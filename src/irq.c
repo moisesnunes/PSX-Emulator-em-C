@@ -15,6 +15,11 @@ void irq_assert(Irq *irq, IrqFlag flag)
         (unsigned)flag, (unsigned)irq->status, (unsigned)irq->mask, irq_pending(irq));
 }
 
+void irq_deassert(Irq *irq, IrqFlag flag)
+{
+    irq->status &= ~(uint16_t)flag;
+}
+
 bool irq_pending(const Irq *irq)
 {
     return (irq->status & irq->mask) != 0;

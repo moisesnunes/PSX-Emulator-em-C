@@ -29,8 +29,16 @@ typedef enum
 typedef enum
 {
     CDROM_PHASE_ACK = 0,       /* deliver irq_type from queue, done */
+    CDROM_PHASE_INIT_ACK,      /* deliver INT3 init ack, enqueue complete */
+    CDROM_PHASE_INIT_DONE,     /* prepare idle stat and deliver INT2 */
     CDROM_PHASE_SEEK_ACK,      /* deliver INT3 seek ack, enqueue seek-done */
     CDROM_PHASE_SEEK_DONE,     /* prepare idle stat and deliver INT2 */
+    CDROM_PHASE_GETID_ACK,     /* deliver INT3 ID ack, enqueue ID result */
+    CDROM_PHASE_GETID_DONE,    /* prepare ID bytes and deliver INT2/INT5 */
+    CDROM_PHASE_READTOC_ACK,   /* deliver INT3 TOC ack, enqueue complete */
+    CDROM_PHASE_READTOC_DONE,  /* prepare idle stat and deliver INT2 */
+    CDROM_PHASE_PAUSE_ACK,     /* deliver INT3 pause ack, enqueue complete */
+    CDROM_PHASE_PAUSE_DONE,    /* prepare idle stat and deliver INT2 */
     CDROM_PHASE_READ_DATA,     /* deliver INT3 ack, enqueue first SECTOR event */
     CDROM_PHASE_SECTOR,        /* load + deliver one sector (INT1), re-enqueue self */
 } CdromPhase;
@@ -75,6 +83,12 @@ typedef struct
 
     /* ---- Pending event queue ---- */
     CdromEventQueue evq; /* commands enqueue; scheduler event handler dequeues */
+
+    /* ---- Command waiting for the current response IRQ to be acknowledged ---- */
+    bool pending_cmd_valid;
+    uint8_t pending_cmd;
+    uint8_t pending_param_fifo[CDROM_PARAM_FIFO_SIZE];
+    uint8_t pending_param_len;
 
     /* ---- Drive state ---- */
     CdromState state;

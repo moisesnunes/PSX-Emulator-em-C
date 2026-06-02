@@ -10,6 +10,7 @@
 #include "cdrom.h"
 #include "disc.h"
 #include "sio.h"
+#include "mdec.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -17,6 +18,7 @@ typedef struct
 {
     Bios bios;
     Ram ram;
+    uint8_t scratchpad[1024];
     Dma dma;
     Gpu gpu;
     Spu spu;
@@ -25,6 +27,7 @@ typedef struct
     Timers timers;
     Cdrom cdrom;
     Sio sio;
+    Mdec mdec;
     Disc disc;
     bool disc_loaded;
 } Interconnect;

@@ -115,6 +115,7 @@ struct Gpu
     uint32_t gp0_words_remaining;
     Gp0Method gp0_command_method;
     Gp0Mode gp0_mode;
+    uint32_t gpuread_latch;
 
     /* VRAM: 1024x512 x 16-bit (ABGR1555), heap-allocated */
     uint16_t *vram;
@@ -134,5 +135,6 @@ uint32_t gpu_status(const Gpu *gpu);
 uint32_t gpu_read(Gpu *gpu);
 void gpu_gp0(Gpu *gpu, uint32_t val);
 void gpu_gp1(Gpu *gpu, uint32_t val);
+void gpu_gp1_reset_consecutive(void);
 void gpu_vblank(Gpu *gpu);
 void gpu_destroy(Gpu *gpu);
