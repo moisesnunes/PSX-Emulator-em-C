@@ -20,7 +20,7 @@ typedef struct
 void renderer_init(Renderer *r, SDL_Window *window);
 
 /* Upload VRAM and draw the PSX frame — does NOT call SwapWindow.
-   Call renderer_present() after compositing any overlay (e.g. ImGui). */
+   Call renderer_present() after compositing any overlay. */
 void renderer_upload_frame(Renderer *r,
                            const uint16_t *vram,
                            uint16_t display_x, uint16_t display_y,

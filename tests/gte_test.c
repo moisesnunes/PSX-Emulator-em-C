@@ -5,19 +5,19 @@
 static int g_pass = 0;
 static int g_fail = 0;
 
-#define EXPECT_EQ(a, b)                                                \
-    do                                                                 \
-    {                                                                  \
-        if ((uint32_t)(a) != (uint32_t)(b))                            \
-        {                                                              \
+#define EXPECT_EQ(a, b)                                                   \
+    do                                                                    \
+    {                                                                     \
+        if ((uint32_t)(a) != (uint32_t)(b))                               \
+        {                                                                 \
             fprintf(stderr, "  FAIL %s:%d  expected 0x%08X got 0x%08X\n", \
-                    __FILE__, __LINE__, (unsigned)(b), (unsigned)(a)); \
-            g_fail++;                                                  \
-        }                                                              \
-        else                                                           \
-        {                                                              \
-            g_pass++;                                                  \
-        }                                                              \
+                    __FILE__, __LINE__, (unsigned)(b), (unsigned)(a));    \
+            g_fail++;                                                     \
+        }                                                                 \
+        else                                                              \
+        {                                                                 \
+            g_pass++;                                                     \
+        }                                                                 \
     } while (0)
 
 static void test_color_registers(void)
@@ -27,7 +27,7 @@ static void test_color_registers(void)
     gte_init(&gte);
 
     gte_write_data(&gte, 28, 0x00007FFF);
-    EXPECT_EQ(gte_read_data(&gte, 9),  0x00000F80u);
+    EXPECT_EQ(gte_read_data(&gte, 9), 0x00000F80u);
     EXPECT_EQ(gte_read_data(&gte, 10), 0x00000F80u);
     EXPECT_EQ(gte_read_data(&gte, 11), 0x00000F80u);
     EXPECT_EQ(gte_read_data(&gte, 29), 0x00007FFFu);
@@ -81,9 +81,9 @@ static void test_rtps_divide_flag(void)
     Gte gte;
     gte_init(&gte);
 
-    gte_write_ctrl(&gte, 7, 1);        /* TRZ */
-    gte_write_ctrl(&gte, 26, 0xFFFF);  /* H */
-    gte_execute(&gte, 0x01);           /* RTPS */
+    gte_write_ctrl(&gte, 7, 1);       /* TRZ */
+    gte_write_ctrl(&gte, 26, 0xFFFF); /* H */
+    gte_execute(&gte, 0x01);          /* RTPS */
     EXPECT_EQ(gte_read_ctrl(&gte, 31) & (1u << 17), 1u << 17);
     EXPECT_EQ(gte_read_ctrl(&gte, 31) & (1u << 31), 1u << 31);
     printf("ok\n");

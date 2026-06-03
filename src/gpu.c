@@ -1691,9 +1691,9 @@ void gpu_vblank(Gpu *gpu)
     uint16_t w = hres_width(gpu->hres);
     uint16_t h = (gpu->vres == VRES_480) ? 480 : 240;
     bool display_24bit = gpu->display_depth == DISPLAY_DEPTH_24;
-    renderer_upload_frame(&gpu->renderer, gpu->vram,
-                          gpu->display_vram_x_start, gpu->display_vram_y_start, w, h,
-                          display_24bit);
+    renderer_display(&gpu->renderer, gpu->vram,
+                     gpu->display_vram_x_start, gpu->display_vram_y_start, w, h,
+                     display_24bit);
     gpu->frame_updated = true;
 
     static bool dumped = false;

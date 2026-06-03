@@ -3,7 +3,6 @@ src/*.o
 src/*.debug.o
 ps1_boot
 ps1_boot_debug
-psx_ui.ini
 
 # BIOS (arquivos de hardware proprietário)
 bios/
@@ -14,12 +13,10 @@ tests/**/*.log
 tests/cdrom_test
 tests/sio_test
 tests/gte_test
-tests/dma_test
-tests/out/
 
 # Documentação e plano local
 CONTINUAR_PROJETO.md
 guide.tex
 
-# Jogos
-games/
+# Games
+/games

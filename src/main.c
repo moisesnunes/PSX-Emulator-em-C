@@ -6,8 +6,6 @@
 #include "log.h"
 #include "scheduler.h"
 #include "timer.h"
-#include "renderer.h"
-#include "ui.h"
 #include <SDL2/SDL.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -44,26 +42,6 @@ static uint32_t debug_load32(Interconnect *inter, uint32_t addr)
     if (addr & 3u)
         return 0xCACACACA;
     return interconnect_load32(inter, addr);
-}
-
-/* ---- UI callback flags (set by static trampoline functions) ---- */
-static bool     g_req_quit   = false;
-static bool     g_req_reset  = false;
-static bool     g_req_pause_toggle = false;
-static char     g_req_load[512] = {0};
-
-static void ui_cb_quit(void)          { g_req_quit = true; }
-static void ui_cb_reset(void)         { g_req_reset = true; }
-static void ui_cb_pause_toggle(void)  { g_req_pause_toggle = true; }
-static void ui_cb_load_exe(const char *p)
-{
-    strncpy(g_req_load, p, sizeof(g_req_load) - 1);
-    g_req_load[sizeof(g_req_load) - 1] = '\0';
-}
-static void ui_cb_load_disc(const char *p)
-{
-    strncpy(g_req_load, p, sizeof(g_req_load) - 1);
-    g_req_load[sizeof(g_req_load) - 1] = '\0';
 }
 
 static void maybe_dump_ram(Cpu *cpu)
@@ -266,8 +244,10 @@ int main(int argc, char **argv)
                 }
             }
             const char *r = getenv("PS1_WATCH_PC_REPEAT");
-            if (r) watch_pc_repeat = (uint64_t)strtoull(r, NULL, 10);
-            if (watch_pc_repeat < 1) watch_pc_repeat = 1;
+            if (r)
+                watch_pc_repeat = (uint64_t)strtoull(r, NULL, 10);
+            if (watch_pc_repeat < 1)
+                watch_pc_repeat = 1;
         }
 
         /* PS1_WATCH_RAM=0xADDR[,0xADDR,...] — print when word at address changes. */
@@ -312,7 +292,8 @@ int main(int argc, char **argv)
             /* PS1_WATCH_PC hits */
             for (uint32_t wi = 0; wi < watch_pc_count; wi++)
             {
-                if (cpu->current_pc != watch_pcs[wi]) continue;
+                if (cpu->current_pc != watch_pcs[wi])
+                    continue;
                 watch_pc_hits[wi]++;
                 if (watch_pc_hits[wi] != 1 && (watch_pc_hits[wi] % watch_pc_repeat) != 0)
                     continue;
@@ -324,10 +305,10 @@ int main(int argc, char **argv)
                         cpu->inter.irq.status, cpu->inter.irq.mask);
                 for (int r = 0; r < 32; r += 4)
                     fprintf(stderr, "  R%02d=%08X R%02d=%08X R%02d=%08X R%02d=%08X\n",
-                            r,   cpu->regs[r],
-                            r+1, cpu->regs[r+1],
-                            r+2, cpu->regs[r+2],
-                            r+3, cpu->regs[r+3]);
+                            r, cpu->regs[r],
+                            r + 1, cpu->regs[r + 1],
+                            r + 2, cpu->regs[r + 2],
+                            r + 3, cpu->regs[r + 3]);
                 /* Print s0 area: 8 words around cpu->regs[16] if it looks like RAM */
                 uint32_t s0 = cpu->regs[16];
                 if (s0 >= 0x80000000u && s0 < 0x80200000u)
@@ -336,7 +317,7 @@ int main(int argc, char **argv)
                     for (int d = -4; d <= 12; d++)
                     {
                         uint32_t a = s0 + (uint32_t)(d * 4);
-                        fprintf(stderr, "    [s0%+d]=0x%08X\n", d*4,
+                        fprintf(stderr, "    [s0%+d]=0x%08X\n", d * 4,
                                 debug_load32(&cpu->inter, a));
                     }
                 }
@@ -407,31 +388,6 @@ int main(int argc, char **argv)
         }
     }
 
-    /* ---- UI state & callbacks ---- */
-    bool ui_running = false;
-    bool ui_paused  = false;
-    char ui_loaded_path[512] = {0};
-
-    UiState ui_state = {0};
-    ui_state.cb.on_load_exe      = ui_cb_load_exe;
-    ui_state.cb.on_load_disc     = ui_cb_load_disc;
-    ui_state.cb.on_pause_toggle  = ui_cb_pause_toggle;
-    ui_state.cb.on_reset         = ui_cb_reset;
-    ui_state.cb.on_quit          = ui_cb_quit;
-
-    /* Initialize Dear ImGui using the renderer's existing GL context */
-    ui_init(window, cpu->inter.gpu.renderer.gl_context);
-
-    /* Enable SDL drag-and-drop */
-    SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
-
-    /* If an exe/disc was passed on the command line, mark as running */
-    if (exe_path || disc_path)
-    {
-        ui_running = true;
-        strncpy(ui_loaded_path, exe_path ? exe_path : disc_path, sizeof(ui_loaded_path) - 1);
-    }
-
     /* Run ~564k cycles per frame (33.868MHz / 60Hz), poll SDL once per frame. */
     const uint32_t CYCLES_PER_FRAME = 33868800U / 60U;
     const uint64_t FRAME_NS = 1000000000ULL / 60ULL;
@@ -440,137 +396,27 @@ int main(int argc, char **argv)
     uint64_t spu_now = now_nanos();
     uint64_t spu_acc = 0;
 
-    /* FPS counter */
-    uint64_t fps_frame_count = 0;
-    uint64_t fps_last_ns     = now_nanos();
-    float    fps_display     = 60.0f;
-
-    bool fullscreen = false;
-
     for (;;)
     {
-        /* ---- SDL events ---- */
-        SDL_Event event;
-        while (SDL_PollEvent(&event))
+        /* Run one full frame's worth of CPU cycles before polling SDL. */
+        uint32_t frame_cycles = 0;
+        while (frame_cycles < CYCLES_PER_FRAME)
         {
-            ui_process_event(&event);
+            uint32_t cycles = cpu_run_next_instruction(cpu);
+            uint32_t fired = scheduler_step(&cpu->inter.scheduler, cycles, &cpu->inter.irq);
+            timers_step(&cpu->inter.timers, cycles, &cpu->inter.irq, &cpu->inter.scheduler);
+            frame_cycles += cycles;
 
-            if (event.type == SDL_QUIT)
-            {
-                g_req_quit = true;
-            }
-            else if (event.type == SDL_DROPFILE)
-            {
-                strncpy(g_req_load, event.drop.file, sizeof(g_req_load) - 1);
-                SDL_free(event.drop.file);
-            }
-            else if (event.type == SDL_KEYDOWN)
-            {
-                SDL_Keycode key = event.key.keysym.sym;
-                if (key == SDLK_ESCAPE && ui_running)
-                    g_req_pause_toggle = true;
-                else if (key == SDLK_F11)
-                {
-                    fullscreen = !fullscreen;
-                    SDL_SetWindowFullscreen(window, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-                }
-                sio_on_key(&cpu->inter.sio, event.key.keysym.scancode, true);
-            }
-            else if (event.type == SDL_KEYUP)
-            {
-                sio_on_key(&cpu->inter.sio, event.key.keysym.scancode, false);
-            }
+            if (fired & (1u << EVENT_VBLANK))
+                gpu_vblank(&cpu->inter.gpu);
+
+            if (fired & (1u << EVENT_CDROM_IRQ))
+                cdrom_on_scheduler_event(&cpu->inter.cdrom, &cpu->inter.irq,
+                                         &cpu->inter.scheduler);
         }
 
-        /* ---- Process deferred load (drag-drop or UI button) ---- */
-        if (g_req_load[0])
+        /* SPU clock — catch up for this frame */
         {
-            size_t rlen = strlen(g_req_load);
-            bool is_exe  = rlen > 4 && SDL_strcasecmp(g_req_load + rlen - 4, ".exe") == 0;
-            bool is_disc = rlen > 4 && SDL_strcasecmp(g_req_load + rlen - 4, ".bin") == 0;
-            if (is_exe)
-            {
-                PsxExe loaded_exe;
-                if (exe_parse(g_req_load, &loaded_exe) == 0 &&
-                    exe_load(g_req_load, &loaded_exe, cpu->inter.ram.data, RAM_SIZE) == 0)
-                {
-                    cpu->pc               = loaded_exe.pc;
-                    cpu->next_pc          = loaded_exe.pc + 4;
-                    memset(cpu->regs, 0, sizeof(cpu->regs));
-                    memset(cpu->out_regs, 0, sizeof(cpu->out_regs));
-                    cpu->regs[28]         = loaded_exe.gp;
-                    cpu->regs[29]         = loaded_exe.sp;
-                    cpu->regs[30]         = loaded_exe.sp;
-                    cpu->out_regs[28]     = loaded_exe.gp;
-                    cpu->out_regs[29]     = loaded_exe.sp;
-                    cpu->out_regs[30]     = loaded_exe.sp;
-                    cpu->next_instruction = 0;
-                    cpu->hle_bios_vectors = true;
-                    strncpy(ui_loaded_path, g_req_load, sizeof(ui_loaded_path) - 1);
-                    ui_running = true;
-                    ui_paused  = false;
-                    fprintf(stderr, "EXE loaded: %s\n", g_req_load);
-                }
-                else
-                {
-                    fprintf(stderr, "Failed to load EXE: %s\n", g_req_load);
-                }
-            }
-            else if (is_disc)
-            {
-                /* Disc hot-swap not yet implemented; inform user */
-                fprintf(stderr, "Disc hot-swap not supported yet: %s\n", g_req_load);
-                strncpy(ui_loaded_path, g_req_load, sizeof(ui_loaded_path) - 1);
-            }
-            g_req_load[0] = '\0';
-        }
-
-        /* ---- Process pause toggle ---- */
-        if (g_req_pause_toggle)
-        {
-            g_req_pause_toggle = false;
-            ui_paused = !ui_paused;
-        }
-
-        /* ---- Process deferred reset ---- */
-        if (g_req_reset)
-        {
-            g_req_reset = false;
-            if (ui_loaded_path[0])
-                strncpy(g_req_load, ui_loaded_path, sizeof(g_req_load) - 1);
-        }
-
-        /* ---- Process quit ---- */
-        if (g_req_quit)
-        {
-            ui_destroy();
-            cpu_destroy(cpu);
-            free(cpu);
-            SDL_DestroyWindow(window);
-            SDL_Quit();
-            return 0;
-        }
-
-        /* ---- Emulation tick (skip when paused or no game loaded) ---- */
-        if (ui_running && !ui_paused)
-        {
-            uint32_t frame_cycles = 0;
-            while (frame_cycles < CYCLES_PER_FRAME)
-            {
-                uint32_t cycles = cpu_run_next_instruction(cpu);
-                uint32_t fired  = scheduler_step(&cpu->inter.scheduler, cycles, &cpu->inter.irq);
-                timers_step(&cpu->inter.timers, cycles, &cpu->inter.irq, &cpu->inter.scheduler);
-                frame_cycles += cycles;
-
-                if (fired & (1u << EVENT_VBLANK))
-                    gpu_vblank(&cpu->inter.gpu);
-
-                if (fired & (1u << EVENT_CDROM_IRQ))
-                    cdrom_on_scheduler_event(&cpu->inter.cdrom, &cpu->inter.irq,
-                                             &cpu->inter.scheduler);
-            }
-
-            /* SPU clock — catch up for this frame */
             uint64_t now = now_nanos();
             spu_acc += now - spu_now;
             spu_now = now;
@@ -581,29 +427,24 @@ int main(int argc, char **argv)
             }
         }
 
-        /* ---- FPS counter ---- */
-        fps_frame_count++;
+        /* SDL events */
+        SDL_Event event;
+        while (SDL_PollEvent(&event))
         {
-            uint64_t now = now_nanos();
-            uint64_t elapsed = now - fps_last_ns;
-            if (elapsed >= 500000000ULL) /* update every 0.5s */
+            if (event.type == SDL_QUIT)
             {
-                fps_display    = (float)fps_frame_count * 1e9f / (float)elapsed;
-                fps_frame_count = 0;
-                fps_last_ns    = now;
+                cpu_destroy(cpu);
+                free(cpu);
+                SDL_DestroyWindow(window);
+                SDL_Quit();
+                return 0;
             }
+            if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP)
+                sio_on_key(&cpu->inter.sio, event.key.keysym.scancode,
+                           event.type == SDL_KEYDOWN);
         }
 
-        /* ---- Render: ImGui overlay on top of PSX frame ---- */
-        /* gpu_vblank() already called renderer_upload_frame() during emulation;
-           ui_render() composites ImGui on top and calls SwapWindow. */
-        ui_state.running     = ui_running;
-        ui_state.paused      = ui_paused;
-        ui_state.loaded_path = ui_loaded_path;
-        ui_state.fps         = fps_display;
-        ui_render(&ui_state);
-
-        /* ---- Sleep until next frame deadline to cap at 60 Hz ---- */
+        /* Sleep until next frame deadline to cap at 60 Hz */
         {
             uint64_t now = now_nanos();
             if (now < frame_deadline)

@@ -5,31 +5,31 @@
 static int g_pass;
 static int g_fail;
 
-#define EXPECT_TRUE(x)                                      \
-    do                                                      \
-    {                                                       \
-        if (x)                                              \
-            g_pass++;                                       \
-        else                                                \
-        {                                                   \
-            g_fail++;                                       \
+#define EXPECT_TRUE(x)                                            \
+    do                                                            \
+    {                                                             \
+        if (x)                                                    \
+            g_pass++;                                             \
+        else                                                      \
+        {                                                         \
+            g_fail++;                                             \
             printf("\nFAIL %s:%d: %s\n", __FILE__, __LINE__, #x); \
-        }                                                   \
+        }                                                         \
     } while (0)
 
-#define EXPECT_EQ(a, b)                                                     \
-    do                                                                      \
-    {                                                                       \
-        unsigned long long _a = (unsigned long long)(a);                    \
-        unsigned long long _b = (unsigned long long)(b);                    \
-        if (_a == _b)                                                       \
-            g_pass++;                                                       \
-        else                                                                \
-        {                                                                   \
-            g_fail++;                                                       \
-            printf("\nFAIL %s:%d: got 0x%llX expected 0x%llX\n",            \
-                   __FILE__, __LINE__, _a, _b);                             \
-        }                                                                   \
+#define EXPECT_EQ(a, b)                                          \
+    do                                                           \
+    {                                                            \
+        unsigned long long _a = (unsigned long long)(a);         \
+        unsigned long long _b = (unsigned long long)(b);         \
+        if (_a == _b)                                            \
+            g_pass++;                                            \
+        else                                                     \
+        {                                                        \
+            g_fail++;                                            \
+            printf("\nFAIL %s:%d: got 0x%llX expected 0x%llX\n", \
+                   __FILE__, __LINE__, _a, _b);                  \
+        }                                                        \
     } while (0)
 
 void log_enable(LogSubsystem s) { (void)s; }

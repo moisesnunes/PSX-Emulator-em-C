@@ -1,11 +1,7 @@
 CC           = gcc
-CXX          = g++
-IMGUI_DIR    = third_party/imgui
-CFLAGS       = -std=c11 -Wall -Wextra -O2 -fno-strict-aliasing $(shell sdl2-config --cflags) -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
-CXXFLAGS     = -std=c++17 -O2 -fno-strict-aliasing $(shell sdl2-config --cflags) -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
-DEBUG_CFLAGS = -std=c11 -Wall -Wextra -O0 -g -fsanitize=address,undefined $(shell sdl2-config --cflags) -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
-DEBUG_CXXFLAGS = -std=c++17 -O0 -g -fsanitize=address,undefined $(shell sdl2-config --cflags) -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
-LDFLAGS      = $(shell sdl2-config --libs) -lGL -lGLEW -lm -lstdc++
+CFLAGS       = -std=c11 -Wall -Wextra -O2 -fno-strict-aliasing $(shell sdl2-config --cflags)
+DEBUG_CFLAGS = -std=c11 -Wall -Wextra -O0 -g -fsanitize=address,undefined $(shell sdl2-config --cflags)
+LDFLAGS      = $(shell sdl2-config --libs) -lGL -lGLEW -lm
 DEBUG_LDFLAGS= $(LDFLAGS) -fsanitize=address,undefined
 
 BIOS_PATH ?= bios/BIOS.ROM
@@ -31,16 +27,8 @@ SRCS = src/main.c         \
        src/sio.c          \
        src/gte.c
 
-SRCS_CXX = src/ui.cpp                              \
-            $(IMGUI_DIR)/imgui.cpp                  \
-            $(IMGUI_DIR)/imgui_draw.cpp             \
-            $(IMGUI_DIR)/imgui_tables.cpp           \
-            $(IMGUI_DIR)/imgui_widgets.cpp          \
-            $(IMGUI_DIR)/backends/imgui_impl_sdl2.cpp   \
-            $(IMGUI_DIR)/backends/imgui_impl_opengl3.cpp
-
-OBJS       = $(SRCS:.c=.o) $(SRCS_CXX:.cpp=.o)
-DEBUG_OBJS = $(SRCS:.c=.debug.o) $(SRCS_CXX:.cpp=.debug.o)
+OBJS       = $(SRCS:.c=.o)
+DEBUG_OBJS = $(SRCS:.c=.debug.o)
 TARGET     = ps1_boot
 PSX_TEST_RUNNER = python3 tests/run_psx_tests.py
 PSX_TEST_ARGS ?=
@@ -55,19 +43,13 @@ PSX_TEST_ARGS ?=
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CXX) $(OBJS) $(LDFLAGS) -o $@
+	$(CC) $(OBJS) $(LDFLAGS) -o $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
 %.debug.o: %.c
 	$(CC) $(DEBUG_CFLAGS) -c $< -o $@
-
-%.debug.o: %.cpp
-	$(CXX) $(DEBUG_CXXFLAGS) -c $< -o $@
 
 run: $(TARGET)
 	./$(TARGET) --bios $(BIOS_PATH)
@@ -163,7 +145,4 @@ test-psx-extras: $(TARGET)
 	    --keep-going $(PSX_TEST_ARGS)
 
 clean:
-	rm -f $(SRCS:.c=.o) $(SRCS:.c=.debug.o) \
-	      $(SRCS_CXX:.cpp=.o) $(SRCS_CXX:.cpp=.debug.o) \
-	      $(TARGET) $(TARGET)_debug \
-	      tests/cdrom_test tests/sio_test tests/gte_test tests/dma_test
+	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cdrom_test tests/sio_test tests/gte_test tests/dma_test

@@ -173,7 +173,8 @@ static void cmd_test(Cdrom *cd, Scheduler *sched)
         resp_push(cd, 0x00);
         queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
         break;
-    case 0x22: { /* region string */
+    case 0x22:
+    { /* region string */
         static const uint8_t region[] = {'f', 'o', 'r', ' ', 'U', '/', 'C'};
         for (size_t i = 0; i < sizeof(region); i++)
             resp_push(cd, region[i]);
