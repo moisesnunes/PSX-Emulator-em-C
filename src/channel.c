@@ -40,8 +40,8 @@ void channel_set_control(Channel *ch, uint32_t val)
         ch->sync = SYNC_LINKED_LIST;
         break;
     default:
-        fprintf(stderr, "Unknown DMA sync mode: %u\n", (val >> 9) & 3);
-        exit(1);
+        ch->sync = SYNC_LINKED_LIST;
+        break;
     }
     ch->chop_dma_sz = (val >> 16) & 7;
     ch->chop_cpu_sz = (val >> 20) & 7;

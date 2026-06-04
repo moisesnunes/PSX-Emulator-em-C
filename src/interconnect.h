@@ -19,6 +19,7 @@ typedef struct
     Bios bios;
     Ram ram;
     uint8_t scratchpad[1024];
+    uint32_t mem_control[9];
     Dma dma;
     Gpu gpu;
     Spu spu;

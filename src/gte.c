@@ -344,9 +344,9 @@ static void mat_mul_vec(Gte *gte, MatFn mf,
                         int16_t vx, int16_t vy, int16_t vz,
                         int sf, bool lm)
 {
-    int64_t m1 = ((int64_t)tx << 12) + (int64_t)mf(gte, 0, 0) * vx + (int64_t)mf(gte, 0, 1) * vy + (int64_t)mf(gte, 0, 2) * vz;
-    int64_t m2 = ((int64_t)ty << 12) + (int64_t)mf(gte, 1, 0) * vx + (int64_t)mf(gte, 1, 1) * vy + (int64_t)mf(gte, 1, 2) * vz;
-    int64_t m3 = ((int64_t)tz << 12) + (int64_t)mf(gte, 2, 0) * vx + (int64_t)mf(gte, 2, 1) * vy + (int64_t)mf(gte, 2, 2) * vz;
+    int64_t m1 = (int64_t)tx * 0x1000 + (int64_t)mf(gte, 0, 0) * vx + (int64_t)mf(gte, 0, 1) * vy + (int64_t)mf(gte, 0, 2) * vz;
+    int64_t m2 = (int64_t)ty * 0x1000 + (int64_t)mf(gte, 1, 0) * vx + (int64_t)mf(gte, 1, 1) * vy + (int64_t)mf(gte, 1, 2) * vz;
+    int64_t m3 = (int64_t)tz * 0x1000 + (int64_t)mf(gte, 2, 0) * vx + (int64_t)mf(gte, 2, 1) * vy + (int64_t)mf(gte, 2, 2) * vz;
     int32_t r1 = set_mac(gte, 1, m1, sf);
     int32_t r2 = set_mac(gte, 2, m2, sf);
     int32_t r3 = set_mac(gte, 3, m3, sf);
@@ -381,7 +381,7 @@ static void gte_rtps(Gte *gte, int v, int sf, bool lm)
     /* IR0 (depth cue interpolation factor) */
     int64_t ir0_64 = ((int64_t)(int16_t)DQA * div + (int64_t)DQB + 0x800) >> 12;
     set_ir0(gte, (int32_t)ir0_64);
-    set_mac0(gte, ir0_64 << 12);
+    set_mac0(gte, ir0_64 * 0x1000);
 }
 
 /* ---- GTE commands ---- */

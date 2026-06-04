@@ -578,6 +578,13 @@ static void deliver_sector(Cdrom *cd, Irq *irq, Scheduler *sched)
 {
     (void)sched;
 
+    if (cd->irq_flag != 0 || cd->pending_cmd_valid)
+    {
+        evq_push(&cd->evq, CDROM_INT1, CDROM_PHASE_SECTOR, CDROM_ACK_DELAY);
+        LOG(LOG_CDROM, "Sector deferred while INT%d pending", cd->irq_flag);
+        return;
+    }
+
     if (cd->state != CDROM_STATE_READING)
     {
         LOG(LOG_CDROM, "ReadN sector ignored: state=%d", cd->state);

@@ -75,6 +75,26 @@ static void maybe_dump_ram(Cpu *cpu)
     fclose(f);
 }
 
+static void advance_system_quantum(Cpu *cpu)
+{
+    const uint32_t SYSTEM_CYCLE_QUANTUM = 300;
+
+    dma_step(&cpu->inter.dma, &cpu->inter.irq);
+    uint32_t fired = scheduler_step(&cpu->inter.scheduler, SYSTEM_CYCLE_QUANTUM, &cpu->inter.irq);
+
+    if (fired & (1u << EVENT_CDROM_IRQ))
+        cdrom_on_scheduler_event(&cpu->inter.cdrom, &cpu->inter.irq,
+                                 &cpu->inter.scheduler);
+
+    timers_step(&cpu->inter.timers, SYSTEM_CYCLE_QUANTUM, &cpu->inter.irq, &cpu->inter.scheduler);
+
+    if (gpu_step(&cpu->inter.gpu, SYSTEM_CYCLE_QUANTUM))
+    {
+        irq_assert(&cpu->inter.irq, IRQ_VBLANK);
+        gpu_vblank(&cpu->inter.gpu);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *bios_path = "bios/BIOS.ROM";
@@ -273,19 +293,17 @@ int main(int argc, char **argv)
             }
         }
 
+        const uint32_t CPU_CYCLE_QUANTUM = 100;
+        uint32_t cpu_quantum_cycles = 0;
+
         for (;;)
         {
             uint32_t cycles = cpu_run_next_instruction(cpu);
-            uint32_t fired = scheduler_step(&cpu->inter.scheduler, cycles, &cpu->inter.irq);
-            timers_step(&cpu->inter.timers, cycles, &cpu->inter.irq, &cpu->inter.scheduler);
-            if (fired & (1u << EVENT_VBLANK))
+            cpu_quantum_cycles += cycles;
+            while (cpu_quantum_cycles >= CPU_CYCLE_QUANTUM)
             {
-                gpu_vblank(&cpu->inter.gpu);
-            }
-            if (fired & (1u << EVENT_CDROM_IRQ))
-            {
-                cdrom_on_scheduler_event(&cpu->inter.cdrom, &cpu->inter.irq,
-                                         &cpu->inter.scheduler);
+                advance_system_quantum(cpu);
+                cpu_quantum_cycles -= CPU_CYCLE_QUANTUM;
             }
             count++;
 
@@ -374,11 +392,10 @@ int main(int argc, char **argv)
             {
                 uint32_t op = debug_load32(&cpu->inter, cpu->current_pc);
                 fprintf(stderr,
-                        "Smoke: ran %llu instructions without abort. PC=0x%08X OP=0x%08X SR=0x%08X CAUSE=0x%08X CYC=%llu VBL=%d@%llu I_STAT=0x%04X I_MASK=0x%04X\n",
+                        "Smoke: ran %llu instructions without abort. PC=0x%08X OP=0x%08X SR=0x%08X CAUSE=0x%08X CYC=%llu GPU_FRAMES=%llu I_STAT=0x%04X I_MASK=0x%04X\n",
                         (unsigned long long)count, cpu->current_pc, op, cpu->sr, cpu->cause,
                         (unsigned long long)cpu->inter.scheduler.current_cycle,
-                        cpu->inter.scheduler.events[EVENT_VBLANK].active,
-                        (unsigned long long)cpu->inter.scheduler.events[EVENT_VBLANK].fire_at,
+                        (unsigned long long)(uint64_t)cpu->inter.gpu.frames,
                         cpu->inter.irq.status, cpu->inter.irq.mask);
                 maybe_dump_ram(cpu);
                 cpu_destroy(cpu);
@@ -390,6 +407,8 @@ int main(int argc, char **argv)
 
     /* Run ~564k cycles per frame (33.868MHz / 60Hz), poll SDL once per frame. */
     const uint32_t CYCLES_PER_FRAME = 33868800U / 60U;
+    const uint32_t CPU_CYCLE_QUANTUM = 100;
+    const uint32_t SYSTEM_CYCLE_QUANTUM = 300;
     const uint64_t FRAME_NS = 1000000000ULL / 60ULL;
     const uint64_t SPU_INTERVAL = 1000000000ULL / 44100ULL;
     uint64_t frame_deadline = now_nanos() + FRAME_NS;
@@ -400,19 +419,17 @@ int main(int argc, char **argv)
     {
         /* Run one full frame's worth of CPU cycles before polling SDL. */
         uint32_t frame_cycles = 0;
+        uint32_t cpu_quantum_cycles = 0;
         while (frame_cycles < CYCLES_PER_FRAME)
         {
             uint32_t cycles = cpu_run_next_instruction(cpu);
-            uint32_t fired = scheduler_step(&cpu->inter.scheduler, cycles, &cpu->inter.irq);
-            timers_step(&cpu->inter.timers, cycles, &cpu->inter.irq, &cpu->inter.scheduler);
-            frame_cycles += cycles;
-
-            if (fired & (1u << EVENT_VBLANK))
-                gpu_vblank(&cpu->inter.gpu);
-
-            if (fired & (1u << EVENT_CDROM_IRQ))
-                cdrom_on_scheduler_event(&cpu->inter.cdrom, &cpu->inter.irq,
-                                         &cpu->inter.scheduler);
+            cpu_quantum_cycles += cycles;
+            while (cpu_quantum_cycles >= CPU_CYCLE_QUANTUM)
+            {
+                advance_system_quantum(cpu);
+                frame_cycles += SYSTEM_CYCLE_QUANTUM;
+                cpu_quantum_cycles -= CPU_CYCLE_QUANTUM;
+            }
         }
 
         /* SPU clock — catch up for this frame */

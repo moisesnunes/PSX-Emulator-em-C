@@ -22,7 +22,7 @@ static int range_contains(Range r, uint32_t addr, uint32_t *offset)
     return 0;
 }
 
-static const Range MAP_RAM = {0x00000000, 2 * 1024 * 1024};
+static const Range MAP_RAM = {0x00000000, 8 * 1024 * 1024};
 static const Range MAP_BIOS = {0x1FC00000, 512 * 1024};
 static const Range MAP_SCRATCHPAD = {0x1F800000, 1024};
 static const Range MAP_MEM_CONTROL = {0x1F801000, 36};
@@ -84,6 +84,49 @@ static void scratch_store16(Interconnect *inter, uint32_t offset, uint16_t val)
     inter->scratchpad[offset + 1] = (uint8_t)(val >> 8);
 }
 
+static uint32_t mem_control_load32(const Interconnect *inter, uint32_t offset)
+{
+    uint32_t index = offset >> 2;
+    if (index < 9)
+        return inter->mem_control[index];
+    return 0;
+}
+
+static uint16_t mem_control_load16(const Interconnect *inter, uint32_t offset)
+{
+    return (uint16_t)(mem_control_load32(inter, offset & ~3u) >> ((offset & 2u) * 8u));
+}
+
+static uint8_t mem_control_load8(const Interconnect *inter, uint32_t offset)
+{
+    return (uint8_t)(mem_control_load32(inter, offset & ~3u) >> ((offset & 3u) * 8u));
+}
+
+static void mem_control_store32(Interconnect *inter, uint32_t offset, uint32_t val)
+{
+    uint32_t index = offset >> 2;
+    if (index < 9)
+        inter->mem_control[index] = val;
+}
+
+static void mem_control_store16(Interconnect *inter, uint32_t offset, uint16_t val)
+{
+    uint32_t aligned = offset & ~3u;
+    uint32_t shift = (offset & 2u) * 8u;
+    uint32_t word = mem_control_load32(inter, aligned);
+    word = (word & ~(0xFFFFu << shift)) | ((uint32_t)val << shift);
+    mem_control_store32(inter, aligned, word);
+}
+
+static void mem_control_store8(Interconnect *inter, uint32_t offset, uint8_t val)
+{
+    uint32_t aligned = offset & ~3u;
+    uint32_t shift = (offset & 3u) * 8u;
+    uint32_t word = mem_control_load32(inter, aligned);
+    word = (word & ~(0xFFu << shift)) | ((uint32_t)val << shift);
+    mem_control_store32(inter, aligned, word);
+}
+
 /* ---- DMA register helpers ---- */
 static uint32_t dma_reg_read(Interconnect *inter, uint32_t offset)
 {
@@ -123,7 +166,36 @@ static uint32_t dma_reg_read(Interconnect *inter, uint32_t offset)
     exit(1);
 }
 
+static uint16_t dma_reg_read16(Interconnect *inter, uint32_t offset)
+{
+    uint32_t aligned = offset & ~3u;
+    uint32_t word = dma_reg_read(inter, aligned);
+    return (uint16_t)(word >> ((offset & 2u) * 8u));
+}
+
+static uint8_t dma_reg_read8(Interconnect *inter, uint32_t offset)
+{
+    uint32_t word = dma_reg_read(inter, offset & ~3u);
+    return (uint8_t)(word >> ((offset & 3u) * 8u));
+}
+
 static void do_dma(Interconnect *inter, Port port);
+
+static void dma_update_irq(Interconnect *inter)
+{
+    bool pending = dma_irq_pending(&inter->dma);
+    if (pending && !inter->dma.irq_line)
+        inter->dma.irq_pending = true;
+    inter->dma.irq_line = pending;
+}
+
+static void dma_finish(Interconnect *inter, Channel *ch, Port port)
+{
+    channel_done(ch);
+    dma_mark_channel_done(&inter->dma, port);
+    dma_update_irq(inter);
+    LOG(LOG_DMA, "DMA done port=%d", port);
+}
 
 static void dma_reg_write(Interconnect *inter, uint32_t offset, uint32_t val)
 {
@@ -166,6 +238,7 @@ static void dma_reg_write(Interconnect *inter, uint32_t offset, uint32_t val)
             break;
         case 4:
             dma_set_interrupt(&inter->dma, val);
+            dma_update_irq(inter);
             break;
         default:
             fprintf(stderr, "Unhandled DMA write %08X = %08X\n", offset, val);
@@ -182,6 +255,240 @@ static void dma_reg_write(Interconnect *inter, uint32_t offset, uint32_t val)
         do_dma(inter, active_port);
 }
 
+static void dma_reg_write16(Interconnect *inter, uint32_t offset, uint16_t val)
+{
+    uint32_t aligned = offset & ~3u;
+    uint32_t shift = (offset & 2u) * 8u;
+    uint32_t word = dma_reg_read(inter, aligned);
+    word = (word & ~(0xFFFFu << shift)) | ((uint32_t)val << shift);
+    dma_reg_write(inter, aligned, word);
+}
+
+static void dma_reg_write8(Interconnect *inter, uint32_t offset, uint8_t val)
+{
+    uint32_t aligned = offset & ~3u;
+    uint32_t shift = (offset & 3u) * 8u;
+    uint32_t word = dma_reg_read(inter, aligned);
+    word = (word & ~(0xFFu << shift)) | ((uint32_t)val << shift);
+    dma_reg_write(inter, aligned, word);
+}
+
+static uint8_t irq_load8(const Irq *irq, uint32_t offset)
+{
+    uint32_t word = irq_load32(irq, offset & ~3u);
+    return (uint8_t)(word >> ((offset & 3u) * 8u));
+}
+
+static void irq_store8(Irq *irq, uint32_t offset, uint8_t val)
+{
+    uint32_t aligned = offset & ~3u;
+    uint32_t shift = (offset & 3u) * 8u;
+    uint32_t word = irq_load32(irq, aligned);
+    word = (word & ~(0xFFu << shift)) | ((uint32_t)val << shift);
+    irq_store32(irq, aligned, word);
+}
+
+static uint8_t timers_load8(Timers *timers, uint32_t offset)
+{
+    uint16_t half = timers_load16(timers, offset & ~1u);
+    return (uint8_t)(half >> ((offset & 1u) * 8u));
+}
+
+static void timers_store8(Timers *timers, uint32_t offset, uint8_t val, Scheduler *sched)
+{
+    uint32_t aligned = offset & ~1u;
+    uint32_t shift = (offset & 1u) * 8u;
+    uint16_t half = timers_load16(timers, aligned);
+    half = (uint16_t)((half & ~(0xFFu << shift)) | ((uint16_t)val << shift));
+    timers_store16(timers, aligned, half, sched);
+}
+
+static uint16_t cdrom_load16(Cdrom *cdrom, uint32_t offset)
+{
+    return (uint16_t)cdrom_load8(cdrom, offset) |
+           ((uint16_t)cdrom_load8(cdrom, offset + 1) << 8);
+}
+
+static uint32_t cdrom_load32(Cdrom *cdrom, uint32_t offset)
+{
+    return (uint32_t)cdrom_load8(cdrom, offset) |
+           ((uint32_t)cdrom_load8(cdrom, offset + 1) << 8) |
+           ((uint32_t)cdrom_load8(cdrom, offset + 2) << 16) |
+           ((uint32_t)cdrom_load8(cdrom, offset + 3) << 24);
+}
+
+static void cdrom_store16(Cdrom *cdrom, uint32_t offset, uint16_t val,
+                          Irq *irq, Scheduler *sched)
+{
+    cdrom_store8(cdrom, offset, (uint8_t)val, irq, sched);
+    cdrom_store8(cdrom, offset + 1, (uint8_t)(val >> 8), irq, sched);
+}
+
+static void cdrom_store32(Cdrom *cdrom, uint32_t offset, uint32_t val,
+                          Irq *irq, Scheduler *sched)
+{
+    cdrom_store8(cdrom, offset, (uint8_t)val, irq, sched);
+    cdrom_store8(cdrom, offset + 1, (uint8_t)(val >> 8), irq, sched);
+    cdrom_store8(cdrom, offset + 2, (uint8_t)(val >> 16), irq, sched);
+    cdrom_store8(cdrom, offset + 3, (uint8_t)(val >> 24), irq, sched);
+}
+
+static uint32_t gpu_reg_read(Interconnect *inter, uint32_t offset)
+{
+    switch (offset)
+    {
+    case 0:
+        return gpu_read(&inter->gpu);
+    case 4:
+        return gpu_status(&inter->gpu);
+    default:
+        fprintf(stderr, "GPU read: %08X\n", offset);
+        exit(1);
+    }
+}
+
+static void gpu_reg_write(Interconnect *inter, uint32_t offset, uint32_t val)
+{
+    switch (offset)
+    {
+    case 0:
+        gpu_gp0(&inter->gpu, val);
+        return;
+    case 4:
+        gpu_gp1(&inter->gpu, val);
+        return;
+    default:
+        fprintf(stderr, "GPU write: %08X = %08X\n", offset, val);
+        exit(1);
+    }
+}
+
+static uint16_t gpu_reg_read16(Interconnect *inter, uint32_t offset)
+{
+    uint32_t word = gpu_reg_read(inter, offset & ~3u);
+    return (uint16_t)(word >> ((offset & 2u) * 8u));
+}
+
+static uint8_t gpu_reg_read8(Interconnect *inter, uint32_t offset)
+{
+    uint32_t word = gpu_reg_read(inter, offset & ~3u);
+    return (uint8_t)(word >> ((offset & 3u) * 8u));
+}
+
+static void gpu_reg_write16(Interconnect *inter, uint32_t offset, uint16_t val)
+{
+    gpu_reg_write(inter, offset & ~3u, (uint32_t)val << ((offset & 2u) * 8u));
+}
+
+static void gpu_reg_write8(Interconnect *inter, uint32_t offset, uint8_t val)
+{
+    gpu_reg_write(inter, offset & ~3u, (uint32_t)val << ((offset & 3u) * 8u));
+}
+
+static uint16_t mdec_reg_read16(Interconnect *inter, uint32_t offset)
+{
+    uint32_t word = mdec_load32(&inter->mdec, offset & ~3u);
+    return (uint16_t)(word >> ((offset & 2u) * 8u));
+}
+
+static uint8_t mdec_reg_read8(Interconnect *inter, uint32_t offset)
+{
+    uint32_t word = mdec_load32(&inter->mdec, offset & ~3u);
+    return (uint8_t)(word >> ((offset & 3u) * 8u));
+}
+
+static void mdec_reg_write16(Interconnect *inter, uint32_t offset, uint16_t val)
+{
+    mdec_store32(&inter->mdec, offset & ~3u, (uint32_t)val << ((offset & 2u) * 8u));
+}
+
+static void mdec_reg_write8(Interconnect *inter, uint32_t offset, uint8_t val)
+{
+    mdec_store32(&inter->mdec, offset & ~3u, (uint32_t)val << ((offset & 3u) * 8u));
+}
+
+static uint8_t spu_load8(Interconnect *inter, uint32_t abs, uint32_t offset)
+{
+    uint16_t half = spu_load(&inter->spu, abs & ~1u, offset & ~1u);
+    return (uint8_t)(half >> ((offset & 1u) * 8u));
+}
+
+static uint32_t spu_load32(Interconnect *inter, uint32_t abs, uint32_t offset)
+{
+    return (uint32_t)spu_load(&inter->spu, abs, offset) |
+           ((uint32_t)spu_load(&inter->spu, abs + 2, offset + 2) << 16);
+}
+
+static void spu_store8(Interconnect *inter, uint32_t abs, uint32_t offset, uint8_t val)
+{
+    uint32_t aligned_abs = abs & ~1u;
+    uint32_t aligned_off = offset & ~1u;
+    uint32_t shift = (offset & 1u) * 8u;
+    uint16_t half = spu_load(&inter->spu, aligned_abs, aligned_off);
+    half = (uint16_t)((half & ~(0xFFu << shift)) | ((uint16_t)val << shift));
+    spu_store(&inter->spu, aligned_abs, aligned_off, half);
+}
+
+static void spu_store32(Interconnect *inter, uint32_t abs, uint32_t offset, uint32_t val)
+{
+    spu_store(&inter->spu, abs, offset, (uint16_t)val);
+    spu_store(&inter->spu, abs + 2, offset + 2, (uint16_t)(val >> 16));
+}
+
+static void dma_mdec_out_reorder_color(Interconnect *inter, uint32_t addr, uint32_t remsz)
+{
+    uint32_t words_per_macroblock = inter->mdec.output_depth == 3 ? 128u : 192u;
+    uint32_t bytes_per_pixel = inter->mdec.output_depth == 3 ? 2u : 3u;
+    uint8_t raw[192u * 4u];
+    uint8_t ordered[192u * 4u];
+    uint32_t macroblock = 0;
+
+    while (remsz >= words_per_macroblock)
+    {
+        memset(raw, 0, sizeof(raw));
+        memset(ordered, 0, sizeof(ordered));
+
+        for (uint32_t i = 0; i < words_per_macroblock; i++)
+        {
+            uint32_t word = mdec_dma_read(&inter->mdec);
+            raw[i * 4u + 0u] = (uint8_t)word;
+            raw[i * 4u + 1u] = (uint8_t)(word >> 8);
+            raw[i * 4u + 2u] = (uint8_t)(word >> 16);
+            raw[i * 4u + 3u] = (uint8_t)(word >> 24);
+        }
+
+        for (uint32_t block = 0; block < 4; block++)
+        {
+            uint32_t xx = (block & 1u) ? 8u : 0u;
+            uint32_t yy = (block & 2u) ? 8u : 0u;
+            uint32_t block_base = block * 8u * 8u * bytes_per_pixel;
+            for (uint32_t y = 0; y < 8; y++)
+            {
+                for (uint32_t x = 0; x < 8; x++)
+                {
+                    uint32_t src = block_base + (y * 8u + x) * bytes_per_pixel;
+                    uint32_t dst = ((yy + y) * 16u + (xx + x)) * bytes_per_pixel;
+                    for (uint32_t b = 0; b < bytes_per_pixel; b++)
+                        ordered[dst + b] = raw[src + b];
+                }
+            }
+        }
+
+        uint32_t dst_addr = (addr + macroblock * words_per_macroblock * 4u) & 0x001FFFFC;
+        for (uint32_t i = 0; i < words_per_macroblock; i++)
+        {
+            uint32_t word = (uint32_t)ordered[i * 4u + 0u] |
+                            ((uint32_t)ordered[i * 4u + 1u] << 8) |
+                            ((uint32_t)ordered[i * 4u + 2u] << 16) |
+                            ((uint32_t)ordered[i * 4u + 3u] << 24);
+            ram_store32(&inter->ram, (dst_addr + i * 4u) & 0x001FFFFC, word);
+        }
+
+        macroblock++;
+        remsz -= words_per_macroblock;
+    }
+}
+
 static void do_dma_block(Interconnect *inter, Port port)
 {
     Channel *ch = dma_channel(&inter->dma, port);
@@ -190,6 +497,11 @@ static void do_dma_block(Interconnect *inter, Port port)
     uint32_t remsz;
     if (!channel_transfer_size(ch, &remsz))
     {
+        if (port == PORT_OTC)
+        {
+            dma_finish(inter, ch, port);
+            return;
+        }
         fprintf(stderr, "Couldn't figure out DMA block transfer size\n");
         exit(1);
     }
@@ -197,6 +509,13 @@ static void do_dma_block(Interconnect *inter, Port port)
         remsz = channel_block_count(ch) ? channel_block_count(ch) : channel_block_size(ch);
     LOG(LOG_DMA, "DMA block port=%d dir=%d addr=0x%06X bs=%u bc=%u words=%u", port,
         channel_direction(ch), addr, channel_block_size(ch), channel_block_count(ch), remsz);
+    if (port == PORT_MDEC_OUT && channel_direction(ch) == DIRECTION_TO_RAM &&
+        increment == STEP_INCREMENT && (inter->mdec.output_depth == 2 || inter->mdec.output_depth == 3))
+    {
+        dma_mdec_out_reorder_color(inter, addr, remsz);
+        dma_finish(inter, ch, port);
+        return;
+    }
     while (remsz > 0)
     {
         uint32_t cur_addr = addr & 0x001FFFFC;
@@ -215,6 +534,8 @@ static void do_dma_block(Interconnect *inter, Port port)
                 break;
             case PORT_SPU:
                 spu_dma_write(&inter->spu, src);
+                break;
+            case PORT_OTC:
                 break;
             default:
                 fprintf(stderr, "Unhandled DMA dest port %d\n", port);
@@ -251,8 +572,7 @@ static void do_dma_block(Interconnect *inter, Port port)
         addr = (increment == STEP_INCREMENT) ? addr + 4 : addr - 4;
         remsz--;
     }
-    channel_done(ch);
-    LOG(LOG_DMA, "DMA done port=%d", port);
+    dma_finish(inter, ch, port);
 }
 
 static void do_dma_linked_list(Interconnect *inter, Port port)
@@ -283,12 +603,12 @@ static void do_dma_linked_list(Interconnect *inter, Port port)
             break;
         addr = header & 0x001FFFFC;
     }
-    channel_done(ch);
+    dma_finish(inter, ch, port);
 }
 
 static void do_dma(Interconnect *inter, Port port)
 {
-    if (channel_sync(dma_channel(&inter->dma, port)) == SYNC_LINKED_LIST)
+    if (port != PORT_OTC && channel_sync(dma_channel(&inter->dma, port)) == SYNC_LINKED_LIST)
         do_dma_linked_list(inter, port);
     else
         do_dma_block(inter, port);
@@ -301,6 +621,8 @@ int interconnect_init(Interconnect *inter, const char *bios_path, SDL_Window *wi
     memset(inter, 0, sizeof(*inter));
     if (bios_init(&inter->bios, bios_path) != 0)
         return -1;
+    inter->mem_control[0] = 0x1F000000;
+    inter->mem_control[1] = 0x1F802000;
     ram_init(&inter->ram);
     dma_init(&inter->dma);
     gpu_init(&inter->gpu, window);
@@ -342,31 +664,33 @@ uint32_t interconnect_load32(Interconnect *inter, uint32_t addr)
     uint32_t abs = mask_region(addr);
     uint32_t off;
 
+    if (range_contains(MAP_MEM_CONTROL, abs, &off))
+        return mem_control_load32(inter, off);
     if (range_contains(MAP_BIOS, abs, &off))
         return bios_load32(&inter->bios, off);
+    if (range_contains(MAP_SPU, abs, &off))
+        return spu_load32(inter, abs, off);
     if (range_contains(MAP_SCRATCHPAD, abs, &off))
         return scratch_load32(inter, off);
     if (range_contains(MAP_RAM, abs, &off))
-        return ram_load32(&inter->ram, off);
+        return ram_load32(&inter->ram, off & 0x001FFFFF);
     if (range_contains(MAP_IRQ_CONTROL, abs, &off))
         return irq_load32(&inter->irq, off);
+    if (range_contains(MAP_RAM_SIZE, abs, &off))
+        return 0;
+    if (range_contains(MAP_CACHE_CTRL, abs, &off))
+        return 0;
     if (range_contains(MAP_DMA, abs, &off))
         return dma_reg_read(inter, off);
+    if (range_contains(MAP_CDROM, abs, &off))
+        return cdrom_load32(&inter->cdrom, off);
+    if (range_contains(MAP_SIO, abs, &off))
+        return (uint32_t)sio_load16(&inter->sio, off) |
+               ((uint32_t)sio_load16(&inter->sio, off + 2) << 16);
     if (range_contains(MAP_MDEC, abs, &off))
         return mdec_load32(&inter->mdec, off);
     if (range_contains(MAP_GPU, abs, &off))
-    {
-        switch (off)
-        {
-        case 0:
-            return gpu_read(&inter->gpu);
-        case 4:
-            return gpu_status(&inter->gpu);
-        default:
-            fprintf(stderr, "GPU read: %08X\n", off);
-            exit(1);
-        }
-    }
+        return gpu_reg_read(inter, off);
     if (range_contains(MAP_TIMERS, abs, &off))
         return timers_load32(&inter->timers, off);
     if (range_contains(MAP_EXPANSION1, abs, &off))
@@ -391,6 +715,8 @@ uint16_t interconnect_load16(Interconnect *inter, uint32_t addr)
     uint32_t abs = mask_region(addr);
     uint32_t off;
 
+    if (range_contains(MAP_MEM_CONTROL, abs, &off))
+        return mem_control_load16(inter, off);
     if (range_contains(MAP_SPU, abs, &off))
         return spu_load(&inter->spu, abs, off);
     if (range_contains(MAP_BIOS, abs, &off))
@@ -398,9 +724,21 @@ uint16_t interconnect_load16(Interconnect *inter, uint32_t addr)
     if (range_contains(MAP_SCRATCHPAD, abs, &off))
         return scratch_load16(inter, off);
     if (range_contains(MAP_RAM, abs, &off))
-        return ram_load16(&inter->ram, off);
+        return ram_load16(&inter->ram, off & 0x001FFFFF);
     if (range_contains(MAP_IRQ_CONTROL, abs, &off))
         return irq_load16(&inter->irq, off);
+    if (range_contains(MAP_RAM_SIZE, abs, &off))
+        return 0;
+    if (range_contains(MAP_CACHE_CTRL, abs, &off))
+        return 0;
+    if (range_contains(MAP_DMA, abs, &off))
+        return dma_reg_read16(inter, off);
+    if (range_contains(MAP_CDROM, abs, &off))
+        return cdrom_load16(&inter->cdrom, off);
+    if (range_contains(MAP_GPU, abs, &off))
+        return gpu_reg_read16(inter, off);
+    if (range_contains(MAP_MDEC, abs, &off))
+        return mdec_reg_read16(inter, off);
     if (range_contains(MAP_TIMERS, abs, &off))
         return timers_load16(&inter->timers, off);
     if (range_contains(MAP_SIO, abs, &off))
@@ -422,14 +760,32 @@ uint8_t interconnect_load8(Interconnect *inter, uint32_t addr)
     uint32_t abs = mask_region(addr);
     uint32_t off;
 
+    if (range_contains(MAP_MEM_CONTROL, abs, &off))
+        return mem_control_load8(inter, off);
     if (range_contains(MAP_BIOS, abs, &off))
         return bios_load8(&inter->bios, off);
     if (range_contains(MAP_SCRATCHPAD, abs, &off))
         return inter->scratchpad[off];
     if (range_contains(MAP_RAM, abs, &off))
-        return ram_load8(&inter->ram, off);
+        return ram_load8(&inter->ram, off & 0x001FFFFF);
+    if (range_contains(MAP_IRQ_CONTROL, abs, &off))
+        return irq_load8(&inter->irq, off);
+    if (range_contains(MAP_SPU, abs, &off))
+        return spu_load8(inter, abs, off);
+    if (range_contains(MAP_TIMERS, abs, &off))
+        return timers_load8(&inter->timers, off);
+    if (range_contains(MAP_GPU, abs, &off))
+        return gpu_reg_read8(inter, off);
+    if (range_contains(MAP_MDEC, abs, &off))
+        return mdec_reg_read8(inter, off);
     if (range_contains(MAP_CDROM, abs, &off))
         return cdrom_load8(&inter->cdrom, off);
+    if (range_contains(MAP_RAM_SIZE, abs, &off))
+        return 0;
+    if (range_contains(MAP_CACHE_CTRL, abs, &off))
+        return 0;
+    if (range_contains(MAP_DMA, abs, &off))
+        return dma_reg_read8(inter, off);
     if (range_contains(MAP_SIO, abs, &off))
         return sio_load8(&inter->sio, off);
     if (range_contains(MAP_EXPANSION1, abs, &off))
@@ -475,6 +831,7 @@ void interconnect_store32(Interconnect *inter, uint32_t addr, uint32_t val)
         default:
             break;
         }
+        mem_control_store32(inter, off, val);
         return;
     }
     if (range_contains(MAP_RAM_SIZE, abs, &off))
@@ -483,7 +840,7 @@ void interconnect_store32(Interconnect *inter, uint32_t addr, uint32_t val)
         return;
     if (range_contains(MAP_RAM, abs, &off))
     {
-        ram_store32(&inter->ram, off, val);
+        ram_store32(&inter->ram, off & 0x001FFFFF, val);
         return;
     }
     if (range_contains(MAP_SCRATCHPAD, abs, &off))
@@ -506,20 +863,26 @@ void interconnect_store32(Interconnect *inter, uint32_t addr, uint32_t val)
         mdec_store32(&inter->mdec, off, val);
         return;
     }
+    if (range_contains(MAP_SPU, abs, &off))
+    {
+        spu_store32(inter, abs, off, val);
+        return;
+    }
+    if (range_contains(MAP_CDROM, abs, &off))
+    {
+        cdrom_store32(&inter->cdrom, off, val, &inter->irq, &inter->scheduler);
+        return;
+    }
+    if (range_contains(MAP_SIO, abs, &off))
+    {
+        sio_store16(&inter->sio, off, (uint16_t)val, &inter->irq);
+        sio_store16(&inter->sio, off + 2, (uint16_t)(val >> 16), &inter->irq);
+        return;
+    }
     if (range_contains(MAP_GPU, abs, &off))
     {
-        switch (off)
-        {
-        case 0:
-            gpu_gp0(&inter->gpu, val);
-            return;
-        case 4:
-            gpu_gp1(&inter->gpu, val);
-            return;
-        default:
-            fprintf(stderr, "GPU write: %08X = %08X\n", off, val);
-            exit(1);
-        }
+        gpu_reg_write(inter, off, val);
+        return;
     }
     if (range_contains(MAP_TIMERS, abs, &off))
     {
@@ -542,9 +905,14 @@ void interconnect_store16(Interconnect *inter, uint32_t addr, uint16_t val)
     uint32_t abs = mask_region(addr);
     uint32_t off;
 
+    if (range_contains(MAP_MEM_CONTROL, abs, &off))
+    {
+        mem_control_store16(inter, off, val);
+        return;
+    }
     if (range_contains(MAP_RAM, abs, &off))
     {
-        ram_store16(&inter->ram, off, val);
+        ram_store16(&inter->ram, off & 0x001FFFFF, val);
         return;
     }
     if (range_contains(MAP_SCRATCHPAD, abs, &off))
@@ -557,6 +925,10 @@ void interconnect_store16(Interconnect *inter, uint32_t addr, uint16_t val)
         spu_store(&inter->spu, abs, off, val);
         return;
     }
+    if (range_contains(MAP_RAM_SIZE, abs, &off))
+        return;
+    if (range_contains(MAP_CACHE_CTRL, abs, &off))
+        return;
     if (range_contains(MAP_TIMERS, abs, &off))
     {
         timers_store16(&inter->timers, off, val, &inter->scheduler);
@@ -567,9 +939,29 @@ void interconnect_store16(Interconnect *inter, uint32_t addr, uint16_t val)
         irq_store16(&inter->irq, off, val);
         return;
     }
+    if (range_contains(MAP_DMA, abs, &off))
+    {
+        dma_reg_write16(inter, off, val);
+        return;
+    }
     if (range_contains(MAP_SIO, abs, &off))
     {
         sio_store16(&inter->sio, off, val, &inter->irq);
+        return;
+    }
+    if (range_contains(MAP_CDROM, abs, &off))
+    {
+        cdrom_store16(&inter->cdrom, off, val, &inter->irq, &inter->scheduler);
+        return;
+    }
+    if (range_contains(MAP_GPU, abs, &off))
+    {
+        gpu_reg_write16(inter, off, val);
+        return;
+    }
+    if (range_contains(MAP_MDEC, abs, &off))
+    {
+        mdec_reg_write16(inter, off, val);
         return;
     }
 
@@ -583,16 +975,26 @@ void interconnect_store8(Interconnect *inter, uint32_t addr, uint8_t val)
     uint32_t abs = mask_region(addr);
     uint32_t off;
 
+    if (range_contains(MAP_MEM_CONTROL, abs, &off))
+    {
+        mem_control_store8(inter, off, val);
+        return;
+    }
     if (range_contains(MAP_EXPANSION2, abs, &off))
         return;
     if (range_contains(MAP_RAM, abs, &off))
     {
-        ram_store8(&inter->ram, off, val);
+        ram_store8(&inter->ram, off & 0x001FFFFF, val);
         return;
     }
     if (range_contains(MAP_SCRATCHPAD, abs, &off))
     {
         inter->scratchpad[off] = val;
+        return;
+    }
+    if (range_contains(MAP_SPU, abs, &off))
+    {
+        spu_store8(inter, abs, off, val);
         return;
     }
     if (range_contains(MAP_CDROM, abs, &off))
@@ -603,6 +1005,35 @@ void interconnect_store8(Interconnect *inter, uint32_t addr, uint8_t val)
     if (range_contains(MAP_SIO, abs, &off))
     {
         sio_store8(&inter->sio, off, val, &inter->irq);
+        return;
+    }
+    if (range_contains(MAP_IRQ_CONTROL, abs, &off))
+    {
+        irq_store8(&inter->irq, off, val);
+        return;
+    }
+    if (range_contains(MAP_TIMERS, abs, &off))
+    {
+        timers_store8(&inter->timers, off, val, &inter->scheduler);
+        return;
+    }
+    if (range_contains(MAP_GPU, abs, &off))
+    {
+        gpu_reg_write8(inter, off, val);
+        return;
+    }
+    if (range_contains(MAP_MDEC, abs, &off))
+    {
+        mdec_reg_write8(inter, off, val);
+        return;
+    }
+    if (range_contains(MAP_RAM_SIZE, abs, &off))
+        return;
+    if (range_contains(MAP_CACHE_CTRL, abs, &off))
+        return;
+    if (range_contains(MAP_DMA, abs, &off))
+    {
+        dma_reg_write8(inter, off, val);
         return;
     }
 

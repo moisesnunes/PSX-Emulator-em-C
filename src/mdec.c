@@ -10,25 +10,137 @@
 #define MDEC_STATUS_DATA_OUT_REQ (1u << 27)
 
 static const uint8_t zagzig[64] = {
-    0, 1, 8, 16, 9, 2, 3, 10,
-    17, 24, 32, 25, 18, 11, 4, 5,
-    12, 19, 26, 33, 40, 48, 41, 34,
-    27, 20, 13, 6, 7, 14, 21, 28,
-    35, 42, 49, 56, 57, 50, 43, 36,
-    29, 22, 15, 23, 30, 37, 44, 51,
-    58, 59, 52, 45, 38, 31, 39, 46,
-    53, 60, 61, 54, 47, 55, 62, 63,
+    0,
+    1,
+    8,
+    16,
+    9,
+    2,
+    3,
+    10,
+    17,
+    24,
+    32,
+    25,
+    18,
+    11,
+    4,
+    5,
+    12,
+    19,
+    26,
+    33,
+    40,
+    48,
+    41,
+    34,
+    27,
+    20,
+    13,
+    6,
+    7,
+    14,
+    21,
+    28,
+    35,
+    42,
+    49,
+    56,
+    57,
+    50,
+    43,
+    36,
+    29,
+    22,
+    15,
+    23,
+    30,
+    37,
+    44,
+    51,
+    58,
+    59,
+    52,
+    45,
+    38,
+    31,
+    39,
+    46,
+    53,
+    60,
+    61,
+    54,
+    47,
+    55,
+    62,
+    63,
 };
 
 static const int16_t default_scale[64] = {
-    0x5A82, 0x5A82, 0x5A82, 0x5A82, 0x5A82, 0x5A82, 0x5A82, 0x5A82,
-    0x7D8A, 0x6A6D, 0x471C, 0x18F8, (int16_t)0xE707, (int16_t)0xB8E3, (int16_t)0x9592, (int16_t)0x8275,
-    0x7641, 0x30FB, (int16_t)0xCF04, (int16_t)0x89BE, (int16_t)0x89BE, (int16_t)0xCF04, 0x30FB, 0x7641,
-    0x6A6D, (int16_t)0xE707, (int16_t)0x8275, (int16_t)0xB8E3, 0x471C, 0x7D8A, 0x18F8, (int16_t)0x9592,
-    0x5A82, (int16_t)0xA57D, (int16_t)0xA57D, 0x5A82, 0x5A82, (int16_t)0xA57D, (int16_t)0xA57D, 0x5A82,
-    0x471C, (int16_t)0x8275, 0x18F8, 0x6A6D, (int16_t)0x9592, (int16_t)0xE707, 0x7D8A, (int16_t)0xB8E3,
-    0x30FB, (int16_t)0x89BE, 0x7641, (int16_t)0xCF04, (int16_t)0xCF04, 0x7641, (int16_t)0x89BE, 0x30FB,
-    0x18F8, (int16_t)0xB8E3, 0x6A6D, (int16_t)0x8275, 0x7D8A, (int16_t)0x9592, 0x471C, (int16_t)0xE707,
+    0x5A82,
+    0x5A82,
+    0x5A82,
+    0x5A82,
+    0x5A82,
+    0x5A82,
+    0x5A82,
+    0x5A82,
+    0x7D8A,
+    0x6A6D,
+    0x471C,
+    0x18F8,
+    (int16_t)0xE707,
+    (int16_t)0xB8E3,
+    (int16_t)0x9592,
+    (int16_t)0x8275,
+    0x7641,
+    0x30FB,
+    (int16_t)0xCF04,
+    (int16_t)0x89BE,
+    (int16_t)0x89BE,
+    (int16_t)0xCF04,
+    0x30FB,
+    0x7641,
+    0x6A6D,
+    (int16_t)0xE707,
+    (int16_t)0x8275,
+    (int16_t)0xB8E3,
+    0x471C,
+    0x7D8A,
+    0x18F8,
+    (int16_t)0x9592,
+    0x5A82,
+    (int16_t)0xA57D,
+    (int16_t)0xA57D,
+    0x5A82,
+    0x5A82,
+    (int16_t)0xA57D,
+    (int16_t)0xA57D,
+    0x5A82,
+    0x471C,
+    (int16_t)0x8275,
+    0x18F8,
+    0x6A6D,
+    (int16_t)0x9592,
+    (int16_t)0xE707,
+    0x7D8A,
+    (int16_t)0xB8E3,
+    0x30FB,
+    (int16_t)0x89BE,
+    0x7641,
+    (int16_t)0xCF04,
+    (int16_t)0xCF04,
+    0x7641,
+    (int16_t)0x89BE,
+    0x30FB,
+    0x18F8,
+    (int16_t)0xB8E3,
+    0x6A6D,
+    (int16_t)0x8275,
+    0x7D8A,
+    (int16_t)0x9592,
+    0x471C,
+    (int16_t)0xE707,
 };
 
 static int32_t sign10(uint16_t v)
@@ -205,6 +317,14 @@ static uint8_t mono_sample(const Mdec *mdec, int16_t y)
     return (uint8_t)v;
 }
 
+static int32_t signed9_to_s8(int16_t v)
+{
+    int32_t x = v & 0x1FF;
+    if (x & 0x100)
+        x -= 0x200;
+    return clamp_i32(x, -128, 127);
+}
+
 static uint8_t mono_nibble(const Mdec *mdec, int16_t y)
 {
     uint32_t v = (uint32_t)mono_sample(mdec, y) + 8u;
@@ -246,9 +366,12 @@ static void output_mono(Mdec *mdec, const int16_t yblk[64])
 static void yuv_to_rgb(const Mdec *mdec, int16_t y, int16_t cr, int16_t cb,
                        uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    int32_t rr = y + (cr * 5743) / 4096;
-    int32_t gg = y - (cr * 2926 + cb * 1408) / 4096;
-    int32_t bb = y + (cb * 7258) / 4096;
+    int32_t yy = signed9_to_s8(y);
+    int32_t rr_chroma = signed9_to_s8(cr);
+    int32_t bb_chroma = signed9_to_s8(cb);
+    int32_t rr = yy + (rr_chroma * 5743) / 4096;
+    int32_t gg = yy - (rr_chroma * 2926 + bb_chroma * 1408) / 4096;
+    int32_t bb = yy + (bb_chroma * 7258) / 4096;
     rr = clamp_i32(rr, -128, 127);
     gg = clamp_i32(gg, -128, 127);
     bb = clamp_i32(bb, -128, 127);
@@ -282,33 +405,37 @@ static void output_color(Mdec *mdec, int16_t blocks[6][64])
 {
     uint8_t bytes[8];
     int byte_count = 0;
-    for (int y = 0; y < 16; y++)
+    for (int block = 0; block < 4; block++)
     {
-        for (int x = 0; x < 16; x++)
+        int xx = (block & 1) ? 8 : 0;
+        int yy = (block & 2) ? 8 : 0;
+        for (int y = 0; y < 8; y++)
         {
-            int y_block = (y >= 8 ? 2 : 0) + (x >= 8 ? 1 : 0);
-            int yi = (x & 7) + (y & 7) * 8;
-            int ci = (x / 2) + (y / 2) * 8;
-            uint8_t r, g, b;
-            yuv_to_rgb(mdec, blocks[2 + y_block][yi], blocks[0][ci], blocks[1][ci], &r, &g, &b);
+            for (int x = 0; x < 8; x++)
+            {
+                int yi = x + y * 8;
+                int ci = ((x + xx) / 2) + ((y + yy) / 2) * 8;
+                uint8_t r, g, b;
+                yuv_to_rgb(mdec, blocks[2 + block][yi], blocks[0][ci], blocks[1][ci], &r, &g, &b);
 
-            if (mdec->output_depth == 3)
-            {
-                uint16_t pix = (uint16_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
-                if (mdec->output_bit15)
-                    pix |= 0x8000u;
-                bytes[byte_count++] = (uint8_t)pix;
-                bytes[byte_count++] = (uint8_t)(pix >> 8);
-                if (byte_count == 4)
+                if (mdec->output_depth == 3)
                 {
-                    push_output(mdec, (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
-                                          ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24));
-                    byte_count = 0;
+                    uint16_t pix = (uint16_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
+                    if (mdec->output_bit15)
+                        pix |= 0x8000u;
+                    bytes[byte_count++] = (uint8_t)pix;
+                    bytes[byte_count++] = (uint8_t)(pix >> 8);
+                    if (byte_count == 4)
+                    {
+                        push_output(mdec, (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+                                              ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24));
+                        byte_count = 0;
+                    }
                 }
-            }
-            else
-            {
-                append_rgb_pixel(mdec, r, g, b, bytes, &byte_count);
+                else
+                {
+                    append_rgb_pixel(mdec, r, g, b, bytes, &byte_count);
+                }
             }
         }
     }

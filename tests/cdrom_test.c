@@ -309,6 +309,15 @@ static void test_readn(void)
 
     send_cmd(&cd, 0x06, &irq, &sched); /* ReadN */
 
+    /* ReadN first returns INT3; sectors must wait until it is acknowledged. */
+    {
+        uint32_t fired = scheduler_step(&sched, PS1_CPU_HZ / 500, &irq);
+        if (fired & (1u << EVENT_CDROM_IRQ))
+            cdrom_on_scheduler_event(&cd, &irq, &sched);
+    }
+    EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT3);
+    ack_cdrom_irq(&cd, &irq, &sched);
+
     /* Run until we have INT3 + at least 3 INT1s */
     const uint32_t step = PS1_CPU_HZ / 500;
     for (uint64_t e = 0; e < 4ULL * PS1_CPU_HZ; e += step)
@@ -316,6 +325,8 @@ static void test_readn(void)
         uint32_t fired = scheduler_step(&sched, step, &irq);
         if (fired & (1u << EVENT_CDROM_IRQ))
             cdrom_on_scheduler_event(&cd, &irq, &sched);
+        if (cd.irq_flag == CDROM_INT1)
+            ack_cdrom_irq(&cd, &irq, &sched);
         /* Count INT1 sectors after the initial INT3 */
         uint32_t int1s = 0;
         for (uint32_t i = 1; i < cdrom_event_log_count(); i++)

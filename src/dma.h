@@ -1,5 +1,6 @@
 #pragma once
 #include "channel.h"
+#include "irq.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -23,6 +24,8 @@ typedef struct
     uint8_t channel_irq_en;
     uint8_t channel_irq_flags;
     bool force_irq;
+    bool irq_line;
+    bool irq_pending;
     uint8_t irq_dummy;
     Channel channels[7];
 } Dma;
@@ -34,5 +37,6 @@ uint32_t dma_interrupt(const Dma *dma);
 void dma_set_interrupt(Dma *dma, uint32_t val);
 void dma_mark_channel_done(Dma *dma, Port port);
 bool dma_irq_pending(const Dma *dma);
+void dma_step(Dma *dma, Irq *irq);
 Channel *dma_channel(Dma *dma, Port port);
 const Channel *dma_channel_const(const Dma *dma, Port port);

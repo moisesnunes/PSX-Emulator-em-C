@@ -38,6 +38,11 @@ static inline uint32_t cpu_external_irq_cause(const Cpu *cpu)
     return irq_pending(&cpu->inter.irq) ? (1u << 10) : 0;
 }
 
+static inline bool cpu_irq_enabled(const Cpu *cpu)
+{
+    return (cpu->sr & 0x1u) && (cpu->sr & cpu_external_irq_cause(cpu)) != 0;
+}
+
 static inline bool cpu_is_bios_vector(uint32_t pc)
 {
     return pc == 0x000000A0u || pc == 0x000000B0u || pc == 0x000000C0u;
@@ -386,6 +391,7 @@ static void decode_and_execute(Cpu *cpu, uint32_t op)
 /* ---- Init ---- */
 int cpu_init(Cpu *cpu, const char *bios_path, SDL_Window *window, bool headless, const char *disc_path)
 {
+    memset(cpu, 0, sizeof(*cpu));
     memset(cpu->regs, 0xDE, sizeof(cpu->regs));
     cpu->regs[0] = 0;
     memcpy(cpu->out_regs, cpu->regs, sizeof(cpu->regs));
@@ -422,7 +428,7 @@ uint32_t cpu_run_next_instruction(Cpu *cpu)
     /* Hardware interrupts are sampled between instructions, but not between a
        branch and its delay slot. Let the delay slot retire, then take the IRQ
        at the branch target on the next step. */
-    if (!cpu->branch && (cpu->sr & 0x1) && irq_pending(&cpu->inter.irq))
+    if (!cpu->branch && cpu_irq_enabled(cpu))
     {
         LOG(LOG_IRQ, "CPU interrupt: SR=0x%08x status=0x%04x mask=0x%04x pc=0x%08x",
             cpu->sr, cpu->inter.irq.status, cpu->inter.irq.mask, cpu->current_pc);
@@ -1078,6 +1084,8 @@ static void op_lwr(Cpu *cpu, uint32_t op)
 
 static void op_swl(Cpu *cpu, uint32_t op)
 {
+    if (cpu->sr & 0x10000)
+        return;
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     uint32_t v = cpu_reg(cpu, instr_t(op));
     uint32_t aligned = addr & ~3u;
@@ -1105,6 +1113,8 @@ static void op_swl(Cpu *cpu, uint32_t op)
 
 static void op_swr(Cpu *cpu, uint32_t op)
 {
+    if (cpu->sr & 0x10000)
+        return;
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     uint32_t v = cpu_reg(cpu, instr_t(op));
     uint32_t aligned = addr & ~3u;

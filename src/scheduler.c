@@ -1,9 +1,6 @@
 #include "scheduler.h"
 #include "log.h"
 
-/* VBlank fires once per frame at 60 Hz (NTSC). */
-#define VBLANK_CYCLES (PS1_CPU_HZ / 60)
-
 void scheduler_init(Scheduler *s) {
     s->current_cycle = 0;
     for (int i = 0; i < EVENT_COUNT; i++) {
@@ -11,7 +8,6 @@ void scheduler_init(Scheduler *s) {
         s->events[i].fire_at = 0;
         s->events[i].type    = (EventType)i;
     }
-    scheduler_schedule(s, EVENT_VBLANK, VBLANK_CYCLES);
 }
 
 void scheduler_schedule(Scheduler *s, EventType type, uint32_t delta_cycles) {
@@ -35,11 +31,7 @@ uint32_t scheduler_step(Scheduler *s, uint32_t cycles, Irq *irq) {
         fired |= (1u << i);
 
         switch ((EventType)i) {
-        case EVENT_VBLANK:
-            LOG(LOG_IRQ, "VBlank at cycle %llu", (unsigned long long)s->current_cycle);
-            irq_assert(irq, IRQ_VBLANK);
-            scheduler_schedule(s, EVENT_VBLANK, VBLANK_CYCLES);
-            break;
+        case EVENT_VBLANK: break;
         case EVENT_TIMER0: irq_assert(irq, IRQ_TIMER0); break;
         case EVENT_TIMER1: irq_assert(irq, IRQ_TIMER1); break;
         case EVENT_TIMER2: irq_assert(irq, IRQ_TIMER2); break;

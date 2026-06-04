@@ -1,4 +1,5 @@
 #include "dma.h"
+#include "irq.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +35,8 @@ void dma_init(Dma *dma)
     dma->channel_irq_en = 0;
     dma->channel_irq_flags = 0;
     dma->force_irq = false;
+    dma->irq_line = false;
+    dma->irq_pending = false;
     dma->irq_dummy = 0;
     for (int i = 0; i < 7; i++)
         channel_init(&dma->channels[i]);
@@ -80,10 +83,20 @@ void dma_set_interrupt(Dma *dma, uint32_t val)
 
 void dma_mark_channel_done(Dma *dma, Port port)
 {
-    dma->channel_irq_flags |= (uint8_t)(1u << (uint8_t)port);
+    uint8_t channel_bit = (uint8_t)(1u << (uint8_t)port);
+    if (dma->irq_en && (dma->channel_irq_en & channel_bit))
+        dma->channel_irq_flags |= channel_bit;
     LOG(LOG_DMA, "done port=%u flags=0x%02X en=0x%02X irq_en=%u pending=%u dicr=0x%08X",
         (unsigned)port, dma->channel_irq_flags, dma->channel_irq_en,
         dma->irq_en ? 1u : 0u, dma_irq(dma) ? 1u : 0u, dma_interrupt(dma));
+}
+
+void dma_step(Dma *dma, Irq *irq)
+{
+    if (!dma->irq_pending)
+        return;
+    dma->irq_pending = false;
+    irq_assert(irq, IRQ_DMA);
 }
 
 Channel *dma_channel(Dma *dma, Port port)

@@ -41,7 +41,8 @@ typedef enum
 {
     GP0_MODE_COMMAND = 0,
     GP0_MODE_IMAGE_LOAD = 1,
-    GP0_MODE_IMAGE_STORE = 2
+    GP0_MODE_IMAGE_STORE = 2,
+    GP0_MODE_POLYLINE = 3
 } Gp0Mode;
 
 typedef struct
@@ -117,6 +118,15 @@ struct Gpu
     Gp0Mode gp0_mode;
     uint32_t gpuread_latch;
 
+    /* Streaming polyline state (GP0 0x48-0x4F / 0x58-0x5F) */
+    bool polyline_shaded;
+    bool polyline_expect_color;
+    bool polyline_semi;
+    int32_t polyline_last_x;
+    int32_t polyline_last_y;
+    uint32_t polyline_last_color;
+    uint32_t polyline_next_color;
+
     /* VRAM: 1024x512 x 16-bit (ABGR1555), heap-allocated */
     uint16_t *vram;
 
@@ -128,6 +138,8 @@ struct Gpu
 
     Renderer renderer;
     bool frame_updated;
+    int32_t vblank_cycles_left;
+    uint32_t frames;
 };
 
 void gpu_init(Gpu *gpu, SDL_Window *window);
@@ -136,5 +148,6 @@ uint32_t gpu_read(Gpu *gpu);
 void gpu_gp0(Gpu *gpu, uint32_t val);
 void gpu_gp1(Gpu *gpu, uint32_t val);
 void gpu_gp1_reset_consecutive(void);
+bool gpu_step(Gpu *gpu, uint32_t cycles);
 void gpu_vblank(Gpu *gpu);
 void gpu_destroy(Gpu *gpu);

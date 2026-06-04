@@ -5,6 +5,8 @@ LDFLAGS      = $(shell sdl2-config --libs) -lGL -lGLEW -lm
 DEBUG_LDFLAGS= $(LDFLAGS) -fsanitize=address,undefined
 
 BIOS_PATH ?= bios/BIOS.ROM
+EXE ?=
+MAX_INSTRUCTIONS ?= 5000000
 
 SRCS = src/main.c         \
        src/cpu.c          \
@@ -33,7 +35,8 @@ TARGET     = ps1_boot
 PSX_TEST_RUNNER = python3 tests/run_psx_tests.py
 PSX_TEST_ARGS ?=
 
-.PHONY: all clean run debug smoke test-cdrom test-sio test-gte test-dma \
+.PHONY: all clean run run-exe run-exe-headless run-psxtest-cpu run-psxtest-gpu \
+        run-psxtest-cpx run-psxtest-gte debug smoke test-cdrom test-sio test-gte test-dma \
         test-psx-list test-psx-all test-psx-cdrom test-psx-cpu test-psx-dma \
         test-psx-gpu test-psx-gte test-psx-gte-fuzz test-psx-input \
         test-psx-mdec test-psx-spu test-psx-timer-dump test-psx-timers \
@@ -53,6 +56,40 @@ $(TARGET): $(OBJS)
 
 run: $(TARGET)
 	./$(TARGET) --bios $(BIOS_PATH)
+
+run-exe: $(TARGET)
+	@if [ -z "$(EXE)" ]; then \
+	    echo "Usage: make run-exe EXE=tests/path/to/test.exe"; \
+	    exit 2; \
+	fi
+	@if [ ! -f "$(EXE)" ]; then \
+	    echo "EXE not found: $(EXE)"; \
+	    exit 2; \
+	fi
+	./$(TARGET) --bios $(BIOS_PATH) --exe $(EXE)
+
+run-exe-headless: $(TARGET)
+	@if [ -z "$(EXE)" ]; then \
+	    echo "Usage: make run-exe-headless EXE=tests/path/to/test.exe"; \
+	    exit 2; \
+	fi
+	@if [ ! -f "$(EXE)" ]; then \
+	    echo "EXE not found: $(EXE)"; \
+	    exit 2; \
+	fi
+	./$(TARGET) --bios $(BIOS_PATH) --exe $(EXE) --headless --max-instructions $(MAX_INSTRUCTIONS)
+
+run-psxtest-cpu: EXE=tests/psxtest_cpu/psxtest_cpu.exe
+run-psxtest-cpu: run-exe
+
+run-psxtest-gpu: EXE=tests/psxtest_gpu/psxtest_gpu.exe
+run-psxtest-gpu: run-exe
+
+run-psxtest-cpx: EXE=tests/psxtest_cpx/psxtest_cpx.exe
+run-psxtest-cpx: run-exe
+
+run-psxtest-gte: EXE=tests/psxtest_gte/psxtest_gte.exe
+run-psxtest-gte: run-exe
 
 debug: $(DEBUG_OBJS)
 	$(CC) $(DEBUG_OBJS) $(DEBUG_LDFLAGS) -o $(TARGET)_debug
@@ -81,7 +118,7 @@ test-gte: src/gte.c tests/gte_test.c
 
 test-dma: src/dma.c src/channel.c tests/dma_test.c
 	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
-	    tests/dma_test.c src/dma.c src/channel.c \
+	    tests/dma_test.c src/dma.c src/channel.c src/irq.c \
 	    -o tests/dma_test
 	./tests/dma_test
 

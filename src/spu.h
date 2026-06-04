@@ -6,6 +6,7 @@
 #define SOUND_RAM_SIZE (512 * 1024)
 #define NUM_VOICES 24
 #define FIR_LEN 39
+#define SPU_REG_WORDS (0x280 / 2)
 
 typedef enum
 {
@@ -70,6 +71,7 @@ typedef struct
     Voice voices[NUM_VOICES];
     SDL_AudioDeviceID device;
 
+    uint16_t regs[SPU_REG_WORDS];
     uint8_t sound_ram[SOUND_RAM_SIZE];
     uint32_t sound_ram_start_address;
     int16_t main_volume_l;

@@ -448,16 +448,24 @@ void spu_destroy(Spu *spu)
 /* ---- Load / Store ---- */
 uint16_t spu_load(const Spu *spu, uint32_t abs_addr, uint32_t offset)
 {
-    (void)spu;
     (void)abs_addr;
-    if (offset == 0x01AC)
-        return 0x0004;
-    return 0;
+    if (offset == 0x01A8)
+        return 0xFFFF;
+
+    uint16_t val = 0;
+    uint32_t reg = (offset & 0x3FEu) >> 1;
+    if (reg < SPU_REG_WORDS)
+        val = spu->regs[reg];
+    return val;
 }
 
 void spu_store(Spu *spu, uint32_t abs_addr, uint32_t offset, uint16_t val)
 {
     (void)abs_addr;
+    uint32_t reg = (offset & 0x3FEu) >> 1;
+    if (reg < SPU_REG_WORDS)
+        spu->regs[reg] = val;
+
     if (offset <= 0x017F)
     {
         int index = offset / 0x10;

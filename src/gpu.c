@@ -8,6 +8,7 @@
 
 #define VRAM_W 1024
 #define VRAM_H 512
+#define GPU_CPU_CYCLES_PER_FRAME (33868800 / 60)
 
 static uint32_t g_trace_prims_limit = 0;
 static uint32_t g_trace_prims_count = 0;
@@ -68,6 +69,48 @@ static uint16_t hres_width(HorizontalRes hr)
     }
 }
 
+static uint16_t display_width_from_gpu(const Gpu *gpu)
+{
+    uint32_t raw_width = (uint32_t)(gpu->display_horiz_end - gpu->display_horiz_start);
+    if (raw_width > 0)
+    {
+        uint32_t dotclock;
+        if (gpu->hres.hr & 1u)
+        {
+            dotclock = 7;
+        }
+        else
+        {
+            switch ((gpu->hres.hr >> 1) & 3u)
+            {
+            case 0:
+                dotclock = 10;
+                break;
+            case 1:
+                dotclock = 8;
+                break;
+            case 2:
+                dotclock = 5;
+                break;
+            default:
+                dotclock = 4;
+                break;
+            }
+        }
+
+        uint32_t width = raw_width / dotclock;
+        if (width >= 256 && width <= 640)
+            return (uint16_t)width;
+    }
+
+    return hres_width(gpu->hres);
+}
+
+static uint16_t display_height_from_gpu(const Gpu *gpu)
+{
+    return (gpu->vres == VRES_480 && gpu->interlaced) ? 480 : 240;
+}
+
 /* ---- CommandBuffer ---- */
 static void cb_clear(CommandBuffer *cb) { cb->len = 0; }
 static void cb_push(CommandBuffer *cb, uint32_t word)
@@ -91,6 +134,29 @@ static inline uint16_t rgb_to_1555(uint8_t r, uint8_t g, uint8_t b)
     return (uint16_t)(((r >> 3) & 0x1F) |
                       (((g >> 3) & 0x1F) << 5) |
                       (((b >> 3) & 0x1F) << 10));
+}
+
+static inline uint8_t dither_channel(uint8_t c, int32_t x, int32_t y)
+{
+    static const int8_t matrix[4][4] = {
+        {-4, 0, -3, 1},
+        {2, -2, 3, -1},
+        {-3, 1, -4, 0},
+        {3, -1, 2, -2},
+    };
+    int32_t v = (int32_t)c + matrix[y & 3][x & 3];
+    if (v < 0)
+        v = 0;
+    if (v > 255)
+        v = 255;
+    return (uint8_t)v;
+}
+
+static inline uint16_t rgb_to_1555_dither(uint8_t r, uint8_t g, uint8_t b, int32_t x, int32_t y)
+{
+    return rgb_to_1555(dither_channel(r, x, y),
+                       dither_channel(g, x, y),
+                       dither_channel(b, x, y));
 }
 
 /* ---- Texture fetch ---- */
@@ -165,7 +231,6 @@ static void draw_pixel(Gpu *gpu, int32_t x, int32_t y, uint16_t color, bool semi
         uint32_t or_, og, ob;
         switch (gpu->semi_transparency)
         {
-        default:
         case 0:
             or_ = (br + fr) / 2;
             og = (bg_ + fg_) / 2;
@@ -186,6 +251,11 @@ static void draw_pixel(Gpu *gpu, int32_t x, int32_t y, uint16_t color, bool semi
             og = bg_ + fg_ / 4;
             ob = bb + fb / 4;
             break; /* B+F/4   */
+        default:
+            or_ = fr;
+            og = fg_;
+            ob = fb;
+            break;
         }
         if (or_ > 31u)
             or_ = 31u;
@@ -206,71 +276,14 @@ static void draw_pixel(Gpu *gpu, int32_t x, int32_t y, uint16_t color, bool semi
 
 #define FRAC 16
 
-static void swap_i32(int32_t *a, int32_t *b)
+static int64_t edge_i64(int32_t ax, int32_t ay, int32_t bx, int32_t by, int32_t px, int32_t py)
 {
-    int32_t t = *a;
-    *a = *b;
-    *b = t;
-}
-static void swap_u8(uint8_t *a, uint8_t *b)
-{
-    uint8_t t = *a;
-    *a = *b;
-    *b = t;
+    return (int64_t)(px - ax) * (by - ay) - (int64_t)(py - ay) * (bx - ax);
 }
 
-/* Sort three vertices by Y using simple comparisons */
-static void sort3_y(int32_t px[3], int32_t py[3],
-                    uint8_t pr[3], uint8_t pg[3], uint8_t pb[3])
+static bool edge_is_top_left(int32_t ax, int32_t ay, int32_t bx, int32_t by)
 {
-    if (py[0] > py[1])
-    {
-        swap_i32(&px[0], &px[1]);
-        swap_i32(&py[0], &py[1]);
-        swap_u8(&pr[0], &pr[1]);
-        swap_u8(&pg[0], &pg[1]);
-        swap_u8(&pb[0], &pb[1]);
-    }
-    if (py[1] > py[2])
-    {
-        swap_i32(&px[1], &px[2]);
-        swap_i32(&py[1], &py[2]);
-        swap_u8(&pr[1], &pr[2]);
-        swap_u8(&pg[1], &pg[2]);
-        swap_u8(&pb[1], &pb[2]);
-    }
-    if (py[0] > py[1])
-    {
-        swap_i32(&px[0], &px[1]);
-        swap_i32(&py[0], &py[1]);
-        swap_u8(&pr[0], &pr[1]);
-        swap_u8(&pg[0], &pg[1]);
-        swap_u8(&pb[0], &pb[1]);
-    }
-}
-
-static void sort3_y_tex(int32_t px[3], int32_t py[3],
-                        uint8_t pu[3], uint8_t pv[3],
-                        uint8_t pr[3], uint8_t pg[3], uint8_t pb[3])
-{
-#define SWAP3T(i, j)              \
-    do                            \
-    {                             \
-        swap_i32(&px[i], &px[j]); \
-        swap_i32(&py[i], &py[j]); \
-        swap_u8(&pu[i], &pu[j]);  \
-        swap_u8(&pv[i], &pv[j]);  \
-        swap_u8(&pr[i], &pr[j]);  \
-        swap_u8(&pg[i], &pg[j]);  \
-        swap_u8(&pb[i], &pb[j]);  \
-    } while (0)
-    if (py[0] > py[1])
-        SWAP3T(0, 1);
-    if (py[1] > py[2])
-        SWAP3T(1, 2);
-    if (py[0] > py[1])
-        SWAP3T(0, 1);
-#undef SWAP3T
+    return (ay == by && ax > bx) || (ay < by);
 }
 
 /* Filled shaded triangle via scanline rasterization */
@@ -278,76 +291,58 @@ static void fill_triangle(Gpu *gpu,
                           int32_t x0, int32_t y0, uint8_t r0, uint8_t g0, uint8_t b0,
                           int32_t x1, int32_t y1, uint8_t r1, uint8_t g1, uint8_t b1,
                           int32_t x2, int32_t y2, uint8_t r2, uint8_t g2, uint8_t b2,
-                          bool semi)
+                          bool semi, bool dither)
 {
-    int32_t px[3] = {x0, x1, x2}, py[3] = {y0, y1, y2};
-    uint8_t pr[3] = {r0, r1, r2}, pg[3] = {g0, g1, g2}, pb[3] = {b0, b1, b2};
-    sort3_y(px, py, pr, pg, pb);
+    int64_t area = edge_i64(x0, y0, x1, y1, x2, y2);
+    if (area == 0)
+        return;
 
-    if (py[0] == py[2])
-        return; /* degenerate */
+    int32_t min_x = x0 < x1 ? x0 : x1;
+    if (x2 < min_x)
+        min_x = x2;
+    int32_t max_x = x0 > x1 ? x0 : x1;
+    if (x2 > max_x)
+        max_x = x2;
+    int32_t min_y = y0 < y1 ? y0 : y1;
+    if (y2 < min_y)
+        min_y = y2;
+    int32_t max_y = y0 > y1 ? y0 : y1;
+    if (y2 > max_y)
+        max_y = y2;
 
-    for (int32_t y = py[0]; y <= py[2]; y++)
+    bool tl01 = edge_is_top_left(x0, y0, x1, y1);
+    bool tl12 = edge_is_top_left(x1, y1, x2, y2);
+    bool tl20 = edge_is_top_left(x2, y2, x0, y0);
+    bool neg = area < 0;
+    if (neg)
+        area = -area;
+
+    for (int32_t y = min_y; y <= max_y; y++)
     {
-        int32_t dy02 = py[2] - py[0];
-        int32_t t02 = (dy02 == 0) ? 0 : ((y - py[0]) << FRAC) / dy02;
-        int32_t xa = px[0] + (((px[2] - px[0]) * t02) >> FRAC);
-        int32_t ra = pr[0] + (((int32_t)(pr[2] - pr[0]) * t02) >> FRAC);
-        int32_t ga = pg[0] + (((int32_t)(pg[2] - pg[0]) * t02) >> FRAC);
-        int32_t ba = pb[0] + (((int32_t)(pb[2] - pb[0]) * t02) >> FRAC);
-
-        int32_t xb, rb, gb, bb;
-        if (y <= py[1])
+        for (int32_t x = min_x; x <= max_x; x++)
         {
-            int32_t dy01 = py[1] - py[0];
-            int32_t t01 = (dy01 == 0) ? (1 << FRAC) : ((y - py[0]) << FRAC) / dy01;
-            xb = px[0] + (((px[1] - px[0]) * t01) >> FRAC);
-            rb = pr[0] + (((int32_t)(pr[1] - pr[0]) * t01) >> FRAC);
-            gb = pg[0] + (((int32_t)(pg[1] - pg[0]) * t01) >> FRAC);
-            bb = pb[0] + (((int32_t)(pb[1] - pb[0]) * t01) >> FRAC);
-        }
-        else
-        {
-            int32_t dy12 = py[2] - py[1];
-            int32_t t12 = (dy12 == 0) ? 0 : ((y - py[1]) << FRAC) / dy12;
-            xb = px[1] + (((px[2] - px[1]) * t12) >> FRAC);
-            rb = pr[1] + (((int32_t)(pr[2] - pr[1]) * t12) >> FRAC);
-            gb = pg[1] + (((int32_t)(pg[2] - pg[1]) * t12) >> FRAC);
-            bb = pb[1] + (((int32_t)(pb[2] - pb[1]) * t12) >> FRAC);
-        }
-
-        if (xa > xb)
-        {
-            swap_i32(&xa, &xb);
-            int32_t t;
-            t = ra;
-            ra = rb;
-            rb = t;
-            t = ga;
-            ga = gb;
-            gb = t;
-            t = ba;
-            ba = bb;
-            bb = t;
-        }
-        int32_t dx = xb - xa;
-        for (int32_t x = xa; x <= xb; x++)
-        {
-            uint8_t cr, cg, cb;
-            if (dx == 0)
+            int64_t w0 = edge_i64(x1, y1, x2, y2, x, y);
+            int64_t w1 = edge_i64(x2, y2, x0, y0, x, y);
+            int64_t w2 = edge_i64(x0, y0, x1, y1, x, y);
+            if (neg)
             {
-                cr = (uint8_t)ra;
-                cg = (uint8_t)ga;
-                cb = (uint8_t)ba;
+                w0 = -w0;
+                w1 = -w1;
+                w2 = -w2;
             }
-            else
-            {
-                int32_t t = ((x - xa) << 16) / dx;
-                cr = (uint8_t)(ra + (((rb - ra) * t) >> 16));
-                cg = (uint8_t)(ga + (((gb - ga) * t) >> 16));
-                cb = (uint8_t)(ba + (((bb - ba) * t) >> 16));
-            }
-            draw_pixel(gpu, x, y, rgb_to_1555(cr, cg, cb), semi);
+
+            if (!((w0 > 0 || (w0 == 0 && tl12)) &&
+                  (w1 > 0 || (w1 == 0 && tl20)) &&
+                  (w2 > 0 || (w2 == 0 && tl01))))
+                continue;
+
+            uint8_t cr = (uint8_t)((w0 * r0 + w1 * r1 + w2 * r2 + area / 2) / area);
+            uint8_t cg = (uint8_t)((w0 * g0 + w1 * g1 + w2 * g2 + area / 2) / area);
+            uint8_t cb = (uint8_t)((w0 * b0 + w1 * b1 + w2 * b2 + area / 2) / area);
+            uint16_t color = (dither && gpu->dithering)
+                                 ? rgb_to_1555_dither(cr, cg, cb, x, y)
+                                 : rgb_to_1555(cr, cg, cb);
+            draw_pixel(gpu, x, y, color, semi);
         }
     }
 }
@@ -359,92 +354,63 @@ static void fill_triangle_tex(Gpu *gpu,
                               int32_t x2, int32_t y2, uint8_t u2, uint8_t v2, uint8_t r2, uint8_t g2, uint8_t b2,
                               bool blend, bool semi)
 {
-    int32_t px[3] = {x0, x1, x2}, py[3] = {y0, y1, y2};
-    uint8_t pu[3] = {u0, u1, u2}, pv[3] = {v0, v1, v2};
-    uint8_t pr[3] = {r0, r1, r2}, pg[3] = {g0, g1, g2}, pb[3] = {b0, b1, b2};
-    sort3_y_tex(px, py, pu, pv, pr, pg, pb);
+    int32_t sx0 = x0 * 2, sy0 = y0 * 2;
+    int32_t sx1 = x1 * 2, sy1 = y1 * 2;
+    int32_t sx2 = x2 * 2, sy2 = y2 * 2;
+    int64_t area = edge_i64(sx0, sy0, sx1, sy1, sx2, sy2);
+    if (area == 0)
+        return;
 
-    for (int32_t y = py[0]; y <= py[2]; y++)
+    int32_t min_x = x0 < x1 ? x0 : x1;
+    if (x2 < min_x)
+        min_x = x2;
+    int32_t max_x = x0 > x1 ? x0 : x1;
+    if (x2 > max_x)
+        max_x = x2;
+    int32_t min_y = y0 < y1 ? y0 : y1;
+    if (y2 < min_y)
+        min_y = y2;
+    int32_t max_y = y0 > y1 ? y0 : y1;
+    if (y2 > max_y)
+        max_y = y2;
+
+    bool neg = area < 0;
+    if (neg)
+        area = -area;
+
+    for (int32_t y = min_y; y <= max_y; y++)
     {
-        int32_t dy02 = py[2] - py[0];
-        int32_t xa, xb;
-        uint8_t ua, va, ub, vb;
-        int32_t ra, ga, ba, rb, gb, bb;
-        int32_t t02 = (dy02 == 0) ? 0 : ((y - py[0]) << FRAC) / dy02;
-        xa = px[0] + (((px[2] - px[0]) * t02) >> FRAC);
-        ua = (uint8_t)(pu[0] + (((int32_t)(pu[2] - pu[0]) * t02) >> FRAC));
-        va = (uint8_t)(pv[0] + (((int32_t)(pv[2] - pv[0]) * t02) >> FRAC));
-        ra = pr[0] + (((int32_t)(pr[2] - pr[0]) * t02) >> FRAC);
-        ga = pg[0] + (((int32_t)(pg[2] - pg[0]) * t02) >> FRAC);
-        ba = pb[0] + (((int32_t)(pb[2] - pb[0]) * t02) >> FRAC);
-
-        if (y <= py[1])
+        for (int32_t x = min_x; x <= max_x; x++)
         {
-            int32_t dy01 = py[1] - py[0];
-            int32_t t01 = (dy01 == 0) ? (1 << FRAC) : ((y - py[0]) << FRAC) / dy01;
-            xb = (int32_t)(px[0] + (((px[1] - px[0]) * t01) >> FRAC));
-            ub = (uint8_t)(pu[0] + (((int32_t)(pu[1] - pu[0]) * t01) >> FRAC));
-            vb = (uint8_t)(pv[0] + (((int32_t)(pv[1] - pv[0]) * t01) >> FRAC));
-            rb = pr[0] + (((int32_t)(pr[1] - pr[0]) * t01) >> FRAC);
-            gb = pg[0] + (((int32_t)(pg[1] - pg[0]) * t01) >> FRAC);
-            bb = pb[0] + (((int32_t)(pb[1] - pb[0]) * t01) >> FRAC);
-        }
-        else
-        {
-            int32_t dy12 = py[2] - py[1];
-            int32_t t12 = (dy12 == 0) ? 0 : ((y - py[1]) << FRAC) / dy12;
-            xb = (int32_t)(px[1] + (((px[2] - px[1]) * t12) >> FRAC));
-            ub = (uint8_t)(pu[1] + (((int32_t)(pu[2] - pu[1]) * t12) >> FRAC));
-            vb = (uint8_t)(pv[1] + (((int32_t)(pv[2] - pv[1]) * t12) >> FRAC));
-            rb = pr[1] + (((int32_t)(pr[2] - pr[1]) * t12) >> FRAC);
-            gb = pg[1] + (((int32_t)(pg[2] - pg[1]) * t12) >> FRAC);
-            bb = pb[1] + (((int32_t)(pb[2] - pb[1]) * t12) >> FRAC);
-        }
-
-        if (xa > xb)
-        {
-            int32_t t;
-            t = xa;
-            xa = xb;
-            xb = t;
-            uint8_t tc;
-            tc = ua;
-            ua = ub;
-            ub = tc;
-            tc = va;
-            va = vb;
-            vb = tc;
-            t = ra;
-            ra = rb;
-            rb = t;
-            t = ga;
-            ga = gb;
-            gb = t;
-            t = ba;
-            ba = bb;
-            bb = t;
-        }
-        int32_t dx = xb - xa;
-        for (int32_t x = xa; x <= xb; x++)
-        {
-            uint8_t fu, fv, mcr, mcg, mcb;
-            if (dx == 0)
+            int32_t sx = x * 2 + 1;
+            int32_t sy = y * 2 + 1;
+            int64_t w0 = edge_i64(sx1, sy1, sx2, sy2, sx, sy);
+            int64_t w1 = edge_i64(sx2, sy2, sx0, sy0, sx, sy);
+            int64_t w2 = edge_i64(sx0, sy0, sx1, sy1, sx, sy);
+            if (neg)
             {
-                fu = ua;
-                fv = va;
-                mcr = (uint8_t)ra;
-                mcg = (uint8_t)ga;
-                mcb = (uint8_t)ba;
+                w0 = -w0;
+                w1 = -w1;
+                w2 = -w2;
             }
-            else
+
+            if (w0 < 0 || w1 < 0 || w2 < 0)
+                continue;
+
+            int64_t uw0 = edge_i64(sx1, sy1, sx2, sy2, x * 2, y * 2);
+            int64_t uw1 = edge_i64(sx2, sy2, sx0, sy0, x * 2, y * 2);
+            int64_t uw2 = edge_i64(sx0, sy0, sx1, sy1, x * 2, y * 2);
+            if (neg)
             {
-                int32_t t = ((x - xa) << 16) / dx;
-                fu = (uint8_t)(ua + (((int32_t)(ub - ua) * t) >> 16));
-                fv = (uint8_t)(va + (((int32_t)(vb - va) * t) >> 16));
-                mcr = (uint8_t)(ra + (((rb - ra) * t) >> 16));
-                mcg = (uint8_t)(ga + (((gb - ga) * t) >> 16));
-                mcb = (uint8_t)(ba + (((bb - ba) * t) >> 16));
+                uw0 = -uw0;
+                uw1 = -uw1;
+                uw2 = -uw2;
             }
+            uint8_t fu = (uint8_t)((uw0 * u0 + uw1 * u1 + uw2 * u2 + (area - 1) / 2) / area);
+            uint8_t fv = (uint8_t)((uw0 * v0 + uw1 * v1 + uw2 * v2 + (area - 1) / 2) / area);
+            uint8_t mcr = (uint8_t)((w0 * r0 + w1 * r1 + w2 * r2 + area / 2) / area);
+            uint8_t mcg = (uint8_t)((w0 * g0 + w1 * g1 + w2 * g2 + area / 2) / area);
+            uint8_t mcb = (uint8_t)((w0 * b0 + w1 * b1 + w2 * b2 + area / 2) / area);
             uint16_t texel = texel_fetch(gpu, fu, fv);
             if (texel == 0)
                 continue; /* transparent */
@@ -461,7 +427,9 @@ static void fill_triangle_tex(Gpu *gpu,
                     tg = 255u;
                 if (tb > 255u)
                     tb = 255u;
-                pixel = rgb_to_1555((uint8_t)tr, (uint8_t)tg, (uint8_t)tb);
+                pixel = gpu->dithering
+                            ? rgb_to_1555_dither((uint8_t)tr, (uint8_t)tg, (uint8_t)tb, x, y)
+                            : rgb_to_1555((uint8_t)tr, (uint8_t)tg, (uint8_t)tb);
             }
             else
             {
@@ -491,6 +459,7 @@ void gpu_init(Gpu *gpu, SDL_Window *window)
     gpu->dma_direction = DMA_DIR_OFF;
     gpu->hres = hres_from_fields(0, 0);
     gpu->gp0_mode = GP0_MODE_COMMAND;
+    gpu->vblank_cycles_left = GPU_CPU_CYCLES_PER_FRAME;
     if (window)
         renderer_init(&gpu->renderer, window);
 }
@@ -586,24 +555,57 @@ static void draw_line(Gpu *gpu,
                       int32_t x1, int32_t y1, uint8_t r1, uint8_t g1, uint8_t b1,
                       bool semi)
 {
-    int32_t dx = x1 - x0, dy = y1 - y0;
-    int32_t ax = dx < 0 ? -dx : dx;
-    int32_t ay = dy < 0 ? -dy : dy;
-    int32_t steps = (ax > ay) ? ax : ay;
-    if (steps == 0)
+    int32_t ax = x1 > x0 ? x1 - x0 : x0 - x1;
+    int32_t ay = y1 > y0 ? y1 - y0 : y0 - y1;
+    int32_t k = (ax > ay) ? ax : ay;
+
+    if (k == 0)
     {
         draw_pixel(gpu, x0, y0, rgb_to_1555(r0, g0, b0), semi);
         return;
     }
-    for (int32_t i = 0; i <= steps; i++)
+
+    if (x0 >= x1)
     {
-        int32_t t = (i << 16) / steps;
-        int32_t x = x0 + (dx * t >> 16);
-        int32_t y = y0 + (dy * t >> 16);
-        uint8_t cr = (uint8_t)(r0 + ((int32_t)(r1 - r0) * t >> 16));
-        uint8_t cg = (uint8_t)(g0 + ((int32_t)(g1 - g0) * t >> 16));
-        uint8_t cb = (uint8_t)(b0 + ((int32_t)(b1 - b0) * t >> 16));
-        draw_pixel(gpu, x, y, rgb_to_1555(cr, cg, cb), semi);
+        int32_t ti;
+        uint8_t tc;
+        ti = x0; x0 = x1; x1 = ti;
+        ti = y0; y0 = y1; y1 = ti;
+        tc = r0; r0 = r1; r1 = tc;
+        tc = g0; g0 = g1; g1 = tc;
+        tc = b0; b0 = b1; b1 = tc;
+    }
+
+    int64_t dx = (int64_t)x1 - x0;
+    int64_t dy = (int64_t)y1 - y0;
+    int64_t dxdk = ((dx << 32) - ((dx < 0) ? (k - 1) : 0) + ((dx > 0) ? (k - 1) : 0)) / k;
+    int64_t dydk = ((dy << 32) - ((dy < 0) ? (k - 1) : 0) + ((dy > 0) ? (k - 1) : 0)) / k;
+    int32_t drdk = (((int32_t)r1 - (int32_t)r0) << 12) / k;
+    int32_t dgdk = (((int32_t)g1 - (int32_t)g0) << 12) / k;
+    int32_t dbdk = (((int32_t)b1 - (int32_t)b0) << 12) / k;
+
+    int64_t curx = ((int64_t)x0 << 32) + (1LL << 31) - 1024;
+    int64_t cury = ((int64_t)y0 << 32) + (1LL << 31) - ((dydk < 0) ? 1024 : 0);
+    int32_t curr = ((int32_t)r0 << 12) + (1 << 11);
+    int32_t curg = ((int32_t)g0 << 12) + (1 << 11);
+    int32_t curb = ((int32_t)b0 << 12) + (1 << 11);
+
+    for (int32_t i = 0; i <= k; i++)
+    {
+        int32_t x = (int32_t)(curx >> 32);
+        int32_t y = (int32_t)(cury >> 32);
+        uint8_t cr = (uint8_t)(curr >> 12);
+        uint8_t cg = (uint8_t)(curg >> 12);
+        uint8_t cb = (uint8_t)(curb >> 12);
+        uint16_t color = gpu->dithering
+                             ? rgb_to_1555_dither(cr, cg, cb, x, y)
+                             : rgb_to_1555(cr, cg, cb);
+        draw_pixel(gpu, x, y, color, semi);
+        curx += dxdk;
+        cury += dydk;
+        curr += drdk;
+        curg += dgdk;
+        curb += dbdk;
     }
 }
 
@@ -629,6 +631,8 @@ static void gp0_rect_8x8_tex_opaque(Gpu *g);
 static void gp0_rect_16x16_tex_opaque(Gpu *g);
 static void gp0_line_mono(Gpu *g);
 static void gp0_line_shaded(Gpu *g);
+static void gp0_polyline_mono_start(Gpu *g);
+static void gp0_polyline_shaded_start(Gpu *g);
 static void gp0_image_load(Gpu *g);
 static void gp0_image_store(Gpu *g);
 static void gp0_draw_mode(Gpu *g);
@@ -637,10 +641,90 @@ static void gp0_drawing_area_top_left(Gpu *g);
 static void gp0_drawing_area_bottom_right(Gpu *g);
 static void gp0_drawing_offset(Gpu *g);
 static void gp0_mask_bit_setting(Gpu *g);
+static void apply_offset(const Gpu *gpu, int32_t *x, int32_t *y);
 
 /* ---- GP0 dispatch ---- */
+static inline bool gp0_polyline_terminator(uint32_t val)
+{
+    return (val & 0xF000F000u) == 0x50005000u;
+}
+
+static void gp0_polyline_word(Gpu *gpu, uint32_t val)
+{
+    if (!gpu->polyline_shaded)
+    {
+        if (gp0_polyline_terminator(val))
+        {
+            gpu->gp0_mode = GP0_MODE_COMMAND;
+            return;
+        }
+
+        int32_t x = (int16_t)(val & 0xFFFF);
+        int32_t y = (int16_t)(val >> 16);
+        apply_offset(gpu, &x, &y);
+        uint32_t c = gpu->polyline_last_color;
+        trace_prim("poly_mono seg (%d,%d)->(%d,%d) color=%02X,%02X,%02X",
+                   gpu->polyline_last_x, gpu->polyline_last_y, x, y,
+                   c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF);
+        draw_line(gpu,
+                  gpu->polyline_last_x, gpu->polyline_last_y,
+                  c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF,
+                  x, y,
+                  c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF,
+                  gpu->polyline_semi);
+        gpu->polyline_last_x = x;
+        gpu->polyline_last_y = y;
+        return;
+    }
+
+    if (gpu->polyline_expect_color)
+    {
+        if (gp0_polyline_terminator(val))
+        {
+            gpu->gp0_mode = GP0_MODE_COMMAND;
+            return;
+        }
+
+        gpu->polyline_next_color = val & 0x00FFFFFFu;
+        trace_prim("poly_shaded next_color raw=0x%08X rgb=%02X,%02X,%02X",
+                   val,
+                   gpu->polyline_next_color & 0xFF,
+                   (gpu->polyline_next_color >> 8) & 0xFF,
+                   (gpu->polyline_next_color >> 16) & 0xFF);
+        gpu->polyline_expect_color = false;
+        return;
+    }
+
+    int32_t x = (int16_t)(val & 0xFFFF);
+    int32_t y = (int16_t)(val >> 16);
+    apply_offset(gpu, &x, &y);
+    uint32_t c0 = gpu->polyline_last_color;
+    uint32_t c1 = gpu->polyline_next_color;
+    trace_prim("poly_shaded seg raw_v=0x%08X (%d,%d)->(%d,%d) c0=%02X,%02X,%02X c1=%02X,%02X,%02X",
+               val,
+               gpu->polyline_last_x, gpu->polyline_last_y, x, y,
+               c0 & 0xFF, (c0 >> 8) & 0xFF, (c0 >> 16) & 0xFF,
+               c1 & 0xFF, (c1 >> 8) & 0xFF, (c1 >> 16) & 0xFF);
+    draw_line(gpu,
+              gpu->polyline_last_x, gpu->polyline_last_y,
+              c0 & 0xFF, (c0 >> 8) & 0xFF, (c0 >> 16) & 0xFF,
+              x, y,
+              c1 & 0xFF, (c1 >> 8) & 0xFF, (c1 >> 16) & 0xFF,
+              gpu->polyline_semi);
+    gpu->polyline_last_x = x;
+    gpu->polyline_last_y = y;
+    gpu->polyline_last_color = c1;
+    gpu->polyline_expect_color = true;
+}
+
 void gpu_gp0(Gpu *gpu, uint32_t val)
 {
+    if (gpu->gp0_mode == GP0_MODE_POLYLINE)
+    {
+        gp0_polyline_word(gpu, val);
+        return;
+    }
+
     if (gpu->gp0_words_remaining == 0)
     {
         uint32_t op = (val >> 24) & 0xFF;
@@ -733,6 +817,9 @@ void gpu_gp0(Gpu *gpu, uint32_t val)
         case 0x45:
         case 0x46:
         case 0x47:
+            len = 3;
+            method = gp0_line_mono;
+            break;
         case 0x48:
         case 0x49:
         case 0x4A:
@@ -741,8 +828,8 @@ void gpu_gp0(Gpu *gpu, uint32_t val)
         case 0x4D:
         case 0x4E:
         case 0x4F:
-            len = 3;
-            method = gp0_line_mono;
+            len = 2;
+            method = gp0_polyline_mono_start;
             break;
         /* shaded lines: 0x50-0x5F (0x58-0x5F = polyline sentinel variant) */
         case 0x50:
@@ -753,6 +840,9 @@ void gpu_gp0(Gpu *gpu, uint32_t val)
         case 0x55:
         case 0x56:
         case 0x57:
+            len = 4;
+            method = gp0_line_shaded;
+            break;
         case 0x58:
         case 0x59:
         case 0x5A:
@@ -761,8 +851,8 @@ void gpu_gp0(Gpu *gpu, uint32_t val)
         case 0x5D:
         case 0x5E:
         case 0x5F:
-            len = 4;
-            method = gp0_line_shaded;
+            len = 2;
+            method = gp0_polyline_shaded_start;
             break;
         /* variable rectangles: 0x60-0x63 */
         case 0x60:
@@ -907,6 +997,8 @@ void gpu_gp0(Gpu *gpu, uint32_t val)
     }
     case GP0_MODE_IMAGE_STORE:
         break;
+    case GP0_MODE_POLYLINE:
+        break;
     }
 }
 
@@ -927,6 +1019,8 @@ static void gp0_fill_rect(Gpu *gpu)
     uint16_t y = (uint16_t)((xy >> 16) & 0x1FF);
     uint16_t w = (uint16_t)((wh & 0x3FF) + 0xF) & ~0xF;
     uint16_t h = (uint16_t)((wh >> 16) & 0x1FF);
+    trace_prim("fill xy=(%u,%u) size=%ux%u color=%02X,%02X,%02X",
+               x, y, w, h, r, g, b);
     for (uint16_t dy = 0; dy < h; dy++)
         for (uint16_t dx = 0; dx < w; dx++)
             vram_store(gpu->vram, (x + dx) & 1023u, (y + dy) & 511u, col);
@@ -1017,7 +1111,7 @@ static void gp0_triangle_mono_opaque(Gpu *gpu)
     apply_offset(gpu, &x1, &y1);
     apply_offset(gpu, &x2, &y2);
     bool semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
-    fill_triangle(gpu, x0, y0, r, g, b, x1, y1, r, g, b, x2, y2, r, g, b, semi);
+    fill_triangle(gpu, x0, y0, r, g, b, x1, y1, r, g, b, x2, y2, r, g, b, semi, false);
 }
 
 /* ---- Mono quads ---- */
@@ -1033,8 +1127,11 @@ static void gp0_quad_mono_opaque(Gpu *gpu)
         apply_offset(gpu, &xs[i], &ys[i]);
     }
     bool semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
-    fill_triangle(gpu, xs[0], ys[0], r, g, b, xs[1], ys[1], r, g, b, xs[2], ys[2], r, g, b, semi);
-    fill_triangle(gpu, xs[1], ys[1], r, g, b, xs[2], ys[2], r, g, b, xs[3], ys[3], r, g, b, semi);
+    trace_prim("quad_mono op=0x%02X xy=(%d,%d)(%d,%d)(%d,%d)(%d,%d) color=%02X,%02X,%02X semi=%u mode=%u",
+               (unsigned)(c >> 24), xs[0], ys[0], xs[1], ys[1], xs[2], ys[2], xs[3], ys[3],
+               r, g, b, semi ? 1u : 0u, (unsigned)gpu->semi_transparency);
+    fill_triangle(gpu, xs[0], ys[0], r, g, b, xs[2], ys[2], r, g, b, xs[1], ys[1], r, g, b, semi, false);
+    fill_triangle(gpu, xs[1], ys[1], r, g, b, xs[2], ys[2], r, g, b, xs[3], ys[3], r, g, b, semi, false);
 }
 
 /* ---- Shaded triangles ---- */
@@ -1048,9 +1145,15 @@ static void gp0_triangle_shaded_opaque(Gpu *gpu)
     apply_offset(gpu, &x2, &y2);
     uint32_t c0 = gpu->gp0_command.buffer[0], c1 = gpu->gp0_command.buffer[2], c2 = gpu->gp0_command.buffer[4];
     bool semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
+    trace_prim("tri_shaded op=0x%02X xy=(%d,%d)(%d,%d)(%d,%d) c=(%02X,%02X,%02X)(%02X,%02X,%02X)(%02X,%02X,%02X) semi=%u dither=%u",
+               (unsigned)(gpu->gp0_command.buffer[0] >> 24), x0, y0, x1, y1, x2, y2,
+               c0 & 0xFF, (c0 >> 8) & 0xFF, (c0 >> 16) & 0xFF,
+               c1 & 0xFF, (c1 >> 8) & 0xFF, (c1 >> 16) & 0xFF,
+               c2 & 0xFF, (c2 >> 8) & 0xFF, (c2 >> 16) & 0xFF,
+               semi ? 1u : 0u, gpu->dithering ? 1u : 0u);
     fill_triangle(gpu, x0, y0, c0 & 0xFF, (c0 >> 8) & 0xFF, (c0 >> 16) & 0xFF,
                   x1, y1, c1 & 0xFF, (c1 >> 8) & 0xFF, (c1 >> 16) & 0xFF,
-                  x2, y2, c2 & 0xFF, (c2 >> 8) & 0xFF, (c2 >> 16) & 0xFF, semi);
+                  x2, y2, c2 & 0xFF, (c2 >> 8) & 0xFF, (c2 >> 16) & 0xFF, semi, true);
 }
 
 /* ---- Shaded quads ---- */
@@ -1070,11 +1173,11 @@ static void gp0_quad_shaded_opaque(Gpu *gpu)
     }
     bool semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
     fill_triangle(gpu, xs[0], ys[0], rs[0], gs[0], bs[0],
-                  xs[1], ys[1], rs[1], gs[1], bs[1],
-                  xs[2], ys[2], rs[2], gs[2], bs[2], semi);
+                  xs[2], ys[2], rs[2], gs[2], bs[2],
+                  xs[1], ys[1], rs[1], gs[1], bs[1], semi, true);
     fill_triangle(gpu, xs[1], ys[1], rs[1], gs[1], bs[1],
                   xs[2], ys[2], rs[2], gs[2], bs[2],
-                  xs[3], ys[3], rs[3], gs[3], bs[3], semi);
+                  xs[3], ys[3], rs[3], gs[3], bs[3], semi, true);
 }
 
 /* ---- Textured triangles (cmd col + uv*3) ---- */
@@ -1199,7 +1302,7 @@ static void gp0_quad_tex_opaque(Gpu *gpu)
                gpu->drawing_area_left, gpu->drawing_area_top,
                gpu->drawing_area_right, gpu->drawing_area_bottom,
                gpu->drawing_x_offset, gpu->drawing_y_offset);
-    fill_triangle_tex(gpu, xs[0], ys[0], us[0], vs[0], cr, cg, cb, xs[1], ys[1], us[1], vs[1], cr, cg, cb, xs[2], ys[2], us[2], vs[2], cr, cg, cb, blend, semi);
+    fill_triangle_tex(gpu, xs[0], ys[0], us[0], vs[0], cr, cg, cb, xs[2], ys[2], us[2], vs[2], cr, cg, cb, xs[1], ys[1], us[1], vs[1], cr, cg, cb, blend, semi);
     fill_triangle_tex(gpu, xs[1], ys[1], us[1], vs[1], cr, cg, cb, xs[2], ys[2], us[2], vs[2], cr, cg, cb, xs[3], ys[3], us[3], vs[3], cr, cg, cb, blend, semi);
 }
 
@@ -1298,8 +1401,8 @@ static void gp0_quad_shaded_tex_opaque(Gpu *gpu)
     bool blend = ((gpu->gp0_command.buffer[0] >> 24) & 0x01) == 0;
     bool semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
     fill_triangle_tex(gpu, xs[0], ys[0], us[0], vs[0], rs[0], gs[0], bs[0],
-                      xs[1], ys[1], us[1], vs[1], rs[1], gs[1], bs[1],
-                      xs[2], ys[2], us[2], vs[2], rs[2], gs[2], bs[2], blend, semi);
+                      xs[2], ys[2], us[2], vs[2], rs[2], gs[2], bs[2],
+                      xs[1], ys[1], us[1], vs[1], rs[1], gs[1], bs[1], blend, semi);
     fill_triangle_tex(gpu, xs[1], ys[1], us[1], vs[1], rs[1], gs[1], bs[1],
                       xs[2], ys[2], us[2], vs[2], rs[2], gs[2], bs[2],
                       xs[3], ys[3], us[3], vs[3], rs[3], gs[3], bs[3], blend, semi);
@@ -1360,6 +1463,9 @@ static void rect_common(Gpu *gpu, int32_t w, int32_t h)
     int32_t rx = (int16_t)(xy & 0xFFFF), ry = (int16_t)(xy >> 16);
     apply_offset(gpu, &rx, &ry);
     bool semi = ((c >> 24) & 0x02) != 0;
+    trace_prim("rect op=0x%02X xy=(%d,%d) size=%dx%d color=%02X,%02X,%02X semi=%u mode=%u",
+               (unsigned)(c >> 24), rx, ry, w, h, r, g, b, semi ? 1u : 0u,
+               (unsigned)gpu->semi_transparency);
     fill_rect_sw(gpu, rx, ry, w, h, rgb_to_1555(r, g, b), semi);
 }
 static void rect_common_var(Gpu *gpu)
@@ -1372,6 +1478,9 @@ static void rect_common_var(Gpu *gpu)
     uint32_t wh = gpu->gp0_command.buffer[2];
     int32_t w = wh & 0x3FF, h = (wh >> 16) & 0x1FF;
     bool semi = ((c >> 24) & 0x02) != 0;
+    trace_prim("rect op=0x%02X xy=(%d,%d) size=%dx%d color=%02X,%02X,%02X semi=%u mode=%u",
+               (unsigned)(c >> 24), rx, ry, w, h, r, g, b, semi ? 1u : 0u,
+               (unsigned)gpu->semi_transparency);
     fill_rect_sw(gpu, rx, ry, w, h, rgb_to_1555(r, g, b), semi);
 }
 static void gp0_rect_variable_opaque(Gpu *gpu) { rect_common_var(gpu); }
@@ -1393,6 +1502,11 @@ static void rect_tex_common(Gpu *gpu, int32_t w, int32_t h)
     gpu->clut_y = (clut_raw >> 6) & 0x1FF;
     bool blend = ((c >> 24) & 0x01) == 0;
     bool semi = ((c >> 24) & 0x02) != 0;
+    trace_prim("rect_tex op=0x%02X xy=(%d,%d) size=%dx%d uv=(%u,%u) color=%02X,%02X,%02X blend=%u semi=%u mode=%u depth=%u clut=(%u,%u) page=(%u,%u)",
+               (unsigned)(c >> 24), rx, ry, w, h, u0, v0, cr, cg, cb,
+               blend ? 1u : 0u, semi ? 1u : 0u, (unsigned)gpu->semi_transparency,
+               (unsigned)gpu->texture_depth, gpu->clut_x, gpu->clut_y,
+               gpu->page_base_x, gpu->page_base_y);
     fill_rect_tex_sw(gpu, rx, ry, w, h, u0, v0, cr, cg, cb, blend, semi);
 }
 static void rect_tex_common_var(Gpu *gpu)
@@ -1411,6 +1525,11 @@ static void rect_tex_common_var(Gpu *gpu)
     int32_t w = wh & 0x3FF, h = (wh >> 16) & 0x1FF;
     bool blend = ((c >> 24) & 0x01) == 0;
     bool semi = ((c >> 24) & 0x02) != 0;
+    trace_prim("rect_tex op=0x%02X xy=(%d,%d) size=%dx%d uv=(%u,%u) color=%02X,%02X,%02X blend=%u semi=%u mode=%u depth=%u clut=(%u,%u) page=(%u,%u)",
+               (unsigned)(c >> 24), rx, ry, w, h, u0, v0, cr, cg, cb,
+               blend ? 1u : 0u, semi ? 1u : 0u, (unsigned)gpu->semi_transparency,
+               (unsigned)gpu->texture_depth, gpu->clut_x, gpu->clut_y,
+               gpu->page_base_x, gpu->page_base_y);
     fill_rect_tex_sw(gpu, rx, ry, w, h, u0, v0, cr, cg, cb, blend, semi);
 }
 static void gp0_rect_variable_tex_opaque(Gpu *gpu) { rect_tex_common_var(gpu); }
@@ -1455,9 +1574,7 @@ static void gp0_image_store(Gpu *gpu)
     gpu->gp0_mode = GP0_MODE_IMAGE_STORE;
 }
 
-/* 0x40-0x4F: mono line (single segment; polylines share the same handler via
-   sentinel-driven re-dispatch but we handle only two-point here — sufficient
-   for the vast majority of PS1 games). */
+/* 0x40-0x47: mono line */
 static void gp0_line_mono(Gpu *gpu)
 {
     uint32_t op = gpu->gp0_command.buffer[0];
@@ -1487,6 +1604,42 @@ static void gp0_line_shaded(Gpu *gpu)
     int32_t x1 = (int32_t)((int16_t)(v1w & 0xFFFF)) + gpu->drawing_x_offset;
     int32_t y1 = (int32_t)((int16_t)(v1w >> 16)) + gpu->drawing_y_offset;
     draw_line(gpu, x0, y0, r0, g0, b0, x1, y1, r1, g1, b1, semi);
+}
+
+static void gp0_polyline_mono_start(Gpu *gpu)
+{
+    uint32_t c = gpu->gp0_command.buffer[0] & 0x00FFFFFFu;
+    uint32_t v = gpu->gp0_command.buffer[1];
+    int32_t x = (int16_t)(v & 0xFFFF);
+    int32_t y = (int16_t)(v >> 16);
+    apply_offset(gpu, &x, &y);
+
+    gpu->polyline_shaded = false;
+    gpu->polyline_expect_color = false;
+    gpu->polyline_semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
+    gpu->polyline_last_x = x;
+    gpu->polyline_last_y = y;
+    gpu->polyline_last_color = c;
+    gpu->polyline_next_color = c;
+    gpu->gp0_mode = GP0_MODE_POLYLINE;
+}
+
+static void gp0_polyline_shaded_start(Gpu *gpu)
+{
+    uint32_t c = gpu->gp0_command.buffer[0] & 0x00FFFFFFu;
+    uint32_t v = gpu->gp0_command.buffer[1];
+    int32_t x = (int16_t)(v & 0xFFFF);
+    int32_t y = (int16_t)(v >> 16);
+    apply_offset(gpu, &x, &y);
+
+    gpu->polyline_shaded = true;
+    gpu->polyline_expect_color = true;
+    gpu->polyline_semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
+    gpu->polyline_last_x = x;
+    gpu->polyline_last_y = y;
+    gpu->polyline_last_color = c;
+    gpu->polyline_next_color = c;
+    gpu->gp0_mode = GP0_MODE_POLYLINE;
 }
 
 /* ---- GP1 ---- */
@@ -1678,6 +1831,27 @@ static void gp1_reset_command_buffer(Gpu *gpu)
     cb_clear(&gpu->gp0_command);
     gpu->gp0_words_remaining = 0;
     gpu->gp0_mode = GP0_MODE_COMMAND;
+    gpu->polyline_shaded = false;
+    gpu->polyline_expect_color = false;
+    gpu->polyline_semi = false;
+    gpu->polyline_last_x = 0;
+    gpu->polyline_last_y = 0;
+    gpu->polyline_last_color = 0;
+    gpu->polyline_next_color = 0;
+}
+
+bool gpu_step(Gpu *gpu, uint32_t cycles)
+{
+    gpu->vblank_cycles_left -= (int32_t)cycles;
+    if (gpu->vblank_cycles_left > 0)
+        return false;
+
+    do
+    {
+        gpu->vblank_cycles_left += GPU_CPU_CYCLES_PER_FRAME;
+    } while (gpu->vblank_cycles_left <= 0);
+    gpu->frames++;
+    return true;
 }
 
 /* Called externally (e.g. from scheduler VBlank) to present the frame */
@@ -1688,11 +1862,24 @@ void gpu_vblank(Gpu *gpu)
     if (gpu->interlaced)
         gpu->field = (gpu->field == FIELD_TOP) ? FIELD_BOTTOM : FIELD_TOP;
 
-    uint16_t w = hres_width(gpu->hres);
-    uint16_t h = (gpu->vres == VRES_480) ? 480 : 240;
+    uint16_t display_x = gpu->display_vram_x_start;
+    uint16_t display_y = gpu->display_vram_y_start;
+    uint16_t w = display_width_from_gpu(gpu);
+    uint16_t h = display_height_from_gpu(gpu);
+    if (display_x >= 1024)
+        display_x = 0;
+    if (display_y >= 512)
+        display_y = 0;
+    if ((uint32_t)display_x + w > 1024u)
+        w = (uint16_t)(1024u - display_x);
+    if ((uint32_t)display_y + h > 512u)
+        h = (uint16_t)(512u - display_y);
+    if (w == 0)
+        w = 320;
+    if (h == 0)
+        h = 240;
     bool display_24bit = gpu->display_depth == DISPLAY_DEPTH_24;
-    renderer_display(&gpu->renderer, gpu->vram,
-                     gpu->display_vram_x_start, gpu->display_vram_y_start, w, h,
+    renderer_display(&gpu->renderer, gpu->vram, display_x, display_y, w, h,
                      display_24bit);
     gpu->frame_updated = true;
 
@@ -1712,8 +1899,8 @@ void gpu_vblank(Gpu *gpu)
             {
                 for (uint32_t x = 0; x < w; x++)
                 {
-                    uint32_t sx = (gpu->display_vram_x_start + x) & 1023u;
-                    uint32_t sy = (gpu->display_vram_y_start + y) & 511u;
+                    uint32_t sx = (display_x + x) & 1023u;
+                    uint32_t sy = (display_y + y) & 511u;
                     if ((gpu->vram[sy * 1024u + sx] & 0x7FFFu) != 0)
                         nonzero++;
                 }
@@ -1721,7 +1908,7 @@ void gpu_vblank(Gpu *gpu)
             fprintf(stderr,
                     "GPU_FRAME %u writes=%llu display_nonzero=%u display=(%u,%u %ux%u) disabled=%d\n",
                     frame_count, (unsigned long long)g_frame_pixels_written, nonzero,
-                    gpu->display_vram_x_start, gpu->display_vram_y_start, w, h,
+                    display_x, display_y, w, h,
                     gpu->display_disabled);
         }
         g_frame_pixels_written = 0;
@@ -1745,8 +1932,8 @@ void gpu_vblank(Gpu *gpu)
                     uint8_t r8, g8, b8;
                     if (!dump_full_vram && display_24bit)
                     {
-                        uint32_t byte_base = (((gpu->display_vram_y_start + y) & 511u) * 1024u +
-                                              (gpu->display_vram_x_start & 1023u)) *
+                        uint32_t byte_base = (((display_y + y) & 511u) * 1024u +
+                                              (display_x & 1023u)) *
                                                  2u +
                                              x * 3u;
                         uint16_t w0 = gpu->vram[(byte_base / 2u) & (1024u * 512u - 1u)];
@@ -1760,8 +1947,8 @@ void gpu_vblank(Gpu *gpu)
                     }
                     else
                     {
-                        uint32_t sx = dump_full_vram ? x : ((gpu->display_vram_x_start + x) & 1023u);
-                        uint32_t sy = dump_full_vram ? y : ((gpu->display_vram_y_start + y) & 511u);
+                        uint32_t sx = dump_full_vram ? x : ((display_x + x) & 1023u);
+                        uint32_t sy = dump_full_vram ? y : ((display_y + y) & 511u);
                         uint16_t c = gpu->vram[sy * 1024u + sx];
                         uint8_t r5 = c & 0x1Fu;
                         uint8_t g5 = (c >> 5) & 0x1Fu;
