@@ -31,6 +31,7 @@ SRCS = src/main.c         \
 
 OBJS       = $(SRCS:.c=.o)
 DEBUG_OBJS = $(SRCS:.c=.debug.o)
+DEPS       = $(wildcard src/*.h)
 TARGET     = ps1_boot
 PSX_TEST_RUNNER = python3 tests/run_psx_tests.py
 PSX_TEST_ARGS ?=
@@ -48,10 +49,10 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(OBJS) $(LDFLAGS) -o $@
 
-%.o: %.c
+%.o: %.c $(DEPS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-%.debug.o: %.c
+%.debug.o: %.c $(DEPS)
 	$(CC) $(DEBUG_CFLAGS) -c $< -o $@
 
 run: $(TARGET)

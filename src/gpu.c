@@ -8,11 +8,14 @@
 
 #define VRAM_W 1024
 #define VRAM_H 512
+#define MAX_PRIMITIVE_WIDTH 1024
+#define MAX_PRIMITIVE_HEIGHT 512
 #define GPU_CPU_CYCLES_PER_FRAME (33868800 / 60)
 
 static uint32_t g_trace_prims_limit = 0;
 static uint32_t g_trace_prims_count = 0;
 static bool g_trace_prims_init = false;
+static uint32_t g_trace_big_prims_threshold = 0;
 static uint64_t g_frame_pixels_written = 0;
 
 static bool trace_prim_enabled(void)
@@ -23,6 +26,9 @@ static bool trace_prim_enabled(void)
         const char *e = getenv("PS1_TRACE_PRIMS");
         if (e)
             g_trace_prims_limit = (uint32_t)strtoul(e, NULL, 10);
+        e = getenv("PS1_TRACE_BIG_PRIMS");
+        if (e)
+            g_trace_big_prims_threshold = (uint32_t)strtoul(e, NULL, 10);
     }
     return g_trace_prims_count < g_trace_prims_limit;
 }
@@ -38,6 +44,70 @@ static void trace_prim(const char *fmt, ...)
     vfprintf(stderr, fmt, args);
     va_end(args);
     fputc('\n', stderr);
+}
+
+static void trace_big_triangle(const Gpu *gpu, const char *kind,
+                               int32_t x0, int32_t y0,
+                               int32_t x1, int32_t y1,
+                               int32_t x2, int32_t y2)
+{
+    if (!g_trace_prims_init)
+        (void)trace_prim_enabled();
+    if (g_trace_big_prims_threshold == 0)
+        return;
+
+    int32_t min_x = x0 < x1 ? x0 : x1;
+    if (x2 < min_x)
+        min_x = x2;
+    int32_t max_x = x0 > x1 ? x0 : x1;
+    if (x2 > max_x)
+        max_x = x2;
+    int32_t min_y = y0 < y1 ? y0 : y1;
+    if (y2 < min_y)
+        min_y = y2;
+    int32_t max_y = y0 > y1 ? y0 : y1;
+    if (y2 > max_y)
+        max_y = y2;
+
+    uint32_t bw = (uint32_t)(max_x - min_x);
+    uint32_t bh = (uint32_t)(max_y - min_y);
+    bool outside = min_x < -64 || min_y < -64 || max_x > 1088 || max_y > 576;
+    if (bw < g_trace_big_prims_threshold && bh < g_trace_big_prims_threshold && !outside)
+        return;
+
+    fprintf(stderr,
+            "BIG_PRIM kind=%s op=0x%02X xy=(%d,%d)(%d,%d)(%d,%d) bbox=(%d,%d %ux%u) "
+            "clip=(%u,%u)-(%u,%u) off=(%d,%d) words=",
+            kind, (unsigned)(gpu->gp0_command.buffer[0] >> 24),
+            x0, y0, x1, y1, x2, y2,
+            min_x, min_y, bw, bh,
+            gpu->drawing_area_left, gpu->drawing_area_top,
+            gpu->drawing_area_right, gpu->drawing_area_bottom,
+            gpu->drawing_x_offset, gpu->drawing_y_offset);
+    for (uint8_t i = 0; i < gpu->gp0_command.len; i++)
+        fprintf(stderr, "%s%08X", i == 0 ? "" : ",", gpu->gp0_command.buffer[i]);
+    fputc('\n', stderr);
+}
+
+static bool triangle_too_large(int32_t x0, int32_t y0,
+                               int32_t x1, int32_t y1,
+                               int32_t x2, int32_t y2)
+{
+    int32_t min_x = x0 < x1 ? x0 : x1;
+    if (x2 < min_x)
+        min_x = x2;
+    int32_t max_x = x0 > x1 ? x0 : x1;
+    if (x2 > max_x)
+        max_x = x2;
+    int32_t min_y = y0 < y1 ? y0 : y1;
+    if (y2 < min_y)
+        min_y = y2;
+    int32_t max_y = y0 > y1 ? y0 : y1;
+    if (y2 > max_y)
+        max_y = y2;
+
+    return (max_x - min_x + 1) > MAX_PRIMITIVE_WIDTH ||
+           (max_y - min_y + 1) > MAX_PRIMITIVE_HEIGHT;
 }
 
 /* ---- HorizontalRes ---- */
@@ -69,46 +139,77 @@ static uint16_t hres_width(HorizontalRes hr)
     }
 }
 
-static uint16_t display_width_from_gpu(const Gpu *gpu)
+static uint16_t display_dotclock_divider(const Gpu *gpu)
 {
-    uint32_t raw_width = (uint32_t)(gpu->display_horiz_end - gpu->display_horiz_start);
-    if (raw_width > 0)
+    if (gpu->hres.hr & 1u)
+        return 7;
+
+    switch ((gpu->hres.hr >> 1) & 3u)
     {
-        uint32_t dotclock;
-        if (gpu->hres.hr & 1u)
-        {
-            dotclock = 7;
-        }
-        else
-        {
-            switch ((gpu->hres.hr >> 1) & 3u)
-            {
-            case 0:
-                dotclock = 10;
-                break;
-            case 1:
-                dotclock = 8;
-                break;
-            case 2:
-                dotclock = 5;
-                break;
-            default:
-                dotclock = 4;
-                break;
-            }
-        }
-
-        uint32_t width = raw_width / dotclock;
-        if (width >= 256 && width <= 640)
-            return (uint16_t)width;
+    case 0:
+        return 10;
+    case 1:
+        return 8;
+    case 2:
+        return 5;
+    default:
+        return 4;
     }
-
-    return hres_width(gpu->hres);
 }
 
-static uint16_t display_height_from_gpu(const Gpu *gpu)
+typedef struct
 {
-    return (gpu->vres == VRES_480 && gpu->interlaced) ? 480 : 240;
+    uint16_t x;
+    uint16_t y;
+    uint16_t w;
+    uint16_t h;
+} DisplayRect;
+
+static DisplayRect display_rect_from_gpu(const Gpu *gpu)
+{
+    DisplayRect rect = {
+        (uint16_t)(gpu->display_vram_x_start & 1023u),
+        (uint16_t)(gpu->display_vram_y_start & 511u),
+        hres_width(gpu->hres),
+        (gpu->vres == VRES_480 && gpu->interlaced) ? 480 : 240,
+    };
+
+    uint32_t raw_width = (gpu->display_horiz_end >= gpu->display_horiz_start)
+                             ? (uint32_t)(gpu->display_horiz_end - gpu->display_horiz_start)
+                             : 0u;
+    if (raw_width > 0)
+    {
+        uint32_t width = raw_width / display_dotclock_divider(gpu);
+        if (width == 1u)
+            width = 4u;
+        else
+            width = (width + 2u) & ~3u;
+
+        if (width >= 4u && width <= 1024u)
+            rect.w = (uint16_t)width;
+    }
+
+    uint32_t raw_height = (gpu->display_line_end >= gpu->display_line_start)
+                              ? (uint32_t)(gpu->display_line_end - gpu->display_line_start)
+                              : 0u;
+    if (raw_height > 0u)
+    {
+        uint32_t height = raw_height;
+        if (gpu->interlaced)
+            height <<= 1;
+        if (height >= 1u && height <= 512u)
+            rect.h = (uint16_t)height;
+    }
+
+    if (rect.x + rect.w > 1024u)
+        rect.w = (uint16_t)(1024u - rect.x);
+    if (rect.y + rect.h > 512u)
+        rect.h = (uint16_t)(512u - rect.y);
+    if (rect.w == 0)
+        rect.w = hres_width(gpu->hres);
+    if (rect.h == 0)
+        rect.h = (gpu->vres == VRES_480 && gpu->interlaced) ? 480 : 240;
+    return rect;
 }
 
 /* ---- CommandBuffer ---- */
@@ -158,6 +259,16 @@ static inline uint16_t rgb_to_1555_dither(uint8_t r, uint8_t g, uint8_t b, int32
                        dither_channel(g, x, y),
                        dither_channel(b, x, y));
 }
+
+static inline int32_t gpu_coord11(uint32_t v)
+{
+    v &= 0x7FFu;
+    return (v & 0x400u) ? (int32_t)(v | 0xFFFFF800u) : (int32_t)v;
+}
+
+static inline int32_t gpu_xy_x(uint32_t xy) { return gpu_coord11(xy); }
+static inline int32_t gpu_xy_y(uint32_t xy) { return gpu_coord11(xy >> 16); }
+static inline int32_t gpu_truncate_coord(int32_t v) { return gpu_coord11((uint32_t)v); }
 
 /* ---- Texture fetch ---- */
 static uint16_t texel_fetch(const Gpu *gpu, uint8_t u, uint8_t v)
@@ -296,6 +407,9 @@ static void fill_triangle(Gpu *gpu,
     int64_t area = edge_i64(x0, y0, x1, y1, x2, y2);
     if (area == 0)
         return;
+    if (triangle_too_large(x0, y0, x1, y1, x2, y2))
+        return;
+    trace_big_triangle(gpu, "flat", x0, y0, x1, y1, x2, y2);
 
     int32_t min_x = x0 < x1 ? x0 : x1;
     if (x2 < min_x)
@@ -360,6 +474,9 @@ static void fill_triangle_tex(Gpu *gpu,
     int64_t area = edge_i64(sx0, sy0, sx1, sy1, sx2, sy2);
     if (area == 0)
         return;
+    if (triangle_too_large(x0, y0, x1, y1, x2, y2))
+        return;
+    trace_big_triangle(gpu, "tex", x0, y0, x1, y1, x2, y2);
 
     int32_t min_x = x0 < x1 ? x0 : x1;
     if (x2 < min_x)
@@ -558,10 +675,13 @@ static void draw_line(Gpu *gpu,
     int32_t ax = x1 > x0 ? x1 - x0 : x0 - x1;
     int32_t ay = y1 > y0 ? y1 - y0 : y0 - y1;
     int32_t k = (ax > ay) ? ax : ay;
+    if (ax >= MAX_PRIMITIVE_WIDTH || ay >= MAX_PRIMITIVE_HEIGHT)
+        return;
 
     if (k == 0)
     {
-        draw_pixel(gpu, x0, y0, rgb_to_1555(r0, g0, b0), semi);
+        draw_pixel(gpu, gpu_truncate_coord(x0), gpu_truncate_coord(y0),
+                   rgb_to_1555(r0, g0, b0), semi);
         return;
     }
 
@@ -569,11 +689,21 @@ static void draw_line(Gpu *gpu,
     {
         int32_t ti;
         uint8_t tc;
-        ti = x0; x0 = x1; x1 = ti;
-        ti = y0; y0 = y1; y1 = ti;
-        tc = r0; r0 = r1; r1 = tc;
-        tc = g0; g0 = g1; g1 = tc;
-        tc = b0; b0 = b1; b1 = tc;
+        ti = x0;
+        x0 = x1;
+        x1 = ti;
+        ti = y0;
+        y0 = y1;
+        y1 = ti;
+        tc = r0;
+        r0 = r1;
+        r1 = tc;
+        tc = g0;
+        g0 = g1;
+        g1 = tc;
+        tc = b0;
+        b0 = b1;
+        b1 = tc;
     }
 
     int64_t dx = (int64_t)x1 - x0;
@@ -592,8 +722,8 @@ static void draw_line(Gpu *gpu,
 
     for (int32_t i = 0; i <= k; i++)
     {
-        int32_t x = (int32_t)(curx >> 32);
-        int32_t y = (int32_t)(cury >> 32);
+        int32_t x = gpu_truncate_coord((int32_t)(curx >> 32));
+        int32_t y = gpu_truncate_coord((int32_t)(cury >> 32));
         uint8_t cr = (uint8_t)(curr >> 12);
         uint8_t cg = (uint8_t)(curg >> 12);
         uint8_t cb = (uint8_t)(curb >> 12);
@@ -659,8 +789,8 @@ static void gp0_polyline_word(Gpu *gpu, uint32_t val)
             return;
         }
 
-        int32_t x = (int16_t)(val & 0xFFFF);
-        int32_t y = (int16_t)(val >> 16);
+        int32_t x = gpu_xy_x(val);
+        int32_t y = gpu_xy_y(val);
         apply_offset(gpu, &x, &y);
         uint32_t c = gpu->polyline_last_color;
         trace_prim("poly_mono seg (%d,%d)->(%d,%d) color=%02X,%02X,%02X",
@@ -695,8 +825,8 @@ static void gp0_polyline_word(Gpu *gpu, uint32_t val)
         return;
     }
 
-    int32_t x = (int16_t)(val & 0xFFFF);
-    int32_t y = (int16_t)(val >> 16);
+    int32_t x = gpu_xy_x(val);
+    int32_t y = gpu_xy_y(val);
     apply_offset(gpu, &x, &y);
     uint32_t c0 = gpu->polyline_last_color;
     uint32_t c1 = gpu->polyline_next_color;
@@ -1104,9 +1234,9 @@ static void gp0_triangle_mono_opaque(Gpu *gpu)
 {
     uint32_t c = gpu->gp0_command.buffer[0];
     uint8_t r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
-    int32_t x0 = (int16_t)(gpu->gp0_command.buffer[1] & 0xFFFF), y0 = (int16_t)(gpu->gp0_command.buffer[1] >> 16);
-    int32_t x1 = (int16_t)(gpu->gp0_command.buffer[2] & 0xFFFF), y1 = (int16_t)(gpu->gp0_command.buffer[2] >> 16);
-    int32_t x2 = (int16_t)(gpu->gp0_command.buffer[3] & 0xFFFF), y2 = (int16_t)(gpu->gp0_command.buffer[3] >> 16);
+    int32_t x0 = gpu_xy_x(gpu->gp0_command.buffer[1]), y0 = gpu_xy_y(gpu->gp0_command.buffer[1]);
+    int32_t x1 = gpu_xy_x(gpu->gp0_command.buffer[2]), y1 = gpu_xy_y(gpu->gp0_command.buffer[2]);
+    int32_t x2 = gpu_xy_x(gpu->gp0_command.buffer[3]), y2 = gpu_xy_y(gpu->gp0_command.buffer[3]);
     apply_offset(gpu, &x0, &y0);
     apply_offset(gpu, &x1, &y1);
     apply_offset(gpu, &x2, &y2);
@@ -1122,8 +1252,8 @@ static void gp0_quad_mono_opaque(Gpu *gpu)
     int32_t xs[4], ys[4];
     for (int i = 0; i < 4; i++)
     {
-        xs[i] = (int16_t)(gpu->gp0_command.buffer[i + 1] & 0xFFFF);
-        ys[i] = (int16_t)(gpu->gp0_command.buffer[i + 1] >> 16);
+        xs[i] = gpu_xy_x(gpu->gp0_command.buffer[i + 1]);
+        ys[i] = gpu_xy_y(gpu->gp0_command.buffer[i + 1]);
         apply_offset(gpu, &xs[i], &ys[i]);
     }
     bool semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
@@ -1137,9 +1267,9 @@ static void gp0_quad_mono_opaque(Gpu *gpu)
 /* ---- Shaded triangles ---- */
 static void gp0_triangle_shaded_opaque(Gpu *gpu)
 {
-    int32_t x0 = (int16_t)(gpu->gp0_command.buffer[1] & 0xFFFF), y0 = (int16_t)(gpu->gp0_command.buffer[1] >> 16);
-    int32_t x1 = (int16_t)(gpu->gp0_command.buffer[3] & 0xFFFF), y1 = (int16_t)(gpu->gp0_command.buffer[3] >> 16);
-    int32_t x2 = (int16_t)(gpu->gp0_command.buffer[5] & 0xFFFF), y2 = (int16_t)(gpu->gp0_command.buffer[5] >> 16);
+    int32_t x0 = gpu_xy_x(gpu->gp0_command.buffer[1]), y0 = gpu_xy_y(gpu->gp0_command.buffer[1]);
+    int32_t x1 = gpu_xy_x(gpu->gp0_command.buffer[3]), y1 = gpu_xy_y(gpu->gp0_command.buffer[3]);
+    int32_t x2 = gpu_xy_x(gpu->gp0_command.buffer[5]), y2 = gpu_xy_y(gpu->gp0_command.buffer[5]);
     apply_offset(gpu, &x0, &y0);
     apply_offset(gpu, &x1, &y1);
     apply_offset(gpu, &x2, &y2);
@@ -1167,8 +1297,8 @@ static void gp0_quad_shaded_opaque(Gpu *gpu)
         rs[i] = ci & 0xFF;
         gs[i] = (ci >> 8) & 0xFF;
         bs[i] = (ci >> 16) & 0xFF;
-        xs[i] = (int16_t)(gpu->gp0_command.buffer[i * 2 + 1] & 0xFFFF);
-        ys[i] = (int16_t)(gpu->gp0_command.buffer[i * 2 + 1] >> 16);
+        xs[i] = gpu_xy_x(gpu->gp0_command.buffer[i * 2 + 1]);
+        ys[i] = gpu_xy_y(gpu->gp0_command.buffer[i * 2 + 1]);
         apply_offset(gpu, &xs[i], &ys[i]);
     }
     bool semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
@@ -1195,13 +1325,13 @@ static void gp0_triangle_tex_opaque(Gpu *gpu)
     uint32_t w4 = gpu->gp0_command.buffer[5];
     uint32_t w5 = gpu->gp0_command.buffer[6];
 
-    int32_t x0 = (int16_t)(w0 & 0xFFFF), y0 = (int16_t)(w0 >> 16);
+    int32_t x0 = gpu_xy_x(w0), y0 = gpu_xy_y(w0);
     uint8_t u0 = w1 & 0xFF, v0 = (w1 >> 8) & 0xFF;
     uint16_t clut_raw = (w1 >> 16) & 0xFFFF;
     gpu->clut_x = (clut_raw & 0x3F) * 16;
     gpu->clut_y = (clut_raw >> 6) & 0x1FF;
 
-    int32_t x1 = (int16_t)(w2 & 0xFFFF), y1 = (int16_t)(w2 >> 16);
+    int32_t x1 = gpu_xy_x(w2), y1 = gpu_xy_y(w2);
     uint8_t u1 = w3 & 0xFF, v1 = (w3 >> 8) & 0xFF;
     uint16_t page_raw = (w3 >> 16) & 0xFFFF;
     gpu->page_base_x = page_raw & 0x0F;
@@ -1219,7 +1349,7 @@ static void gp0_triangle_tex_opaque(Gpu *gpu)
         break;
     }
 
-    int32_t x2 = (int16_t)(w4 & 0xFFFF), y2 = (int16_t)(w4 >> 16);
+    int32_t x2 = gpu_xy_x(w4), y2 = gpu_xy_y(w4);
     uint8_t u2 = w5 & 0xFF, v2 = (w5 >> 8) & 0xFF;
 
     apply_offset(gpu, &x0, &y0);
@@ -1243,8 +1373,8 @@ static void gp0_quad_tex_opaque(Gpu *gpu)
     uint32_t w;
 
     w = gpu->gp0_command.buffer[1];
-    xs[0] = (int16_t)(w & 0xFFFF);
-    ys[0] = (int16_t)(w >> 16);
+    xs[0] = gpu_xy_x(w);
+    ys[0] = gpu_xy_y(w);
     w = gpu->gp0_command.buffer[2];
     us[0] = w & 0xFF;
     vs[0] = (w >> 8) & 0xFF;
@@ -1253,8 +1383,8 @@ static void gp0_quad_tex_opaque(Gpu *gpu)
     gpu->clut_y = (clut_raw >> 6) & 0x1FF;
 
     w = gpu->gp0_command.buffer[3];
-    xs[1] = (int16_t)(w & 0xFFFF);
-    ys[1] = (int16_t)(w >> 16);
+    xs[1] = gpu_xy_x(w);
+    ys[1] = gpu_xy_y(w);
     w = gpu->gp0_command.buffer[4];
     us[1] = w & 0xFF;
     vs[1] = (w >> 8) & 0xFF;
@@ -1275,14 +1405,14 @@ static void gp0_quad_tex_opaque(Gpu *gpu)
     }
 
     w = gpu->gp0_command.buffer[5];
-    xs[2] = (int16_t)(w & 0xFFFF);
-    ys[2] = (int16_t)(w >> 16);
+    xs[2] = gpu_xy_x(w);
+    ys[2] = gpu_xy_y(w);
     w = gpu->gp0_command.buffer[6];
     us[2] = w & 0xFF;
     vs[2] = (w >> 8) & 0xFF;
     w = gpu->gp0_command.buffer[7];
-    xs[3] = (int16_t)(w & 0xFFFF);
-    ys[3] = (int16_t)(w >> 16);
+    xs[3] = gpu_xy_x(w);
+    ys[3] = gpu_xy_y(w);
     w = gpu->gp0_command.buffer[8];
     us[3] = w & 0xFF;
     vs[3] = (w >> 8) & 0xFF;
@@ -1312,7 +1442,7 @@ static void gp0_triangle_shaded_tex_opaque(Gpu *gpu)
 {
     uint32_t c0 = gpu->gp0_command.buffer[0];
     uint8_t r0 = c0 & 0xFF, g0 = (c0 >> 8) & 0xFF, b0 = (c0 >> 16) & 0xFF;
-    int32_t x0 = (int16_t)(gpu->gp0_command.buffer[1] & 0xFFFF), y0 = (int16_t)(gpu->gp0_command.buffer[1] >> 16);
+    int32_t x0 = gpu_xy_x(gpu->gp0_command.buffer[1]), y0 = gpu_xy_y(gpu->gp0_command.buffer[1]);
     uint32_t uv0c = gpu->gp0_command.buffer[2];
     uint8_t u0 = uv0c & 0xFF, v0 = (uv0c >> 8) & 0xFF;
     uint16_t clut_raw = (uint16_t)(uv0c >> 16);
@@ -1321,7 +1451,7 @@ static void gp0_triangle_shaded_tex_opaque(Gpu *gpu)
 
     uint32_t c1 = gpu->gp0_command.buffer[3];
     uint8_t r1 = c1 & 0xFF, g1 = (c1 >> 8) & 0xFF, b1 = (c1 >> 16) & 0xFF;
-    int32_t x1 = (int16_t)(gpu->gp0_command.buffer[4] & 0xFFFF), y1 = (int16_t)(gpu->gp0_command.buffer[4] >> 16);
+    int32_t x1 = gpu_xy_x(gpu->gp0_command.buffer[4]), y1 = gpu_xy_y(gpu->gp0_command.buffer[4]);
     uint32_t uv1p = gpu->gp0_command.buffer[5];
     uint8_t u1 = uv1p & 0xFF, v1 = (uv1p >> 8) & 0xFF;
     uint16_t page_raw = (uint16_t)(uv1p >> 16);
@@ -1342,7 +1472,7 @@ static void gp0_triangle_shaded_tex_opaque(Gpu *gpu)
 
     uint32_t c2 = gpu->gp0_command.buffer[6];
     uint8_t r2 = c2 & 0xFF, g2 = (c2 >> 8) & 0xFF, b2 = (c2 >> 16) & 0xFF;
-    int32_t x2 = (int16_t)(gpu->gp0_command.buffer[7] & 0xFFFF), y2 = (int16_t)(gpu->gp0_command.buffer[7] >> 16);
+    int32_t x2 = gpu_xy_x(gpu->gp0_command.buffer[7]), y2 = gpu_xy_y(gpu->gp0_command.buffer[7]);
     uint32_t uv2 = gpu->gp0_command.buffer[8];
     uint8_t u2 = uv2 & 0xFF, v2 = (uv2 >> 8) & 0xFF;
 
@@ -1367,8 +1497,8 @@ static void gp0_quad_shaded_tex_opaque(Gpu *gpu)
         gs[i] = (ci >> 8) & 0xFF;
         bs[i] = (ci >> 16) & 0xFF;
         uint32_t xy = gpu->gp0_command.buffer[i * 3 + 1];
-        xs[i] = (int16_t)(xy & 0xFFFF);
-        ys[i] = (int16_t)(xy >> 16);
+        xs[i] = gpu_xy_x(xy);
+        ys[i] = gpu_xy_y(xy);
         uint32_t uv = gpu->gp0_command.buffer[i * 3 + 2];
         us[i] = uv & 0xFF;
         vs[i] = (uv >> 8) & 0xFF;
@@ -1427,7 +1557,7 @@ static void fill_rect_tex_sw(Gpu *gpu, int32_t rx, int32_t ry, int32_t rw, int32
         {
             uint8_t fu = (uint8_t)(u0 + dx);
             if (gpu->rectangle_texture_x_flip)
-                fu = (uint8_t)(u0 - dx);
+                fu = (uint8_t)(u0 + 1 - dx);
             uint16_t texel = texel_fetch(gpu, fu, fv);
             if (texel == 0)
                 continue;
@@ -1460,8 +1590,10 @@ static void rect_common(Gpu *gpu, int32_t w, int32_t h)
     uint32_t c = gpu->gp0_command.buffer[0];
     uint8_t r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
     uint32_t xy = gpu->gp0_command.buffer[1];
-    int32_t rx = (int16_t)(xy & 0xFFFF), ry = (int16_t)(xy >> 16);
+    int32_t rx = gpu_xy_x(xy), ry = gpu_xy_y(xy);
     apply_offset(gpu, &rx, &ry);
+    rx = gpu_truncate_coord(rx);
+    ry = gpu_truncate_coord(ry);
     bool semi = ((c >> 24) & 0x02) != 0;
     trace_prim("rect op=0x%02X xy=(%d,%d) size=%dx%d color=%02X,%02X,%02X semi=%u mode=%u",
                (unsigned)(c >> 24), rx, ry, w, h, r, g, b, semi ? 1u : 0u,
@@ -1473,8 +1605,10 @@ static void rect_common_var(Gpu *gpu)
     uint32_t c = gpu->gp0_command.buffer[0];
     uint8_t r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
     uint32_t xy = gpu->gp0_command.buffer[1];
-    int32_t rx = (int16_t)(xy & 0xFFFF), ry = (int16_t)(xy >> 16);
+    int32_t rx = gpu_xy_x(xy), ry = gpu_xy_y(xy);
     apply_offset(gpu, &rx, &ry);
+    rx = gpu_truncate_coord(rx);
+    ry = gpu_truncate_coord(ry);
     uint32_t wh = gpu->gp0_command.buffer[2];
     int32_t w = wh & 0x3FF, h = (wh >> 16) & 0x1FF;
     bool semi = ((c >> 24) & 0x02) != 0;
@@ -1493,8 +1627,10 @@ static void rect_tex_common(Gpu *gpu, int32_t w, int32_t h)
     uint32_t c = gpu->gp0_command.buffer[0];
     uint8_t cr = c & 0xFF, cg = (c >> 8) & 0xFF, cb = (c >> 16) & 0xFF;
     uint32_t xy = gpu->gp0_command.buffer[1];
-    int32_t rx = (int16_t)(xy & 0xFFFF), ry = (int16_t)(xy >> 16);
+    int32_t rx = gpu_xy_x(xy), ry = gpu_xy_y(xy);
     apply_offset(gpu, &rx, &ry);
+    rx = gpu_truncate_coord(rx);
+    ry = gpu_truncate_coord(ry);
     uint32_t uv_clut = gpu->gp0_command.buffer[2];
     uint8_t u0 = uv_clut & 0xFF, v0 = (uv_clut >> 8) & 0xFF;
     uint16_t clut_raw = (uint16_t)(uv_clut >> 16);
@@ -1514,8 +1650,10 @@ static void rect_tex_common_var(Gpu *gpu)
     uint32_t c = gpu->gp0_command.buffer[0];
     uint8_t cr = c & 0xFF, cg = (c >> 8) & 0xFF, cb = (c >> 16) & 0xFF;
     uint32_t xy = gpu->gp0_command.buffer[1];
-    int32_t rx = (int16_t)(xy & 0xFFFF), ry = (int16_t)(xy >> 16);
+    int32_t rx = gpu_xy_x(xy), ry = gpu_xy_y(xy);
     apply_offset(gpu, &rx, &ry);
+    rx = gpu_truncate_coord(rx);
+    ry = gpu_truncate_coord(ry);
     uint32_t uv_clut = gpu->gp0_command.buffer[2];
     uint8_t u0 = uv_clut & 0xFF, v0 = (uv_clut >> 8) & 0xFF;
     uint16_t clut_raw = (uint16_t)(uv_clut >> 16);
@@ -1582,10 +1720,10 @@ static void gp0_line_mono(Gpu *gpu)
     uint32_t v1w = gpu->gp0_command.buffer[2];
     bool semi = (op >> 25) & 1;
     uint8_t r = op & 0xFF, g = (op >> 8) & 0xFF, b = (op >> 16) & 0xFF;
-    int32_t x0 = (int32_t)((int16_t)(v0w & 0xFFFF)) + gpu->drawing_x_offset;
-    int32_t y0 = (int32_t)((int16_t)(v0w >> 16)) + gpu->drawing_y_offset;
-    int32_t x1 = (int32_t)((int16_t)(v1w & 0xFFFF)) + gpu->drawing_x_offset;
-    int32_t y1 = (int32_t)((int16_t)(v1w >> 16)) + gpu->drawing_y_offset;
+    int32_t x0 = gpu_xy_x(v0w) + gpu->drawing_x_offset;
+    int32_t y0 = gpu_xy_y(v0w) + gpu->drawing_y_offset;
+    int32_t x1 = gpu_xy_x(v1w) + gpu->drawing_x_offset;
+    int32_t y1 = gpu_xy_y(v1w) + gpu->drawing_y_offset;
     draw_line(gpu, x0, y0, r, g, b, x1, y1, r, g, b, semi);
 }
 
@@ -1599,10 +1737,10 @@ static void gp0_line_shaded(Gpu *gpu)
     bool semi = (c0w >> 25) & 1;
     uint8_t r0 = c0w & 0xFF, g0 = (c0w >> 8) & 0xFF, b0 = (c0w >> 16) & 0xFF;
     uint8_t r1 = c1w & 0xFF, g1 = (c1w >> 8) & 0xFF, b1 = (c1w >> 16) & 0xFF;
-    int32_t x0 = (int32_t)((int16_t)(v0w & 0xFFFF)) + gpu->drawing_x_offset;
-    int32_t y0 = (int32_t)((int16_t)(v0w >> 16)) + gpu->drawing_y_offset;
-    int32_t x1 = (int32_t)((int16_t)(v1w & 0xFFFF)) + gpu->drawing_x_offset;
-    int32_t y1 = (int32_t)((int16_t)(v1w >> 16)) + gpu->drawing_y_offset;
+    int32_t x0 = gpu_xy_x(v0w) + gpu->drawing_x_offset;
+    int32_t y0 = gpu_xy_y(v0w) + gpu->drawing_y_offset;
+    int32_t x1 = gpu_xy_x(v1w) + gpu->drawing_x_offset;
+    int32_t y1 = gpu_xy_y(v1w) + gpu->drawing_y_offset;
     draw_line(gpu, x0, y0, r0, g0, b0, x1, y1, r1, g1, b1, semi);
 }
 
@@ -1610,8 +1748,8 @@ static void gp0_polyline_mono_start(Gpu *gpu)
 {
     uint32_t c = gpu->gp0_command.buffer[0] & 0x00FFFFFFu;
     uint32_t v = gpu->gp0_command.buffer[1];
-    int32_t x = (int16_t)(v & 0xFFFF);
-    int32_t y = (int16_t)(v >> 16);
+    int32_t x = gpu_xy_x(v);
+    int32_t y = gpu_xy_y(v);
     apply_offset(gpu, &x, &y);
 
     gpu->polyline_shaded = false;
@@ -1628,8 +1766,8 @@ static void gp0_polyline_shaded_start(Gpu *gpu)
 {
     uint32_t c = gpu->gp0_command.buffer[0] & 0x00FFFFFFu;
     uint32_t v = gpu->gp0_command.buffer[1];
-    int32_t x = (int16_t)(v & 0xFFFF);
-    int32_t y = (int16_t)(v >> 16);
+    int32_t x = gpu_xy_x(v);
+    int32_t y = gpu_xy_y(v);
     apply_offset(gpu, &x, &y);
 
     gpu->polyline_shaded = true;
@@ -1652,18 +1790,20 @@ static void gp1_reset_command_buffer(Gpu *gpu);
  * draw command between them (default 0 = disabled). */
 static uint32_t g_gp1_consecutive = 0;
 static uint32_t g_gp1_loop_thresh = 0;
-static bool     g_gp1_watch       = false;
-static bool     g_gp1_dbg_init    = false;
+static bool g_gp1_watch = false;
+static bool g_gp1_dbg_init = false;
 static uint32_t g_gp1_last_ops[8];
 static uint32_t g_gp1_last_vals[8];
-static uint32_t g_gp1_last_head   = 0;
+static uint32_t g_gp1_last_head = 0;
 
 static void gp1_dbg_init(void)
 {
-    if (g_gp1_dbg_init) return;
+    if (g_gp1_dbg_init)
+        return;
     g_gp1_dbg_init = true;
     const char *e = getenv("PS1_GP1_LOOP_THRESH");
-    if (e) g_gp1_loop_thresh = (uint32_t)strtoul(e, NULL, 10);
+    if (e)
+        g_gp1_loop_thresh = (uint32_t)strtoul(e, NULL, 10);
     g_gp1_watch = getenv("PS1_WATCH_GP1") != NULL;
 }
 
@@ -1676,15 +1816,10 @@ void gpu_gp1(Gpu *gpu, uint32_t val)
     LOG(LOG_GPU, "GP1 op=0x%02X val=0x%08X", op, val);
 
     /* Track consecutive GP1 calls (no GP0 draw between them) */
-    g_gp1_last_ops [g_gp1_last_head & 7] = op;
+    g_gp1_last_ops[g_gp1_last_head & 7] = op;
     g_gp1_last_vals[g_gp1_last_head & 7] = val;
     g_gp1_last_head++;
     g_gp1_consecutive++;
-
-    if (g_gp1_watch)
-        fprintf(stderr, "GP1[%u] op=0x%02X val=0x%08X disp_dis=%d vram_xy=(%u,%u)\n",
-                g_gp1_consecutive, op, val, gpu->display_disabled,
-                gpu->display_vram_x_start, gpu->display_vram_y_start);
 
     if (g_gp1_loop_thresh && g_gp1_consecutive >= g_gp1_loop_thresh)
     {
@@ -1795,6 +1930,16 @@ void gpu_gp1(Gpu *gpu, uint32_t val)
         fprintf(stderr, "Unhandled GP1 0x%02X\n", op);
         break;
     }
+
+    if (g_gp1_watch)
+        fprintf(stderr,
+                "GP1[%u] op=0x%02X val=0x%08X disp_dis=%d vram_xy=(%u,%u) range=(%u-%u,%u-%u) hres=%u depth=%s\n",
+                g_gp1_consecutive, op, val, gpu->display_disabled,
+                gpu->display_vram_x_start, gpu->display_vram_y_start,
+                gpu->display_horiz_start, gpu->display_horiz_end,
+                gpu->display_line_start, gpu->display_line_end,
+                hres_width(gpu->hres),
+                gpu->display_depth == DISPLAY_DEPTH_24 ? "24" : "15");
 }
 
 static void gp1_reset(Gpu *gpu)
@@ -1862,22 +2007,11 @@ void gpu_vblank(Gpu *gpu)
     if (gpu->interlaced)
         gpu->field = (gpu->field == FIELD_TOP) ? FIELD_BOTTOM : FIELD_TOP;
 
-    uint16_t display_x = gpu->display_vram_x_start;
-    uint16_t display_y = gpu->display_vram_y_start;
-    uint16_t w = display_width_from_gpu(gpu);
-    uint16_t h = display_height_from_gpu(gpu);
-    if (display_x >= 1024)
-        display_x = 0;
-    if (display_y >= 512)
-        display_y = 0;
-    if ((uint32_t)display_x + w > 1024u)
-        w = (uint16_t)(1024u - display_x);
-    if ((uint32_t)display_y + h > 512u)
-        h = (uint16_t)(512u - display_y);
-    if (w == 0)
-        w = 320;
-    if (h == 0)
-        h = 240;
+    DisplayRect display = display_rect_from_gpu(gpu);
+    uint16_t display_x = display.x;
+    uint16_t display_y = display.y;
+    uint16_t w = display.w;
+    uint16_t h = display.h;
     bool display_24bit = gpu->display_depth == DISPLAY_DEPTH_24;
     renderer_display(&gpu->renderer, gpu->vram, display_x, display_y, w, h,
                      display_24bit);

@@ -137,23 +137,32 @@ def png_chunk(kind: bytes, payload: bytes) -> bytes:
     return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", crc & 0xFFFFFFFF)
 
 
-def ppm_to_png(ppm: Path, png: Path) -> None:
+def png_color_type(png: Path) -> int:
+    data = png.read_bytes()
+    if len(data) < 26 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        return 2
+    return data[25]
+
+
+def ppm_to_png(ppm: Path, png: Path, color_type: int = 2) -> None:
     width, height, pixels = read_ppm(ppm)
     rows = []
     stride = width * 3
-    grayscale = all(
-        pixels[i] == pixels[i + 1] == pixels[i + 2]
-        for i in range(0, len(pixels), 3)
-    )
-    if grayscale:
+    if color_type == 6:
         for y in range(height):
             row = pixels[y * stride : (y + 1) * stride]
-            rows.append(b"\x00" + row[0::3])
-        color_type = 0
+            rgba = bytearray(width * 4)
+            for x in range(width):
+                src = x * 3
+                dst = x * 4
+                rgba[dst : dst + 3] = row[src : src + 3]
+                rgba[dst + 3] = 255
+            rows.append(b"\x00" + bytes(rgba))
     else:
-        for y in range(height):
-            rows.append(b"\x00" + pixels[y * stride : (y + 1) * stride])
         color_type = 2
+        for y in range(height):
+            row = pixels[y * stride : (y + 1) * stride]
+            rows.append(b"\x00" + row)
     raw = b"".join(rows)
     ihdr = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
     png.write_bytes(
@@ -209,7 +218,7 @@ def run_case(args: argparse.Namespace, case: TestCase) -> bool:
         if not ppm_path.exists():
             print(f"[FAIL] {case.category}/{case.name}: missing VRAM dump ({rel(log_path)})")
             return False
-        ppm_to_png(ppm_path, png_path)
+        ppm_to_png(ppm_path, png_path, png_color_type(case.ref_vram))
         diff_cmd = [str(args.diffvram), str(case.ref_vram), str(png_path), str(diff_path)]
         diff = subprocess.run(diff_cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if diff.returncode != 0:

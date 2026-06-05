@@ -85,6 +85,71 @@ static void cpu_branch(Cpu *cpu, uint32_t offset)
     cpu->branch = true;
 }
 
+static uint32_t gte_command_cycles(uint32_t cmd)
+{
+    switch (cmd & 0x3F)
+    {
+    case 0x01:
+        return 15; /* RTPS */
+    case 0x06:
+        return 8; /* NCLIP */
+    case 0x0C:
+        return 6; /* OP */
+    case 0x10:
+    case 0x11:
+    case 0x12:
+    case 0x29:
+        return 8;
+    case 0x13:
+        return 19; /* NCDS */
+    case 0x14:
+        return 13; /* CDP/CC */
+    case 0x16:
+        return 44; /* NCDT */
+    case 0x1B:
+        return 17; /* NCCS */
+    case 0x1C:
+        return 11; /* CC */
+    case 0x1E:
+        return 14; /* NCS */
+    case 0x20:
+        return 30; /* NCT */
+    case 0x28:
+    case 0x2D:
+    case 0x3D:
+    case 0x3E:
+        return 5;
+    case 0x2A:
+        return 17; /* DPCT */
+    case 0x2E:
+        return 6; /* AVSZ4 */
+    case 0x30:
+        return 23; /* RTPT */
+    case 0x3F:
+        return 39; /* NCCT */
+    default:
+        return 0;
+    }
+}
+
+static void cpu_stall_until_gte_complete(Cpu *cpu)
+{
+    if (cpu->gte_busy_cycles == 0)
+        return;
+    cpu->extra_cycles += cpu->gte_busy_cycles;
+    cpu->gte_busy_cycles = 0;
+}
+
+static uint32_t cpu_finish_instruction_cycles(Cpu *cpu, uint32_t base_cycles)
+{
+    if (cpu->gte_busy_cycles > base_cycles)
+        cpu->gte_busy_cycles -= base_cycles;
+    else
+        cpu->gte_busy_cycles = 0;
+
+    return base_cycles + cpu->extra_cycles;
+}
+
 static void cpu_exception(Cpu *cpu, Exception cause)
 {
     uint32_t handler = (cpu->sr & (1 << 22)) ? 0xBFC00180 : 0x80000080;
@@ -467,6 +532,7 @@ uint32_t cpu_run_next_instruction(Cpu *cpu)
     uint32_t op = cpu_load32(cpu, cpu->pc);
     cpu->pc = cpu->next_pc;
     cpu->next_pc = cpu->next_pc + 4;
+    cpu->extra_cycles = 0;
 
     cpu_set_reg(cpu, cpu->load_reg, cpu->load_val);
     cpu->load_reg = 0;
@@ -480,11 +546,12 @@ uint32_t cpu_run_next_instruction(Cpu *cpu)
 
     /* Approximate cycle cost: loads/stores cost more than ALU ops. */
     uint32_t fn = instr_function(op);
+    uint32_t base_cycles = 2;
     if (fn == 0x20 || fn == 0x21 || fn == 0x22 || fn == 0x23 ||
         fn == 0x24 || fn == 0x25 || fn == 0x26 ||
         fn == 0x28 || fn == 0x29 || fn == 0x2A || fn == 0x2B || fn == 0x2E)
-        return 4; /* loads and stores */
-    return 2;     /* everything else */
+        base_cycles = 4; /* loads and stores */
+    return cpu_finish_instruction_cycles(cpu, base_cycles);
 }
 
 /* ---- Opcode implementations ---- */
@@ -594,17 +661,24 @@ static void op_cop2(Cpu *cpu, uint32_t op)
     if (cop_op & 0x10)
     {
         /* bit 25 set → execute GTE command */
-        gte_execute(&cpu->gte, op & 0x1FFFFFF);
+        uint32_t cmd = op & 0x1FFFFFF;
+        cpu_stall_until_gte_complete(cpu);
+        gte_execute(&cpu->gte, cmd);
+        cpu->gte_busy_cycles = gte_command_cycles(cmd);
         return;
     }
     uint32_t reg = instr_d(op);
     switch (cop_op)
     {
     case 0b00000: /* MFC2 — move from GTE data reg */
-        cpu_set_reg(cpu, instr_t(op), gte_read_data(&cpu->gte, reg));
+        cpu_stall_until_gte_complete(cpu);
+        cpu->load_reg = instr_t(op);
+        cpu->load_val = gte_read_data(&cpu->gte, reg);
         break;
     case 0b00010: /* CFC2 — move from GTE ctrl reg */
-        cpu_set_reg(cpu, instr_t(op), gte_read_ctrl(&cpu->gte, reg));
+        cpu_stall_until_gte_complete(cpu);
+        cpu->load_reg = instr_t(op);
+        cpu->load_val = gte_read_ctrl(&cpu->gte, reg);
         break;
     case 0b00100: /* MTC2 — move to GTE data reg */
         gte_write_data(&cpu->gte, reg, cpu_reg(cpu, instr_t(op)));
@@ -637,6 +711,7 @@ static void op_swc2(Cpu *cpu, uint32_t op)
 {
     if (cpu->sr & 0x10000)
         return;
+    cpu_stall_until_gte_complete(cpu);
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     if (addr % 4 != 0)
     {

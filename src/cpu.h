@@ -22,6 +22,8 @@ typedef struct
 
     /* COP2 / GTE */
     Gte gte;
+    uint32_t gte_busy_cycles;
+    uint32_t extra_cycles;
 
     uint8_t load_reg;
     uint32_t load_val;

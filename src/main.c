@@ -12,9 +12,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 /* Cpu is too large (~3 MB with RAM) to live on the stack — use heap. */
+
+typedef struct
+{
+    SDL_GameController *pad;
+    SDL_JoystickID instance_id;
+    uint16_t button_state;
+    uint16_t axis_state;
+} InputController;
 
 static uint64_t now_nanos(void)
 {
@@ -35,6 +44,192 @@ static void usage(const char *prog)
             "\n"
             "  Positional argument: .exe loads as PS-X EXE, .bin mounts as disc image.\n",
             prog);
+}
+
+static void input_controller_close(InputController *ctl)
+{
+    if (!ctl->pad)
+        return;
+    SDL_GameControllerClose(ctl->pad);
+    ctl->pad = NULL;
+    ctl->instance_id = -1;
+    ctl->button_state = 0;
+    ctl->axis_state = 0;
+}
+
+static void input_controller_apply(InputController *ctl, Sio *sio)
+{
+    sio_set_controller_state(sio, ctl->button_state | ctl->axis_state);
+}
+
+static void input_controller_open_first(InputController *ctl)
+{
+    if (ctl->pad)
+        return;
+
+    int count = SDL_NumJoysticks();
+    for (int i = 0; i < count; i++)
+    {
+        if (!SDL_IsGameController(i))
+            continue;
+        ctl->pad = SDL_GameControllerOpen(i);
+        if (!ctl->pad)
+            continue;
+        SDL_Joystick *joy = SDL_GameControllerGetJoystick(ctl->pad);
+        ctl->instance_id = joy ? SDL_JoystickInstanceID(joy) : -1;
+        fprintf(stderr, "Using controller: %s\n",
+                SDL_GameControllerName(ctl->pad));
+        return;
+    }
+}
+
+static uint16_t input_controller_button_mask(SDL_GameControllerButton button)
+{
+    switch (button)
+    {
+    case SDL_CONTROLLER_BUTTON_A:
+        return SIO_PAD_CROSS;
+    case SDL_CONTROLLER_BUTTON_B:
+        return SIO_PAD_CIRCLE;
+    case SDL_CONTROLLER_BUTTON_X:
+        return SIO_PAD_SQUARE;
+    case SDL_CONTROLLER_BUTTON_Y:
+        return SIO_PAD_TRIANGLE;
+    case SDL_CONTROLLER_BUTTON_BACK:
+        return SIO_PAD_SELECT;
+    case SDL_CONTROLLER_BUTTON_START:
+        return SIO_PAD_START;
+    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
+        return SIO_PAD_L1;
+    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:
+        return SIO_PAD_R1;
+    case SDL_CONTROLLER_BUTTON_DPAD_UP:
+        return SIO_PAD_UP;
+    case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
+        return SIO_PAD_DOWN;
+    case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
+        return SIO_PAD_LEFT;
+    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
+        return SIO_PAD_RIGHT;
+    default:
+        return 0;
+    }
+}
+
+static void input_controller_handle_button(InputController *ctl, Sio *sio,
+                                           SDL_GameControllerButton button,
+                                           bool pressed)
+{
+    uint16_t mask = input_controller_button_mask(button);
+    if (!mask)
+        return;
+    if (pressed)
+        ctl->button_state |= mask;
+    else
+        ctl->button_state &= (uint16_t)~mask;
+    input_controller_apply(ctl, sio);
+}
+
+static void input_controller_handle_axis(InputController *ctl, Sio *sio,
+                                         SDL_GameControllerAxis axis,
+                                         int16_t value)
+{
+    const int16_t deadzone = 12000;
+    uint16_t clear = 0;
+    uint16_t set = 0;
+
+    switch (axis)
+    {
+    case SDL_CONTROLLER_AXIS_LEFTX:
+        clear = SIO_PAD_LEFT | SIO_PAD_RIGHT;
+        if (value <= -deadzone)
+            set = SIO_PAD_LEFT;
+        else if (value >= deadzone)
+            set = SIO_PAD_RIGHT;
+        break;
+    case SDL_CONTROLLER_AXIS_LEFTY:
+        clear = SIO_PAD_UP | SIO_PAD_DOWN;
+        if (value <= -deadzone)
+            set = SIO_PAD_UP;
+        else if (value >= deadzone)
+            set = SIO_PAD_DOWN;
+        break;
+    case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
+        clear = SIO_PAD_L2;
+        if (value >= deadzone)
+            set = SIO_PAD_L2;
+        break;
+    case SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
+        clear = SIO_PAD_R2;
+        if (value >= deadzone)
+            set = SIO_PAD_R2;
+        break;
+    default:
+        return;
+    }
+
+    ctl->axis_state = (uint16_t)((ctl->axis_state & ~clear) | set);
+    input_controller_apply(ctl, sio);
+}
+
+static uint16_t input_button_name_mask(const char *name)
+{
+    if (strcasecmp(name, "SELECT") == 0)
+        return SIO_PAD_SELECT;
+    if (strcasecmp(name, "START") == 0)
+        return SIO_PAD_START;
+    if (strcasecmp(name, "UP") == 0)
+        return SIO_PAD_UP;
+    if (strcasecmp(name, "RIGHT") == 0)
+        return SIO_PAD_RIGHT;
+    if (strcasecmp(name, "DOWN") == 0)
+        return SIO_PAD_DOWN;
+    if (strcasecmp(name, "LEFT") == 0)
+        return SIO_PAD_LEFT;
+    if (strcasecmp(name, "L2") == 0)
+        return SIO_PAD_L2;
+    if (strcasecmp(name, "R2") == 0)
+        return SIO_PAD_R2;
+    if (strcasecmp(name, "L1") == 0)
+        return SIO_PAD_L1;
+    if (strcasecmp(name, "R1") == 0)
+        return SIO_PAD_R1;
+    if (strcasecmp(name, "TRIANGLE") == 0)
+        return SIO_PAD_TRIANGLE;
+    if (strcasecmp(name, "CIRCLE") == 0)
+        return SIO_PAD_CIRCLE;
+    if (strcasecmp(name, "CROSS") == 0 || strcasecmp(name, "X") == 0)
+        return SIO_PAD_CROSS;
+    if (strcasecmp(name, "SQUARE") == 0)
+        return SIO_PAD_SQUARE;
+    return 0;
+}
+
+static void input_apply_forced_env(Sio *sio)
+{
+    const char *env = getenv("PS1_PAD_HELD");
+    if (!env || !*env)
+        return;
+
+    char buf[256];
+    strncpy(buf, env, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    uint16_t pressed = 0;
+    char *token = strtok(buf, ",+ ");
+    while (token)
+    {
+        uint16_t mask = input_button_name_mask(token);
+        if (mask)
+            pressed |= mask;
+        else
+            fprintf(stderr, "Unknown PS1_PAD_HELD button: %s\n", token);
+        token = strtok(NULL, ",+ ");
+    }
+
+    sio_set_forced_state(sio, pressed);
+    if (pressed)
+        fprintf(stderr, "Holding PS1 pad buttons from PS1_PAD_HELD=0x%04X\n", pressed);
 }
 
 static uint32_t debug_load32(Interconnect *inter, uint32_t addr)
@@ -87,6 +282,7 @@ static void advance_system_quantum(Cpu *cpu)
                                  &cpu->inter.scheduler);
 
     timers_step(&cpu->inter.timers, SYSTEM_CYCLE_QUANTUM, &cpu->inter.irq, &cpu->inter.scheduler);
+    sio_step(&cpu->inter.sio, &cpu->inter.irq);
 
     if (gpu_step(&cpu->inter.gpu, SYSTEM_CYCLE_QUANTUM))
     {
@@ -159,7 +355,7 @@ int main(int argc, char **argv)
     SDL_Window *window = NULL;
     if (!headless)
     {
-        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0)
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0)
         {
             fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
             return 1;
@@ -179,10 +375,16 @@ int main(int argc, char **argv)
         }
     }
 
+    InputController input_ctl = {0};
+    input_ctl.instance_id = -1;
+    if (!headless)
+        input_controller_open_first(&input_ctl);
+
     Cpu *cpu = (Cpu *)malloc(sizeof(Cpu));
     if (!cpu)
     {
         fprintf(stderr, "Failed to allocate CPU\n");
+        input_controller_close(&input_ctl);
         if (window)
             SDL_DestroyWindow(window);
         if (!headless)
@@ -193,12 +395,14 @@ int main(int argc, char **argv)
     {
         fprintf(stderr, "Failed to init CPU/BIOS\n");
         free(cpu);
+        input_controller_close(&input_ctl);
         if (window)
             SDL_DestroyWindow(window);
         if (!headless)
             SDL_Quit();
         return 1;
     }
+    input_apply_forced_env(&cpu->inter.sio);
 
     if (exe_path)
     {
@@ -209,6 +413,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "Failed to load EXE: %s\n", exe_path);
             cpu_destroy(cpu);
             free(cpu);
+            input_controller_close(&input_ctl);
             if (window)
                 SDL_DestroyWindow(window);
             if (!headless)
@@ -377,6 +582,7 @@ int main(int argc, char **argv)
                 }
                 cpu_destroy(cpu);
                 free(cpu);
+                input_controller_close(&input_ctl);
                 return 0;
             }
             if (trace_interval > 0 && (count % trace_interval) == 0)
@@ -400,6 +606,7 @@ int main(int argc, char **argv)
                 maybe_dump_ram(cpu);
                 cpu_destroy(cpu);
                 free(cpu);
+                input_controller_close(&input_ctl);
                 return 0;
             }
         }
@@ -452,6 +659,7 @@ int main(int argc, char **argv)
             {
                 cpu_destroy(cpu);
                 free(cpu);
+                input_controller_close(&input_ctl);
                 SDL_DestroyWindow(window);
                 SDL_Quit();
                 return 0;
@@ -459,6 +667,35 @@ int main(int argc, char **argv)
             if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP)
                 sio_on_key(&cpu->inter.sio, event.key.keysym.scancode,
                            event.type == SDL_KEYDOWN);
+            else if (event.type == SDL_CONTROLLERDEVICEADDED)
+            {
+                input_controller_open_first(&input_ctl);
+                input_controller_apply(&input_ctl, &cpu->inter.sio);
+            }
+            else if (event.type == SDL_CONTROLLERDEVICEREMOVED)
+            {
+                if (input_ctl.pad && input_ctl.instance_id == event.cdevice.which)
+                {
+                    input_controller_close(&input_ctl);
+                    input_controller_apply(&input_ctl, &cpu->inter.sio);
+                    input_controller_open_first(&input_ctl);
+                }
+            }
+            else if (event.type == SDL_CONTROLLERBUTTONDOWN ||
+                     event.type == SDL_CONTROLLERBUTTONUP)
+            {
+                if (input_ctl.pad && input_ctl.instance_id == event.cbutton.which)
+                    input_controller_handle_button(&input_ctl, &cpu->inter.sio,
+                                                   (SDL_GameControllerButton)event.cbutton.button,
+                                                   event.type == SDL_CONTROLLERBUTTONDOWN);
+            }
+            else if (event.type == SDL_CONTROLLERAXISMOTION)
+            {
+                if (input_ctl.pad && input_ctl.instance_id == event.caxis.which)
+                    input_controller_handle_axis(&input_ctl, &cpu->inter.sio,
+                                                 (SDL_GameControllerAxis)event.caxis.axis,
+                                                 event.caxis.value);
+            }
         }
 
         /* Sleep until next frame deadline to cap at 60 Hz */

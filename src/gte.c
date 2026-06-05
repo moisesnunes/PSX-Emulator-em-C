@@ -103,6 +103,23 @@ static inline int16_t mat_lcm(const Gte *gte, int r, int c)
     return (int16_t)((idx & 1) ? (word >> 16) : word);
 }
 
+static inline int16_t mat_buggy(const Gte *gte, int r, int c)
+{
+    switch (r)
+    {
+    case 0:
+        if (c == 0)
+            return (int16_t)(-(int16_t)((uint16_t)GTE_R << 4));
+        if (c == 1)
+            return (int16_t)((uint16_t)GTE_R << 4);
+        return IR0;
+    case 1:
+        return rt(gte, 0, 2);
+    default:
+        return rt(gte, 1, 1);
+    }
+}
+
 /* Translation vector (signed 32-bit) */
 #define TRX ((int32_t)gte->cr[5])
 #define TRY ((int32_t)gte->cr[6])
@@ -156,16 +173,14 @@ static int32_t clamp(int32_t v, int32_t lo, int32_t hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
 }
-static int64_t clamp64(int64_t v, int64_t lo, int64_t hi)
+static int64_t sign_extend_bits(uint64_t v, int bits)
 {
-    return v < lo ? lo : (v > hi ? hi : v);
+    uint64_t mask = 1ull << (bits - 1);
+    return (int64_t)((v ^ mask) - mask);
 }
 
-/* Set MAC1/2/3 with 44-bit overflow check (shift right by sf*12 when sf=1) */
-static int32_t set_mac(Gte *gte, int n, int64_t v, int sf)
+static int64_t mac123_result(Gte *gte, int n, int64_t v)
 {
-    int64_t shifted = sf ? (v >> 12) : v;
-    /* overflow flags on the unshifted value (44-bit range for MAC1-3) */
     int64_t limit = (int64_t)1 << 43;
     if (v > limit - 1)
         gte->cr[31] |= (n == 1 ? F_MAC1_POS : n == 2 ? F_MAC2_POS
@@ -173,7 +188,15 @@ static int32_t set_mac(Gte *gte, int n, int64_t v, int sf)
     if (v < -limit)
         gte->cr[31] |= (n == 1 ? F_MAC1_NEG : n == 2 ? F_MAC2_NEG
                                                      : F_MAC3_NEG);
-    int32_t r = (int32_t)clamp64(shifted, INT32_MIN, INT32_MAX);
+    return sign_extend_bits((uint64_t)v & ((1ull << 44) - 1), 44);
+}
+
+/* Set MAC1/2/3 with 44-bit overflow check (shift right by sf*12 when sf=1) */
+static int32_t set_mac(Gte *gte, int n, int64_t v, int sf)
+{
+    mac123_result(gte, n, v);
+    int64_t shifted = sf ? (v >> 12) : v;
+    int32_t r = (int32_t)shifted;
     gte->dr[24 + n] = (uint32_t)r; /* MAC1=d25, MAC2=d26, MAC3=d27 (n=1,2,3) */
     return r;
 }
@@ -184,7 +207,7 @@ static int32_t set_mac0(Gte *gte, int64_t v)
         gte->cr[31] |= F_MAC0_POS;
     if (v < -(int64_t)0x80000000)
         gte->cr[31] |= F_MAC0_NEG;
-    int32_t r = (int32_t)clamp64(v, INT32_MIN, INT32_MAX);
+    int32_t r = (int32_t)v;
     gte->dr[24] = (uint32_t)r;
     return r;
 }
@@ -267,66 +290,58 @@ static void push_rgb(Gte *gte, int32_t r, int32_t g, int32_t b)
 /* Compute floor(h * 0x20000 / sz) clamped to 0x1FFFF */
 static uint32_t gte_divide(uint16_t h, uint16_t sz)
 {
-    /* Exact formula from psx-spx: use a lookup table for leading-zero
-       based reciprocal. We implement the hardware algorithm. */
     static const uint8_t UNR_TABLE[257] = {
         0xFF, 0xFD, 0xFB, 0xF9, 0xF7, 0xF5, 0xF3, 0xF1,
         0xEF, 0xEE, 0xEC, 0xEA, 0xE8, 0xE6, 0xE4, 0xE3,
         0xE1, 0xDF, 0xDD, 0xDC, 0xDA, 0xD8, 0xD6, 0xD5,
-        0xD3, 0xD1, 0xD0, 0xCE, 0xCC, 0xCB, 0xC9, 0xC7,
-        0xC6, 0xC4, 0xC3, 0xC1, 0xC0, 0xBE, 0xBD, 0xBB,
+        0xD3, 0xD1, 0xD0, 0xCE, 0xCD, 0xCB, 0xC9, 0xC8,
+        0xC6, 0xC5, 0xC3, 0xC1, 0xC0, 0xBE, 0xBD, 0xBB,
         0xBA, 0xB8, 0xB7, 0xB5, 0xB4, 0xB2, 0xB1, 0xB0,
         0xAE, 0xAD, 0xAB, 0xAA, 0xA9, 0xA7, 0xA6, 0xA4,
         0xA3, 0xA2, 0xA0, 0x9F, 0x9E, 0x9C, 0x9B, 0x9A,
-        0x98, 0x97, 0x96, 0x94, 0x93, 0x92, 0x91, 0x8F,
-        0x8E, 0x8D, 0x8C, 0x8A, 0x89, 0x88, 0x87, 0x86,
-        0x84, 0x83, 0x82, 0x81, 0x80, 0x7E, 0x7D, 0x7C,
-        0x7B, 0x7A, 0x79, 0x77, 0x76, 0x75, 0x74, 0x73,
-        0x72, 0x71, 0x70, 0x6F, 0x6E, 0x6C, 0x6B, 0x6A,
-        0x69, 0x68, 0x67, 0x66, 0x65, 0x64, 0x63, 0x62,
-        0x61, 0x60, 0x5F, 0x5E, 0x5D, 0x5C, 0x5B, 0x5A,
-        0x59, 0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52,
-        0x51, 0x50, 0x4F, 0x4E, 0x4D, 0x4C, 0x4B, 0x4A,
-        0x49, 0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42,
-        0x41, 0x40, 0x3F, 0x3E, 0x3D, 0x3C, 0x3B, 0x3B,
-        0x3A, 0x39, 0x38, 0x37, 0x36, 0x35, 0x34, 0x33,
-        0x33, 0x32, 0x31, 0x30, 0x2F, 0x2E, 0x2D, 0x2D,
-        0x2C, 0x2B, 0x2A, 0x29, 0x28, 0x28, 0x27, 0x26,
-        0x25, 0x24, 0x24, 0x23, 0x22, 0x21, 0x20, 0x20,
-        0x1F, 0x1E, 0x1D, 0x1D, 0x1C, 0x1B, 0x1A, 0x1A,
-        0x19, 0x18, 0x17, 0x17, 0x16, 0x15, 0x14, 0x14,
-        0x13, 0x12, 0x11, 0x11, 0x10, 0x0F, 0x0F, 0x0E,
-        0x0D, 0x0C, 0x0C, 0x0B, 0x0A, 0x0A, 0x09, 0x08,
-        0x08, 0x07, 0x06, 0x06, 0x05, 0x04, 0x04, 0x03,
-        0x02, 0x02, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF};
+        0x99, 0x97, 0x96, 0x95, 0x94, 0x92, 0x91, 0x90,
+        0x8F, 0x8D, 0x8C, 0x8B, 0x8A, 0x89, 0x87, 0x86,
+        0x85, 0x84, 0x83, 0x82, 0x81, 0x7F, 0x7E, 0x7D,
+        0x7C, 0x7B, 0x7A, 0x79, 0x78, 0x77, 0x75, 0x74,
+        0x73, 0x72, 0x71, 0x70, 0x6F, 0x6E, 0x6D, 0x6C,
+        0x6B, 0x6A, 0x69, 0x68, 0x67, 0x66, 0x65, 0x64,
+        0x63, 0x62, 0x61, 0x60, 0x5F, 0x5E, 0x5D, 0x5D,
+        0x5C, 0x5B, 0x5A, 0x59, 0x58, 0x57, 0x56, 0x55,
+        0x54, 0x53, 0x53, 0x52, 0x51, 0x50, 0x4F, 0x4E,
+        0x4D, 0x4D, 0x4C, 0x4B, 0x4A, 0x49, 0x48, 0x48,
+        0x47, 0x46, 0x45, 0x44, 0x43, 0x43, 0x42, 0x41,
+        0x40, 0x3F, 0x3F, 0x3E, 0x3D, 0x3C, 0x3C, 0x3B,
+        0x3A, 0x39, 0x39, 0x38, 0x37, 0x36, 0x36, 0x35,
+        0x34, 0x33, 0x33, 0x32, 0x31, 0x31, 0x30, 0x2F,
+        0x2E, 0x2E, 0x2D, 0x2C, 0x2C, 0x2B, 0x2A, 0x2A,
+        0x29, 0x28, 0x28, 0x27, 0x26, 0x26, 0x25, 0x24,
+        0x24, 0x23, 0x22, 0x22, 0x21, 0x20, 0x20, 0x1F,
+        0x1E, 0x1E, 0x1D, 0x1D, 0x1C, 0x1B, 0x1B, 0x1A,
+        0x19, 0x19, 0x18, 0x18, 0x17, 0x16, 0x16, 0x15,
+        0x15, 0x14, 0x14, 0x13, 0x12, 0x12, 0x11, 0x11,
+        0x10, 0x0F, 0x0F, 0x0E, 0x0E, 0x0D, 0x0D, 0x0C,
+        0x0C, 0x0B, 0x0A, 0x0A, 0x09, 0x09, 0x08, 0x08,
+        0x07, 0x07, 0x06, 0x06, 0x05, 0x05, 0x04, 0x04,
+        0x03, 0x03, 0x02, 0x02, 0x01, 0x01, 0x00, 0x00,
+        0x00};
 
-    if (sz == 0 || (h / sz) >= 2)
+    if ((uint32_t)sz * 2 <= h)
     {
         return 0x1FFFF; /* division overflow */
     }
 
-    /* Leading zero count to normalise sz */
-    int shift = 0;
-    uint32_t tmp = sz;
-    while (tmp < 0x8000)
+    uint32_t lhs = h;
+    uint32_t rhs = sz;
+    while (rhs < 0x8000)
     {
-        tmp <<= 1;
-        shift++;
+        lhs <<= 1;
+        rhs <<= 1;
     }
-    /* tmp is now in range [0x8000, 0xFFFF] */
-    uint32_t idx = ((tmp & 0x7FFF) + 0x40) >> 7; /* 0..256 */
-    if (idx > 256)
-        idx = 256;
-    uint32_t recip = (uint32_t)UNR_TABLE[idx] + 0x101;
-    /* d = floor((0x2000080 - sz_norm * recip) / 0x80) where sz_norm = sz<<shift */
-    uint32_t sz_n = (uint32_t)sz << shift;
-    uint32_t d = (uint32_t)(((uint64_t)0x2000080 - (uint64_t)sz_n * recip) >> 7);
-    /* result = floor((h * d + 0x8000) >> 16) after scaling */
-    uint64_t result = ((uint64_t)(h << shift) * d + 0x8000) >> 16;
+    uint32_t divisor = rhs | 0x8000;
+    int32_t x = 0x101 + (int32_t)UNR_TABLE[((divisor & 0x7FFF) + 0x40) >> 7];
+    int32_t d = ((int32_t)divisor * -x + 0x80) >> 8;
+    uint32_t recip = (uint32_t)(((int64_t)x * (0x20000 + d) + 0x80) >> 8);
+    uint64_t result = ((uint64_t)lhs * recip + 0x8000) >> 16;
     if (result > 0x1FFFF)
         result = 0x1FFFF;
     return (uint32_t)result;
@@ -344,9 +359,12 @@ static void mat_mul_vec(Gte *gte, MatFn mf,
                         int16_t vx, int16_t vy, int16_t vz,
                         int sf, bool lm)
 {
-    int64_t m1 = (int64_t)tx * 0x1000 + (int64_t)mf(gte, 0, 0) * vx + (int64_t)mf(gte, 0, 1) * vy + (int64_t)mf(gte, 0, 2) * vz;
-    int64_t m2 = (int64_t)ty * 0x1000 + (int64_t)mf(gte, 1, 0) * vx + (int64_t)mf(gte, 1, 1) * vy + (int64_t)mf(gte, 1, 2) * vz;
-    int64_t m3 = (int64_t)tz * 0x1000 + (int64_t)mf(gte, 2, 0) * vx + (int64_t)mf(gte, 2, 1) * vy + (int64_t)mf(gte, 2, 2) * vz;
+    int64_t m1 = mac123_result(gte, 1, (int64_t)tx * 0x1000 + (int64_t)mf(gte, 0, 0) * vx);
+    m1 = mac123_result(gte, 1, m1 + (int64_t)mf(gte, 0, 1) * vy) + (int64_t)mf(gte, 0, 2) * vz;
+    int64_t m2 = mac123_result(gte, 2, (int64_t)ty * 0x1000 + (int64_t)mf(gte, 1, 0) * vx);
+    m2 = mac123_result(gte, 2, m2 + (int64_t)mf(gte, 1, 1) * vy) + (int64_t)mf(gte, 1, 2) * vz;
+    int64_t m3 = mac123_result(gte, 3, (int64_t)tz * 0x1000 + (int64_t)mf(gte, 2, 0) * vx);
+    m3 = mac123_result(gte, 3, m3 + (int64_t)mf(gte, 2, 1) * vy) + (int64_t)mf(gte, 2, 2) * vz;
     int32_t r1 = set_mac(gte, 1, m1, sf);
     int32_t r2 = set_mac(gte, 2, m2, sf);
     int32_t r3 = set_mac(gte, 3, m3, sf);
@@ -355,15 +373,37 @@ static void mat_mul_vec(Gte *gte, MatFn mf,
     set_ir(gte, 3, r3, lm);
 }
 
+static void mat_mul_vec_buggy(Gte *gte, MatFn mf,
+                              int32_t tx, int32_t ty, int32_t tz,
+                              int16_t vx, int16_t vy, int16_t vz,
+                              int sf, bool lm)
+{
+    int shift = sf ? 12 : 0;
+    int64_t p1 = mac123_result(gte, 1, (int64_t)tx * 0x1000 + (int64_t)mf(gte, 0, 0) * vx);
+    int64_t p2 = mac123_result(gte, 2, (int64_t)ty * 0x1000 + (int64_t)mf(gte, 1, 0) * vx);
+    int64_t p3 = mac123_result(gte, 3, (int64_t)tz * 0x1000 + (int64_t)mf(gte, 2, 0) * vx);
+    set_ir(gte, 1, (int32_t)(p1 >> shift), false);
+    set_ir(gte, 2, (int32_t)(p2 >> shift), false);
+    set_ir(gte, 3, (int32_t)(p3 >> shift), false);
+
+    int64_t m1 = mac123_result(gte, 1, (int64_t)mf(gte, 0, 1) * vy) + (int64_t)mf(gte, 0, 2) * vz;
+    int64_t m2 = mac123_result(gte, 2, (int64_t)mf(gte, 1, 1) * vy) + (int64_t)mf(gte, 1, 2) * vz;
+    int64_t m3 = mac123_result(gte, 3, (int64_t)mf(gte, 2, 1) * vy) + (int64_t)mf(gte, 2, 2) * vz;
+    set_ir(gte, 1, set_mac(gte, 1, m1, sf), lm);
+    set_ir(gte, 2, set_mac(gte, 2, m2, sf), lm);
+    set_ir(gte, 3, set_mac(gte, 3, m3, sf), lm);
+}
+
 /* ---- RTPS: perspective transform for one vertex ---- */
-static void gte_rtps(Gte *gte, int v, int sf, bool lm)
+static void gte_rtps(Gte *gte, int v, int sf, bool lm, bool last)
 {
     int16_t vx = VX(v), vy = VY(v), vz = VZ(v);
     mat_mul_vec(gte, rt, TRX, TRY, TRZ, vx, vy, vz, sf, lm);
 
-    /* SZ push: use MAC3 (unshifted TRZ contribution is in MAC3) */
-    int32_t mac3 = MAC3;
-    push_sz(gte, mac3);
+    /* SZ3 uses the unshifted transform result shifted by 12. Since set_mac()
+       stores MAC3 after sf*12, sf=0 needs the extra shift here. */
+    int32_t sz = sf ? MAC3 : (MAC3 >> 12);
+    push_sz(gte, sz);
 
     /* Division: h / SZ3 */
     uint16_t sz3 = SZ(3);
@@ -372,16 +412,19 @@ static void gte_rtps(Gte *gte, int v, int sf, bool lm)
     uint32_t div = gte_divide(H, sz3);
 
     /* SX2 = (MAC1 * div + OFX) >> 16 */
-    int64_t sx64 = ((int64_t)(int16_t)IR1 * div + OFX + 0x8000) >> 16;
+    int64_t sx64 = ((int64_t)(int16_t)IR1 * div + OFX) >> 16;
     /* SY2 = (MAC2 * div + OFY) >> 16 */
-    int64_t sy64 = ((int64_t)(int16_t)IR2 * div + OFY + 0x8000) >> 16;
+    int64_t sy64 = ((int64_t)(int16_t)IR2 * div + OFY) >> 16;
 
     push_sxy(gte, (int32_t)sx64, (int32_t)sy64);
 
-    /* IR0 (depth cue interpolation factor) */
-    int64_t ir0_64 = ((int64_t)(int16_t)DQA * div + (int64_t)DQB + 0x800) >> 12;
-    set_ir0(gte, (int32_t)ir0_64);
-    set_mac0(gte, ir0_64 * 0x1000);
+    if (last)
+    {
+        /* IR0 (depth cue interpolation factor) */
+        int64_t ir0_64 = ((int64_t)(int16_t)DQA * div + (int64_t)DQB) >> 12;
+        set_ir0(gte, (int32_t)ir0_64);
+        set_mac0(gte, ir0_64 * 0x1000);
+    }
 }
 
 /* ---- GTE commands ---- */
@@ -391,7 +434,7 @@ static void cmd_rtps(Gte *gte, uint32_t cmd)
     int sf = (cmd >> 19) & 1;
     bool lm = (cmd >> 10) & 1;
     gte->cr[31] = 0;
-    gte_rtps(gte, 0, sf, lm);
+    gte_rtps(gte, 0, sf, lm, true);
 }
 
 static void cmd_rtpt(Gte *gte, uint32_t cmd)
@@ -399,9 +442,9 @@ static void cmd_rtpt(Gte *gte, uint32_t cmd)
     int sf = (cmd >> 19) & 1;
     bool lm = (cmd >> 10) & 1;
     gte->cr[31] = 0;
-    gte_rtps(gte, 0, sf, lm);
-    gte_rtps(gte, 1, sf, lm);
-    gte_rtps(gte, 2, sf, lm);
+    gte_rtps(gte, 0, sf, lm, false);
+    gte_rtps(gte, 1, sf, lm, false);
+    gte_rtps(gte, 2, sf, lm, true);
 }
 
 static void cmd_nclip(Gte *gte, uint32_t cmd)
@@ -504,8 +547,7 @@ static void cmd_mvmva(Gte *gte, uint32_t cmd)
         mf = mat_lcm;
         break;
     default:
-        /* Garbage matrix (doc says all -0x60 pattern) — we just zero out */
-        mf = rt;
+        mf = mat_buggy;
         break;
     }
 
@@ -550,7 +592,10 @@ static void cmd_mvmva(Gte *gte, uint32_t cmd)
         break;
     }
 
-    mat_mul_vec(gte, mf, (int32_t)tx, (int32_t)ty, (int32_t)tz, vx, vy, vz, sf, lm);
+    if (tv == 2)
+        mat_mul_vec_buggy(gte, mf, (int32_t)tx, (int32_t)ty, (int32_t)tz, vx, vy, vz, sf, lm);
+    else
+        mat_mul_vec(gte, mf, (int32_t)tx, (int32_t)ty, (int32_t)tz, vx, vy, vz, sf, lm);
 }
 
 /* Depth cue single: interpolate between far-color and IR color */
@@ -685,6 +730,25 @@ static void cmd_cc(Gte *gte, uint32_t cmd)
     int64_t m1 = (int64_t)GTE_R * 0x10 * IR1;
     int64_t m2 = (int64_t)GTE_G * 0x10 * IR2;
     int64_t m3 = (int64_t)GTE_B * 0x10 * IR3;
+    set_ir(gte, 1, set_mac(gte, 1, m1, sf), lm);
+    set_ir(gte, 2, set_mac(gte, 2, m2, sf), lm);
+    set_ir(gte, 3, set_mac(gte, 3, m3, sf), lm);
+    push_rgb(gte, MAC1 >> 4, MAC2 >> 4, MAC3 >> 4);
+}
+
+static void cmd_cdp(Gte *gte, uint32_t cmd)
+{
+    int sf = (cmd >> 19) & 1;
+    bool lm = (cmd >> 10) & 1;
+    gte->cr[31] = 0;
+    mat_mul_vec(gte, mat_lcm, RBK, GBK, BBK, IR1, IR2, IR3, sf, lm);
+
+    int64_t m1 = (int64_t)GTE_R * 0x10 * IR1;
+    int64_t m2 = (int64_t)GTE_G * 0x10 * IR2;
+    int64_t m3 = (int64_t)GTE_B * 0x10 * IR3;
+    m1 += (int64_t)IR0 * ((int64_t)RFC - m1 / 0x1000);
+    m2 += (int64_t)IR0 * ((int64_t)GFC - m2 / 0x1000);
+    m3 += (int64_t)IR0 * ((int64_t)BFC - m3 / 0x1000);
     set_ir(gte, 1, set_mac(gte, 1, m1, sf), lm);
     set_ir(gte, 2, set_mac(gte, 2, m2, sf), lm);
     set_ir(gte, 3, set_mac(gte, 3, m3, sf), lm);
@@ -924,22 +988,22 @@ void gte_execute(Gte *gte, uint32_t cmd)
         cmd_ncds(gte, cmd);
         break;
     case 0x14:
-        cmd_cc(gte, cmd);
+        cmd_cdp(gte, cmd);
         break;
     case 0x16:
-        cmd_ncs(gte, cmd);
+        cmd_ncdt(gte, cmd);
         break;
     case 0x1B:
         cmd_nccs(gte, cmd);
         break;
     case 0x1C:
-        cmd_dcpl(gte, cmd);
+        cmd_cc(gte, cmd);
         break;
     case 0x1E:
-        cmd_nct(gte, cmd);
+        cmd_ncs(gte, cmd);
         break;
     case 0x20:
-        cmd_sqr(gte, cmd);
+        cmd_nct(gte, cmd);
         break;
     case 0x28:
         cmd_sqr(gte, cmd);
@@ -967,9 +1031,6 @@ void gte_execute(Gte *gte, uint32_t cmd)
         break;
     case 0x3F:
         cmd_ncct(gte, cmd);
-        break;
-    case 0x17:
-        cmd_ncdt(gte, cmd);
         break;
     default:
         /* Unknown GTE command — silently ignore (don't abort) */

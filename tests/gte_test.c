@@ -89,6 +89,40 @@ static void test_rtps_divide_flag(void)
     printf("ok\n");
 }
 
+static void test_rtps_sf0_sz_shift(void)
+{
+    printf("test_rtps_sf0_sz_shift ... ");
+    Gte gte;
+    gte_init(&gte);
+
+    gte_write_ctrl(&gte, 4, 0x00001000); /* RT33 = 1.0 */
+    gte_write_ctrl(&gte, 26, 0x0100);    /* H */
+    gte_write_data(&gte, 1, 0x00001000); /* VZ0 */
+    gte_execute(&gte, 0x01);             /* RTPS, sf=0 */
+    EXPECT_EQ(gte_read_data(&gte, 19), 0x00001000u);
+    printf("ok\n");
+}
+
+static void test_lighting_opcode_dispatch(void)
+{
+    printf("test_lighting_opcode_dispatch ... ");
+    Gte gte;
+    gte_init(&gte);
+
+    gte_write_data(&gte, 20, 0x00111111);
+    gte_write_data(&gte, 21, 0x00222222);
+    gte_write_data(&gte, 22, 0x00333333);
+    gte_write_data(&gte, 9, 0x00000100);
+    gte_write_data(&gte, 10, 0x00000200);
+    gte_write_data(&gte, 11, 0x00000300);
+
+    gte_execute(&gte, 0x20); /* NCT: pushes three RGB entries */
+    EXPECT_EQ(gte_read_data(&gte, 20), 0x00000000u);
+    EXPECT_EQ(gte_read_data(&gte, 21), 0x00000000u);
+    EXPECT_EQ(gte_read_data(&gte, 22), 0x00000000u);
+    printf("ok\n");
+}
+
 int main(void)
 {
     printf("=== gte unit tests ===\n");
@@ -97,6 +131,8 @@ int main(void)
     test_flag_and_ctrl();
     test_nclip();
     test_rtps_divide_flag();
+    test_rtps_sf0_sz_shift();
+    test_lighting_opcode_dispatch();
     printf("======================\n");
     printf("pass: %d  fail: %d\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;

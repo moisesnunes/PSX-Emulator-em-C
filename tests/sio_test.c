@@ -15,6 +15,11 @@ bool log_is_enabled(LogSubsystem s)
     return false;
 }
 
+void irq_assert(Irq *irq, IrqFlag flag)
+{
+    irq->status |= (uint16_t)flag;
+}
+
 static int g_pass = 0;
 static int g_fail = 0;
 
@@ -93,6 +98,40 @@ static void test_digital_pad_pressed(void)
     printf("ok\n");
 }
 
+static void test_keyboard_and_controller_sources_merge(void)
+{
+    printf("test_keyboard_and_controller_sources_merge ... ");
+    Sio sio;
+    sio_init(&sio);
+
+    sio_on_key(&sio, SDL_SCANCODE_Z, true);
+    sio_set_button(&sio, SIO_PAD_CROSS, true);
+    EXPECT_EQ((sio.pad.buttons & SIO_PAD_CROSS), 0u);
+
+    sio_set_button(&sio, SIO_PAD_CROSS, false);
+    EXPECT_EQ((sio.pad.buttons & SIO_PAD_CROSS), 0u);
+
+    sio_on_key(&sio, SDL_SCANCODE_Z, false);
+    EXPECT_EQ((sio.pad.buttons & SIO_PAD_CROSS), (uint32_t)SIO_PAD_CROSS);
+    printf("ok\n");
+}
+
+static void test_forced_buttons_merge(void)
+{
+    printf("test_forced_buttons_merge ... ");
+    Sio sio;
+    sio_init(&sio);
+
+    sio_set_forced_state(&sio, SIO_PAD_START | SIO_PAD_CROSS);
+    EXPECT_EQ((sio.pad.buttons & SIO_PAD_START), 0u);
+    EXPECT_EQ((sio.pad.buttons & SIO_PAD_CROSS), 0u);
+
+    sio_set_forced_state(&sio, 0);
+    EXPECT_EQ((sio.pad.buttons & SIO_PAD_START), (uint32_t)SIO_PAD_START);
+    EXPECT_EQ((sio.pad.buttons & SIO_PAD_CROSS), (uint32_t)SIO_PAD_CROSS);
+    printf("ok\n");
+}
+
 static void test_slot2_no_device(void)
 {
     printf("test_slot2_no_device ... ");
@@ -102,6 +141,24 @@ static void test_slot2_no_device(void)
 
     EXPECT_EQ(exchange(&sio, 0x81), 0xFFu);
     EXPECT_EQ(exchange(&sio, 0x52), 0xFFu);
+    printf("ok\n");
+}
+
+static void test_unknown_pad_command_no_device(void)
+{
+    printf("test_unknown_pad_command_no_device ... ");
+    Sio sio;
+    sio_init(&sio);
+    select_slot(&sio, false);
+
+    EXPECT_EQ(exchange(&sio, 0x01), 0xFFu);
+    EXPECT_EQ(exchange(&sio, 0x43), 0xFFu);
+    EXPECT_EQ(exchange(&sio, 0x00), 0xFFu);
+    deselect(&sio);
+
+    select_slot(&sio, false);
+    EXPECT_EQ(exchange(&sio, 0x01), 0xFFu);
+    EXPECT_EQ(exchange(&sio, 0x42), 0x41u);
     printf("ok\n");
 }
 
@@ -142,14 +199,39 @@ static void test_memcard_command_no_ack(void)
     printf("ok\n");
 }
 
+static void test_pad_ack_irq(void)
+{
+    printf("test_pad_ack_irq ... ");
+    Sio sio;
+    Irq irq = {0};
+    sio_init(&sio);
+    select_slot(&sio, false);
+
+    exchange(&sio, 0x01);
+    EXPECT_EQ((irq.status & IRQ_SIO) != 0, 0u);
+    for (int i = 0; i < 5; i++)
+        sio_step(&sio, &irq);
+    EXPECT_EQ((irq.status & IRQ_SIO) != 0, 1u);
+    EXPECT_EQ((sio_load16(&sio, 0x04) & 0x0200u) != 0, 1u);
+
+    sio_store16(&sio, 0x0A, (uint16_t)(sio.ctrl | 0x0010u), &irq);
+    EXPECT_EQ(sio.irq_pending, 0u);
+    EXPECT_EQ((sio_load16(&sio, 0x04) & 0x0200u) != 0, 0u);
+    printf("ok\n");
+}
+
 int main(void)
 {
     printf("=== sio unit tests ===\n");
     test_digital_pad_released();
     test_digital_pad_pressed();
+    test_keyboard_and_controller_sources_merge();
+    test_forced_buttons_merge();
     test_slot2_no_device();
+    test_unknown_pad_command_no_device();
     test_memcard_command_no_device();
     test_memcard_command_no_ack();
+    test_pad_ack_irq();
     printf("======================\n");
     printf("pass: %d  fail: %d\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;

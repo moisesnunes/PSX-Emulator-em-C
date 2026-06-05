@@ -8,6 +8,24 @@
    Models a digital pad in slot 1 and "no device" in slot 2 (memory card). */
 
 /* Digital pad button bitmask — bit=0 means pressed (PS1 active-low). */
+enum
+{
+    SIO_PAD_SELECT = 1u << 0,
+    SIO_PAD_START = 1u << 3,
+    SIO_PAD_UP = 1u << 4,
+    SIO_PAD_RIGHT = 1u << 5,
+    SIO_PAD_DOWN = 1u << 6,
+    SIO_PAD_LEFT = 1u << 7,
+    SIO_PAD_L2 = 1u << 8,
+    SIO_PAD_R2 = 1u << 9,
+    SIO_PAD_L1 = 1u << 10,
+    SIO_PAD_R1 = 1u << 11,
+    SIO_PAD_TRIANGLE = 1u << 12,
+    SIO_PAD_CIRCLE = 1u << 13,
+    SIO_PAD_CROSS = 1u << 14,
+    SIO_PAD_SQUARE = 1u << 15,
+};
+
 typedef struct
 {
     uint16_t buttons; /* bit0=Select bit3=Start bit4=Up bit5=Right
@@ -33,7 +51,13 @@ typedef struct
     bool selected;
     bool slot2;
     bool memcard_access;
+    bool pad_access;
+    bool irq_pending;
+    uint8_t irq_timer;
 
+    uint16_t keyboard_buttons;
+    uint16_t controller_buttons;
+    uint16_t forced_buttons;
     PadState pad;
 } Sio;
 
@@ -42,6 +66,11 @@ uint8_t sio_load8(Sio *sio, uint32_t off);
 void sio_store8(Sio *sio, uint32_t off, uint8_t val, Irq *irq);
 uint16_t sio_load16(Sio *sio, uint32_t off);
 void sio_store16(Sio *sio, uint32_t off, uint16_t val, Irq *irq);
+void sio_step(Sio *sio, Irq *irq);
+
+void sio_set_button(Sio *sio, uint16_t mask, bool pressed);
+void sio_set_controller_state(Sio *sio, uint16_t pressed_mask);
+void sio_set_forced_state(Sio *sio, uint16_t pressed_mask);
 
 /* Called by main.c on every SDL keyboard event. */
 void sio_on_key(Sio *sio, SDL_Scancode sc, bool pressed);

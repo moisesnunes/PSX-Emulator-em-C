@@ -7,6 +7,7 @@
 #define STAT_RX_AVAIL (1u << 1) /* RX FIFO has data */
 #define STAT_TX_IDLE (1u << 2)  /* TX finished — always idle */
 #define STAT_ACK (1u << 7)      /* /ACK from device (active-low; 0=ack) */
+#define STAT_IRQ (1u << 9)      /* SIO interrupt pending */
 
 /* CTRL register bits */
 #define CTRL_TX_EN (1u << 0)
@@ -25,22 +26,29 @@ static const struct
     SDL_Scancode sc;
     uint16_t mask;
 } KEY_MAP[] = {
-    {SDL_SCANCODE_UP, 1 << 4},     /* D-pad Up    */
-    {SDL_SCANCODE_DOWN, 1 << 6},   /* D-pad Down  */
-    {SDL_SCANCODE_LEFT, 1 << 7},   /* D-pad Left  */
-    {SDL_SCANCODE_RIGHT, 1 << 5},  /* D-pad Right */
-    {SDL_SCANCODE_RETURN, 1 << 3}, /* Start       */
-    {SDL_SCANCODE_RSHIFT, 1 << 0}, /* Select      */
-    {SDL_SCANCODE_Z, 1 << 14},     /* Cross       */
-    {SDL_SCANCODE_X, 1 << 13},     /* Circle      */
-    {SDL_SCANCODE_A, 1 << 15},     /* Square      */
-    {SDL_SCANCODE_S, 1 << 12},     /* Triangle    */
-    {SDL_SCANCODE_Q, 1 << 10},     /* L1          */
-    {SDL_SCANCODE_W, 1 << 11},     /* R1          */
-    {SDL_SCANCODE_1, 1 << 8},      /* L2          */
-    {SDL_SCANCODE_2, 1 << 9},      /* R2          */
+    {SDL_SCANCODE_UP, SIO_PAD_UP},
+    {SDL_SCANCODE_DOWN, SIO_PAD_DOWN},
+    {SDL_SCANCODE_LEFT, SIO_PAD_LEFT},
+    {SDL_SCANCODE_RIGHT, SIO_PAD_RIGHT},
+    {SDL_SCANCODE_RETURN, SIO_PAD_START},
+    {SDL_SCANCODE_RSHIFT, SIO_PAD_SELECT},
+    {SDL_SCANCODE_Z, SIO_PAD_CROSS},
+    {SDL_SCANCODE_X, SIO_PAD_CIRCLE},
+    {SDL_SCANCODE_A, SIO_PAD_SQUARE},
+    {SDL_SCANCODE_S, SIO_PAD_TRIANGLE},
+    {SDL_SCANCODE_Q, SIO_PAD_L1},
+    {SDL_SCANCODE_W, SIO_PAD_R1},
+    {SDL_SCANCODE_1, SIO_PAD_L2},
+    {SDL_SCANCODE_2, SIO_PAD_R2},
 };
 #define KEY_MAP_SIZE (sizeof(KEY_MAP) / sizeof(KEY_MAP[0]))
+
+static void refresh_pad_buttons(Sio *sio)
+{
+    sio->pad.buttons = (uint16_t)~(sio->keyboard_buttons |
+                                   sio->controller_buttons |
+                                   sio->forced_buttons);
+}
 
 static uint8_t pad_response_byte(const Sio *sio, uint8_t index)
 {
@@ -71,6 +79,12 @@ static void reset_transaction(Sio *sio)
     sio->selected = false;
     sio->slot2 = false;
     sio->memcard_access = false;
+    sio->pad_access = false;
+}
+
+static void schedule_ack_irq(Sio *sio)
+{
+    sio->irq_timer = 5;
 }
 
 static uint32_t build_stat(const Sio *sio)
@@ -82,13 +96,15 @@ static uint32_t build_stat(const Sio *sio)
     bool device_selected = sio->selected && !sio->slot2 && !sio->memcard_access;
     if (!device_selected || sio->rx_pos >= sio->rx_len)
         s |= STAT_ACK; /* no ACK (bit=1 means not asserted) */
+    if (sio->irq_pending)
+        s |= STAT_IRQ;
     return s;
 }
 
 void sio_init(Sio *sio)
 {
     memset(sio, 0, sizeof(*sio));
-    sio->pad.buttons = 0xFFFF; /* all buttons released */
+    refresh_pad_buttons(sio);
     sio->stat = STAT_TX_READY | STAT_TX_IDLE | STAT_ACK;
     sio->baud = 0x0088; /* typical BIOS init value */
 }
@@ -125,12 +141,22 @@ void sio_store8(Sio *sio, uint32_t off, uint8_t val, Irq *irq)
         if (sio->rx_pos >= sio->rx_len)
             sio->rx_pos = sio->rx_len = 0;
         if (sio->tx_count == 0)
+        {
             sio->memcard_access = val == 0x81;
+            sio->pad_access = val == 0x01;
+        }
+        else if (sio->tx_count == 1 && sio->pad_access)
+        {
+            sio->pad_access = val == 0x42;
+        }
         if (sio->rx_len < sizeof(sio->rx_buf))
         {
-            bool no_device = !sio->selected || sio->slot2 || sio->memcard_access;
+            bool no_device = !sio->selected || sio->slot2 || sio->memcard_access ||
+                             (sio->tx_count > 0 && !sio->pad_access);
             sio->rx_buf[sio->rx_len++] =
                 no_device ? 0xFF : pad_response_byte(sio, sio->tx_count);
+            if (!no_device && sio->tx_count < 4)
+                schedule_ack_irq(sio);
         }
         sio->tx_count++;
         sio->stat = build_stat(sio);
@@ -178,7 +204,14 @@ void sio_store16(Sio *sio, uint32_t off, uint16_t val, Irq *irq)
         if (val & CTRL_RESET)
         {
             reset_transaction(sio);
+            sio->irq_pending = false;
+            sio->irq_timer = 0;
             sio->ctrl = 0;
+        }
+        else if (val & CTRL_ACK_RESET)
+        {
+            sio->irq_pending = false;
+            sio->stat = build_stat(sio);
         }
         else if (val & CTRL_SELECT)
         {
@@ -192,6 +225,7 @@ void sio_store16(Sio *sio, uint32_t off, uint16_t val, Irq *irq)
                 sio->rx_len = 0;
                 sio->rx_pos = 0;
                 sio->memcard_access = false;
+                sio->pad_access = false;
             }
         }
         else if (!(val & CTRL_SELECT) && sio->selected)
@@ -210,6 +244,42 @@ void sio_store16(Sio *sio, uint32_t off, uint16_t val, Irq *irq)
     }
 }
 
+void sio_step(Sio *sio, Irq *irq)
+{
+    if (sio->irq_timer > 0)
+    {
+        sio->irq_timer--;
+        if (sio->irq_timer == 0)
+        {
+            sio->irq_pending = true;
+            sio->stat = build_stat(sio);
+        }
+    }
+    if (sio->irq_pending)
+        irq_assert(irq, IRQ_SIO);
+}
+
+void sio_set_button(Sio *sio, uint16_t mask, bool pressed)
+{
+    if (pressed)
+        sio->controller_buttons |= mask;
+    else
+        sio->controller_buttons &= (uint16_t)~mask;
+    refresh_pad_buttons(sio);
+}
+
+void sio_set_controller_state(Sio *sio, uint16_t pressed_mask)
+{
+    sio->controller_buttons = pressed_mask;
+    refresh_pad_buttons(sio);
+}
+
+void sio_set_forced_state(Sio *sio, uint16_t pressed_mask)
+{
+    sio->forced_buttons = pressed_mask;
+    refresh_pad_buttons(sio);
+}
+
 void sio_on_key(Sio *sio, SDL_Scancode sc, bool pressed)
 {
     for (size_t i = 0; i < KEY_MAP_SIZE; i++)
@@ -217,9 +287,10 @@ void sio_on_key(Sio *sio, SDL_Scancode sc, bool pressed)
         if (KEY_MAP[i].sc == sc)
         {
             if (pressed)
-                sio->pad.buttons &= ~KEY_MAP[i].mask; /* active-low */
+                sio->keyboard_buttons |= KEY_MAP[i].mask;
             else
-                sio->pad.buttons |= KEY_MAP[i].mask;
+                sio->keyboard_buttons &= (uint16_t)~KEY_MAP[i].mask;
+            refresh_pad_buttons(sio);
             return;
         }
     }
