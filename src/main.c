@@ -172,6 +172,109 @@ static void input_controller_handle_axis(InputController *ctl, Sio *sio,
     input_controller_apply(ctl, sio);
 }
 
+static void input_controller_poll_state(InputController *ctl, Sio *sio)
+{
+    if (!ctl->pad)
+        return;
+
+    uint16_t buttons = 0;
+    for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX; b++)
+    {
+        if (SDL_GameControllerGetButton(ctl->pad, (SDL_GameControllerButton)b))
+            buttons |= input_controller_button_mask((SDL_GameControllerButton)b);
+    }
+
+    uint16_t axes = 0;
+    const int16_t deadzone = 12000;
+    int16_t lx = SDL_GameControllerGetAxis(ctl->pad, SDL_CONTROLLER_AXIS_LEFTX);
+    int16_t ly = SDL_GameControllerGetAxis(ctl->pad, SDL_CONTROLLER_AXIS_LEFTY);
+    int16_t lt = SDL_GameControllerGetAxis(ctl->pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+    int16_t rt = SDL_GameControllerGetAxis(ctl->pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+
+    if (lx <= -deadzone)
+        axes |= SIO_PAD_LEFT;
+    else if (lx >= deadzone)
+        axes |= SIO_PAD_RIGHT;
+    if (ly <= -deadzone)
+        axes |= SIO_PAD_UP;
+    else if (ly >= deadzone)
+        axes |= SIO_PAD_DOWN;
+    if (lt >= deadzone)
+        axes |= SIO_PAD_L2;
+    if (rt >= deadzone)
+        axes |= SIO_PAD_R2;
+
+    ctl->button_state = buttons;
+    ctl->axis_state = axes;
+    input_controller_apply(ctl, sio);
+}
+
+static bool process_sdl_events(Cpu *cpu, InputController *input_ctl)
+{
+    SDL_Event event;
+    while (SDL_PollEvent(&event))
+    {
+        if (event.type == SDL_QUIT)
+            return false;
+        if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP)
+            sio_on_key(&cpu->inter.sio, event.key.keysym.scancode,
+                       event.type == SDL_KEYDOWN);
+        else if (event.type == SDL_CONTROLLERDEVICEADDED)
+        {
+            input_controller_open_first(input_ctl);
+            input_controller_apply(input_ctl, &cpu->inter.sio);
+        }
+        else if (event.type == SDL_CONTROLLERDEVICEREMOVED)
+        {
+            if (input_ctl->pad && input_ctl->instance_id == event.cdevice.which)
+            {
+                input_controller_close(input_ctl);
+                input_controller_apply(input_ctl, &cpu->inter.sio);
+                input_controller_open_first(input_ctl);
+            }
+        }
+        else if (event.type == SDL_CONTROLLERBUTTONDOWN ||
+                 event.type == SDL_CONTROLLERBUTTONUP)
+        {
+            if (input_ctl->pad && input_ctl->instance_id == event.cbutton.which)
+                input_controller_handle_button(input_ctl, &cpu->inter.sio,
+                                               (SDL_GameControllerButton)event.cbutton.button,
+                                               event.type == SDL_CONTROLLERBUTTONDOWN);
+        }
+        else if (event.type == SDL_CONTROLLERAXISMOTION)
+        {
+            if (input_ctl->pad && input_ctl->instance_id == event.caxis.which)
+                input_controller_handle_axis(input_ctl, &cpu->inter.sio,
+                                             (SDL_GameControllerAxis)event.caxis.axis,
+                                             event.caxis.value);
+        }
+    }
+
+    input_controller_poll_state(input_ctl, &cpu->inter.sio);
+    return true;
+}
+
+static bool sleep_until_frame_deadline(Cpu *cpu, InputController *input_ctl,
+                                       uint64_t deadline)
+{
+    for (;;)
+    {
+        uint64_t now = now_nanos();
+        if (now >= deadline)
+            return true;
+
+        if (!process_sdl_events(cpu, input_ctl))
+            return false;
+
+        uint64_t wait_ns = deadline - now;
+        if (wait_ns > 1000000ULL)
+            wait_ns = 1000000ULL;
+        struct timespec ts = {(time_t)(wait_ns / 1000000000ULL),
+                              (long)(wait_ns % 1000000000ULL)};
+        nanosleep(&ts, NULL);
+    }
+}
+
 static uint16_t input_button_name_mask(const char *name)
 {
     if (strcasecmp(name, "SELECT") == 0)
@@ -283,6 +386,7 @@ static void advance_system_quantum(Cpu *cpu)
 
     timers_step(&cpu->inter.timers, SYSTEM_CYCLE_QUANTUM, &cpu->inter.irq, &cpu->inter.scheduler);
     sio_step(&cpu->inter.sio, &cpu->inter.irq);
+    spu_step(&cpu->inter.spu, SYSTEM_CYCLE_QUANTUM);
 
     if (gpu_step(&cpu->inter.gpu, SYSTEM_CYCLE_QUANTUM))
     {
@@ -612,106 +716,58 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Run ~564k cycles per frame (33.868MHz / 60Hz), poll SDL once per frame. */
-    const uint32_t CYCLES_PER_FRAME = 33868800U / 60U;
     const uint32_t CPU_CYCLE_QUANTUM = 100;
-    const uint32_t SYSTEM_CYCLE_QUANTUM = 300;
+    const uint32_t INPUT_POLL_CYCLES = 3000;
     const uint64_t FRAME_NS = 1000000000ULL / 60ULL;
-    const uint64_t SPU_INTERVAL = 1000000000ULL / 44100ULL;
+    const uint64_t MAX_FRAME_LAG_NS = FRAME_NS * 5ULL;
     uint64_t frame_deadline = now_nanos() + FRAME_NS;
-    uint64_t spu_now = now_nanos();
-    uint64_t spu_acc = 0;
+    uint32_t cpu_quantum_cycles = 0;
 
     for (;;)
     {
-        /* Run one full frame's worth of CPU cycles before polling SDL. */
-        uint32_t frame_cycles = 0;
-        uint32_t cpu_quantum_cycles = 0;
-        while (frame_cycles < CYCLES_PER_FRAME)
+        uint32_t frame_start = cpu->inter.gpu.frames;
+        uint32_t input_poll_cycles = 0;
+
+        if (!process_sdl_events(cpu, &input_ctl))
+            break;
+
+        /* Run in small slices until the GPU produces the next VBlank.  This
+           keeps SDL input fresh and avoids pacing against a second frame clock. */
+        while (cpu->inter.gpu.frames == frame_start)
         {
             uint32_t cycles = cpu_run_next_instruction(cpu);
             cpu_quantum_cycles += cycles;
+            input_poll_cycles += cycles;
             while (cpu_quantum_cycles >= CPU_CYCLE_QUANTUM)
             {
                 advance_system_quantum(cpu);
-                frame_cycles += SYSTEM_CYCLE_QUANTUM;
                 cpu_quantum_cycles -= CPU_CYCLE_QUANTUM;
             }
-        }
 
-        /* SPU clock — catch up for this frame */
-        {
-            uint64_t now = now_nanos();
-            spu_acc += now - spu_now;
-            spu_now = now;
-            while (spu_acc >= SPU_INTERVAL)
+            if (input_poll_cycles >= INPUT_POLL_CYCLES)
             {
-                spu_acc -= SPU_INTERVAL;
-                spu_clock(&cpu->inter.spu);
+                input_poll_cycles = 0;
+                if (!process_sdl_events(cpu, &input_ctl))
+                    goto quit_normal_loop;
             }
         }
 
-        /* SDL events */
-        SDL_Event event;
-        while (SDL_PollEvent(&event))
-        {
-            if (event.type == SDL_QUIT)
-            {
-                cpu_destroy(cpu);
-                free(cpu);
-                input_controller_close(&input_ctl);
-                SDL_DestroyWindow(window);
-                SDL_Quit();
-                return 0;
-            }
-            if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP)
-                sio_on_key(&cpu->inter.sio, event.key.keysym.scancode,
-                           event.type == SDL_KEYDOWN);
-            else if (event.type == SDL_CONTROLLERDEVICEADDED)
-            {
-                input_controller_open_first(&input_ctl);
-                input_controller_apply(&input_ctl, &cpu->inter.sio);
-            }
-            else if (event.type == SDL_CONTROLLERDEVICEREMOVED)
-            {
-                if (input_ctl.pad && input_ctl.instance_id == event.cdevice.which)
-                {
-                    input_controller_close(&input_ctl);
-                    input_controller_apply(&input_ctl, &cpu->inter.sio);
-                    input_controller_open_first(&input_ctl);
-                }
-            }
-            else if (event.type == SDL_CONTROLLERBUTTONDOWN ||
-                     event.type == SDL_CONTROLLERBUTTONUP)
-            {
-                if (input_ctl.pad && input_ctl.instance_id == event.cbutton.which)
-                    input_controller_handle_button(&input_ctl, &cpu->inter.sio,
-                                                   (SDL_GameControllerButton)event.cbutton.button,
-                                                   event.type == SDL_CONTROLLERBUTTONDOWN);
-            }
-            else if (event.type == SDL_CONTROLLERAXISMOTION)
-            {
-                if (input_ctl.pad && input_ctl.instance_id == event.caxis.which)
-                    input_controller_handle_axis(&input_ctl, &cpu->inter.sio,
-                                                 (SDL_GameControllerAxis)event.caxis.axis,
-                                                 event.caxis.value);
-            }
-        }
+        if (!process_sdl_events(cpu, &input_ctl))
+            break;
 
-        /* Sleep until next frame deadline to cap at 60 Hz */
-        {
-            uint64_t now = now_nanos();
-            if (now < frame_deadline)
-            {
-                uint64_t wait_ns = frame_deadline - now;
-                struct timespec ts = {(time_t)(wait_ns / 1000000000ULL),
-                                      (long)(wait_ns % 1000000000ULL)};
-                nanosleep(&ts, NULL);
-            }
-            frame_deadline += FRAME_NS;
-            now = now_nanos();
-            if (now > frame_deadline)
-                frame_deadline = now + FRAME_NS;
-        }
+        if (!sleep_until_frame_deadline(cpu, &input_ctl, frame_deadline))
+            break;
+        frame_deadline += FRAME_NS;
+        uint64_t now = now_nanos();
+        if (now > frame_deadline + MAX_FRAME_LAG_NS)
+            frame_deadline = now + FRAME_NS;
     }
+
+quit_normal_loop:
+    cpu_destroy(cpu);
+    free(cpu);
+    input_controller_close(&input_ctl);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 0;
 }

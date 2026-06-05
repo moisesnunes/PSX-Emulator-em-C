@@ -7,6 +7,7 @@
 #define NUM_VOICES 24
 #define FIR_LEN 39
 #define SPU_REG_WORDS (0x280 / 2)
+#define SPU_CD_AUDIO_BUFFER_FRAMES 44100
 
 typedef enum
 {
@@ -70,6 +71,12 @@ typedef struct
 {
     Voice voices[NUM_VOICES];
     SDL_AudioDeviceID device;
+    uint32_t sample_cycle_accum;
+    int16_t cd_audio_l[SPU_CD_AUDIO_BUFFER_FRAMES];
+    int16_t cd_audio_r[SPU_CD_AUDIO_BUFFER_FRAMES];
+    uint32_t cd_audio_head;
+    uint32_t cd_audio_tail;
+    uint32_t cd_audio_count;
 
     uint16_t regs[SPU_REG_WORDS];
     uint8_t sound_ram[SOUND_RAM_SIZE];
@@ -100,10 +107,13 @@ typedef struct
     FirBuf far_input_r;
 } Spu;
 
-int spu_init(Spu *spu);
+int spu_init(Spu *spu, bool enable_audio);
 uint16_t spu_load(const Spu *spu, uint32_t abs_addr, uint32_t offset);
 void spu_store(Spu *spu, uint32_t abs_addr, uint32_t offset, uint16_t val);
 void spu_clock(Spu *spu);
+void spu_step(Spu *spu, uint32_t cpu_cycles);
+void spu_push_cd_audio_frame(Spu *spu, int16_t left, int16_t right);
+void spu_clear_cd_audio(Spu *spu);
 void spu_destroy(Spu *spu);
 /* DMA channel 4 (RAM→SPU): writes one 32-bit word (two 16-bit samples) to sound RAM. */
 void spu_dma_write(Spu *spu, uint32_t word);

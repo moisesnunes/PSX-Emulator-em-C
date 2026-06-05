@@ -554,6 +554,81 @@ static void test_overlap_cmd_during_readn(void)
     printf("ok\n");
 }
 
+static void test_audio_controls(void)
+{
+    printf("test_audio_controls ... ");
+    Cdrom cd;
+    Irq irq;
+    Scheduler sched;
+    Disc disc;
+    setup(&cd, &irq, &sched, &disc);
+
+    push_param(&cd, 0xC9, &irq, &sched);
+    send_cmd(&cd, 0x0E, &irq, &sched); /* Setmode: CD-DA, XA filter, XA ADPCM, 2x */
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+    EXPECT_TRUE(cd.cdda_en);
+    EXPECT_TRUE(cd.xa_filter_en);
+    EXPECT_TRUE(cd.xa_adpcm_en);
+    EXPECT_TRUE(cd.double_speed);
+    ack_cdrom_irq(&cd, &irq, &sched);
+
+    push_param(&cd, 7, &irq, &sched);
+    push_param(&cd, 3, &irq, &sched);
+    send_cmd(&cd, 0x0D, &irq, &sched); /* Setfilter */
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+    EXPECT_EQ(cd.xa_filter_file, 7u);
+    EXPECT_EQ(cd.xa_filter_channel, 3u);
+    ack_cdrom_irq(&cd, &irq, &sched);
+
+    send_cmd(&cd, 0x0B, &irq, &sched); /* Mute */
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+    EXPECT_TRUE(cd.muted);
+    ack_cdrom_irq(&cd, &irq, &sched);
+
+    send_cmd(&cd, 0x0C, &irq, &sched); /* Demute */
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+    EXPECT_TRUE(!cd.muted);
+    ack_cdrom_irq(&cd, &irq, &sched);
+
+    reg_write(&cd, 0, 2, &irq, &sched);
+    reg_write(&cd, 2, 0x40, &irq, &sched); /* left CD -> left SPU */
+    reg_write(&cd, 3, 0x20, &irq, &sched); /* left CD -> right SPU */
+    reg_write(&cd, 0, 3, &irq, &sched);
+    reg_write(&cd, 1, 0x30, &irq, &sched); /* right CD -> right SPU */
+    reg_write(&cd, 2, 0x10, &irq, &sched); /* right CD -> left SPU */
+    reg_write(&cd, 3, 0x20, &irq, &sched); /* apply volume */
+    EXPECT_EQ(cd.cd_audio_volume[0][0], 0x40u);
+    EXPECT_EQ(cd.cd_audio_volume[0][1], 0x20u);
+    EXPECT_EQ(cd.cd_audio_volume[1][0], 0x10u);
+    EXPECT_EQ(cd.cd_audio_volume[1][1], 0x30u);
+    printf("ok\n");
+}
+
+static void test_play_cdda_pushes_audio(void)
+{
+    printf("test_play_cdda_pushes_audio ... ");
+    Cdrom cd;
+    Irq irq;
+    Scheduler sched;
+    Disc disc;
+    Spu spu;
+    setup(&cd, &irq, &sched, &disc);
+    spu_init(&spu, false);
+    cdrom_set_spu(&cd, &spu);
+
+    send_cmd(&cd, 0x03, &irq, &sched); /* Play */
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+    EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT3);
+    ack_cdrom_irq(&cd, &irq, &sched);
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+
+    EXPECT_TRUE(cd.playing_cdda);
+    EXPECT_TRUE(cd.cdda_en);
+    EXPECT_TRUE(spu.cd_audio_count > 0u);
+    EXPECT_EQ(cd.data_len, 0u);
+    printf("ok\n");
+}
+
 /* =========================================================================
  * Main
  * ========================================================================= */
@@ -569,6 +644,8 @@ int main(void)
     test_readtoc();
     test_deferred_seekl_readn();
     test_overlap_cmd_during_readn();
+    test_audio_controls();
+    test_play_cdda_pushes_audio();
     printf("========================\n");
     printf("pass: %d  fail: %d\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;

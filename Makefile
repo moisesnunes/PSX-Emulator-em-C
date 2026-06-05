@@ -40,7 +40,7 @@ PSX_TEST_ARGS ?=
         run-psxtest-cpx run-psxtest-gte debug smoke test-cdrom test-sio test-gte test-dma \
         test-psx-list test-psx-all test-psx-cdrom test-psx-cpu test-psx-dma \
         test-psx-gpu test-psx-gte test-psx-gte-fuzz test-psx-input \
-        test-psx-mdec test-psx-spu test-psx-timer-dump test-psx-timers \
+        test-psx-mdec test-psx-spu test-spu test-psx-timer-dump test-psx-timers \
         test-psx-psxtest-cpu test-psx-psxtest-cpx test-psx-psxtest-gpu \
         test-psx-psxtest-gte test-psx-resolution test-psx-extras
 
@@ -99,9 +99,10 @@ debug: $(DEBUG_OBJS)
 smoke: $(TARGET)
 	./$(TARGET) --bios $(BIOS_PATH) --headless --max-instructions 500000
 
-test-cdrom: src/cdrom.c tests/cdrom_test.c
-	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
-	    tests/cdrom_test.c src/cdrom.c \
+test-cdrom: src/cdrom.c src/spu.c tests/cdrom_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc $(shell sdl2-config --cflags) \
+	    tests/cdrom_test.c src/cdrom.c src/spu.c \
+	    $(shell sdl2-config --libs) \
 	    -o tests/cdrom_test
 	./tests/cdrom_test
 
@@ -122,6 +123,13 @@ test-dma: src/dma.c src/channel.c tests/dma_test.c
 	    tests/dma_test.c src/dma.c src/channel.c src/irq.c \
 	    -o tests/dma_test
 	./tests/dma_test
+
+test-spu: src/spu.c tests/spu_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc $(shell sdl2-config --cflags) \
+	    tests/spu_test.c src/spu.c \
+	    $(shell sdl2-config --libs) \
+	    -o tests/spu_test
+	./tests/spu_test
 
 test-psx-list:
 	$(PSX_TEST_RUNNER) --list $(PSX_TEST_ARGS)
@@ -183,4 +191,4 @@ test-psx-extras: $(TARGET)
 	    --keep-going $(PSX_TEST_ARGS)
 
 clean:
-	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cdrom_test tests/sio_test tests/gte_test tests/dma_test
+	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cdrom_test tests/sio_test tests/gte_test tests/dma_test tests/spu_test

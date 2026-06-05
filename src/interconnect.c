@@ -627,7 +627,7 @@ int interconnect_init(Interconnect *inter, const char *bios_path, SDL_Window *wi
     dma_init(&inter->dma);
     gpu_init(&inter->gpu, window);
     mdec_init(&inter->mdec);
-    if (!headless && spu_init(&inter->spu) != 0)
+    if (spu_init(&inter->spu, !headless) != 0)
         return -1;
     irq_init(&inter->irq);
     scheduler_init(&inter->scheduler);
@@ -641,6 +641,7 @@ int interconnect_init(Interconnect *inter, const char *bios_path, SDL_Window *wi
             fprintf(stderr, "Warning: could not open disc '%s'\n", disc_path);
     }
     cdrom_init(&inter->cdrom, inter->disc_loaded ? &inter->disc : NULL);
+    cdrom_set_spu(&inter->cdrom, &inter->spu);
     sio_init(&inter->sio);
     return 0;
 }

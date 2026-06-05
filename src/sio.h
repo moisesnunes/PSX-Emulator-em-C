@@ -52,6 +52,7 @@ typedef struct
     bool slot2;
     bool memcard_access;
     bool pad_access;
+    bool ack_active;
     bool irq_pending;
     uint8_t irq_timer;
 

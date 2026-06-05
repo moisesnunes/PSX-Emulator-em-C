@@ -3,6 +3,7 @@
 #include "irq.h"
 #include "scheduler.h"
 #include "ram.h"
+#include "spu.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -94,9 +95,23 @@ typedef struct
     CdromState state;
     bool double_speed;
     bool xa_adpcm_en;
+    bool xa_filter_en;
     bool report_mode;
     bool auto_pause;
+    bool cdda_en;
+    bool playing_cdda;
+    bool muted;
+    bool adpcm_muted;
     uint8_t mode; /* raw setmode byte */
+    uint8_t xa_filter_file;
+    uint8_t xa_filter_channel;
+    bool xa_current_set;
+    uint8_t xa_current_file;
+    uint8_t xa_current_channel;
+    int32_t xa_last_samples[4];
+    uint32_t xa_resample_accum;
+    uint8_t cd_audio_volume[2][2];
+    uint8_t next_cd_audio_volume[2][2];
 
     /* ---- Seek target (from Setloc) ---- */
     Msf seek_target;
@@ -107,12 +122,14 @@ typedef struct
 
     /* ---- Disc image (may be NULL = no disc) ---- */
     Disc *disc;
+    Spu *spu;
 
     /* ---- Sector buffer (filled by ReadN) ---- */
     uint8_t sector_buf[DISC_SECTOR_SIZE];
 } Cdrom;
 
 void cdrom_init(Cdrom *cd, Disc *disc);
+void cdrom_set_spu(Cdrom *cd, Spu *spu);
 uint8_t cdrom_load8(Cdrom *cd, uint32_t offset);
 void cdrom_store8(Cdrom *cd, uint32_t offset, uint8_t val,
                   Irq *irq, Scheduler *sched);

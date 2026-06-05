@@ -13,6 +13,26 @@
 /* SeekL completes after a nominal seek time (~20 ms) */
 #define CDROM_SEEK_DELAY (PS1_CPU_HZ / 50)
 
+#define XA_SECTOR_SUBHEADER_OFFSET 16u
+#define XA_SECTOR_DATA_OFFSET 24u
+#define XA_CHUNKS_PER_SECTOR 18u
+#define XA_CHUNK_SIZE 128u
+#define XA_WORDS_PER_CHUNK 28u
+
+static int16_t clamp16_cdrom(int32_t v)
+{
+    if (v < -0x8000)
+        return -0x8000;
+    if (v > 0x7FFF)
+        return 0x7FFF;
+    return (int16_t)v;
+}
+
+static int16_t le_i16(const uint8_t *p)
+{
+    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
 /* ---- FIFO helpers ---- */
 static void resp_clear(Cdrom *cd)
 {
@@ -44,7 +64,164 @@ static uint8_t make_stat(const Cdrom *cd)
         s |= 0x20; /* reading  */
     if (cd->state == CDROM_STATE_SEEKING)
         s |= 0x40; /* seeking  */
+    if (cd->playing_cdda)
+        s |= 0x80; /* playing CD-DA */
     return s;
+}
+
+static void reset_xa_stream(Cdrom *cd)
+{
+    cd->xa_current_set = false;
+    cd->xa_current_file = 0;
+    cd->xa_current_channel = 0;
+    memset(cd->xa_last_samples, 0, sizeof(cd->xa_last_samples));
+    cd->xa_resample_accum = 0;
+    if (cd->spu)
+        spu_clear_cd_audio(cd->spu);
+}
+
+static int16_t cd_apply_volume(int16_t sample, uint8_t volume)
+{
+    return clamp16_cdrom(((int32_t)sample * (int32_t)volume) >> 7);
+}
+
+static void cd_push_audio_frame(Cdrom *cd, int16_t left, int16_t right)
+{
+    if (!cd->spu || cd->muted || cd->adpcm_muted)
+        return;
+
+    int32_t out_l = cd_apply_volume(left, cd->cd_audio_volume[0][0]) +
+                    cd_apply_volume(right, cd->cd_audio_volume[1][0]);
+    int32_t out_r = cd_apply_volume(left, cd->cd_audio_volume[0][1]) +
+                    cd_apply_volume(right, cd->cd_audio_volume[1][1]);
+    spu_push_cd_audio_frame(cd->spu, clamp16_cdrom(out_l), clamp16_cdrom(out_r));
+}
+
+static void cd_push_resampled_frame(Cdrom *cd, int16_t left, int16_t right, uint32_t source_rate)
+{
+    cd->xa_resample_accum += 44100u;
+    while (cd->xa_resample_accum >= source_rate)
+    {
+        cd->xa_resample_accum -= source_rate;
+        cd_push_audio_frame(cd, left, right);
+    }
+}
+
+static bool xa_sector_is_audio(const uint8_t raw[DISC_SECTOR_SIZE])
+{
+    uint8_t submode = raw[XA_SECTOR_SUBHEADER_OFFSET + 2u];
+    uint8_t coding = raw[XA_SECTOR_SUBHEADER_OFFSET + 3u];
+    return (submode & 0x04u) != 0 && (submode & 0x20u) != 0 &&
+           (coding & 0x03u) == 0;
+}
+
+static void decode_xa_sector(Cdrom *cd, const uint8_t raw[DISC_SECTOR_SIZE])
+{
+    if (!cd->xa_adpcm_en || !xa_sector_is_audio(raw))
+        return;
+
+    uint8_t file = raw[XA_SECTOR_SUBHEADER_OFFSET + 0u];
+    uint8_t channel = raw[XA_SECTOR_SUBHEADER_OFFSET + 1u];
+    uint8_t submode = raw[XA_SECTOR_SUBHEADER_OFFSET + 2u];
+    uint8_t coding = raw[XA_SECTOR_SUBHEADER_OFFSET + 3u];
+
+    if (cd->xa_filter_en &&
+        (file != cd->xa_filter_file || channel != cd->xa_filter_channel))
+        return;
+    if (channel == 0xFFu && (!cd->xa_filter_en || cd->xa_filter_channel != 0xFFu))
+        return;
+
+    if (!cd->xa_current_set)
+    {
+        cd->xa_current_set = true;
+        cd->xa_current_file = file;
+        cd->xa_current_channel = channel;
+    }
+    else if (file != cd->xa_current_file || channel != cd->xa_current_channel)
+    {
+        return;
+    }
+
+    bool stereo = (coding & 0x01u) != 0;
+    bool half_rate = (coding & 0x04u) != 0;
+    bool eight_bit = (coding & 0x10u) != 0;
+    uint32_t source_rate = half_rate ? 18900u : 37800u;
+    uint32_t blocks = eight_bit ? 4u : 8u;
+    static const int8_t filter_pos[16] = {0, 60, 115, 98};
+    static const int8_t filter_neg[16] = {0, 0, -52, -55};
+
+    const uint8_t *chunk = raw + XA_SECTOR_DATA_OFFSET;
+    for (uint32_t ci = 0; ci < XA_CHUNKS_PER_SECTOR; ci++, chunk += XA_CHUNK_SIZE)
+    {
+        const uint8_t *headers = chunk + 4u;
+        const uint8_t *words = chunk + 16u;
+        int16_t decoded[8][XA_WORDS_PER_CHUNK];
+
+        for (uint32_t block = 0; block < blocks; block++)
+        {
+            uint8_t header = headers[block];
+            uint8_t shift = header & 0x0Fu;
+            uint8_t filter = (header >> 4) & 0x0Fu;
+            if (shift > 12)
+                shift = 9;
+            int32_t fp = filter_pos[filter];
+            int32_t fn = filter_neg[filter];
+            int32_t *prev = stereo ? &cd->xa_last_samples[(block & 1u) * 2u]
+                                   : &cd->xa_last_samples[0];
+
+            for (uint32_t word = 0; word < XA_WORDS_PER_CHUNK; word++)
+            {
+                uint32_t word_data = (uint32_t)words[word * 4u + 0u] |
+                                     ((uint32_t)words[word * 4u + 1u] << 8) |
+                                     ((uint32_t)words[word * 4u + 2u] << 16) |
+                                     ((uint32_t)words[word * 4u + 3u] << 24);
+                int32_t sample;
+                if (eight_bit)
+                {
+                    uint8_t b = (uint8_t)((word_data >> (block * 8u)) & 0xFFu);
+                    sample = ((int16_t)((uint16_t)b << 8)) >> shift;
+                }
+                else
+                {
+                    uint8_t nibble = (uint8_t)((word_data >> (block * 4u)) & 0x0Fu);
+                    sample = ((int16_t)((uint16_t)nibble << 12)) >> shift;
+                }
+                sample += (prev[0] * fp) >> 6;
+                sample += (prev[1] * fn) >> 6;
+                sample = clamp16_cdrom(sample);
+                prev[1] = prev[0];
+                prev[0] = sample;
+                decoded[block][word] = (int16_t)sample;
+            }
+        }
+
+        if (stereo)
+        {
+            uint32_t pairs = blocks / 2u;
+            for (uint32_t pair = 0; pair < pairs; pair++)
+                for (uint32_t word = 0; word < XA_WORDS_PER_CHUNK; word++)
+                    cd_push_resampled_frame(cd, decoded[pair * 2u][word],
+                                            decoded[pair * 2u + 1u][word], source_rate);
+        }
+        else
+        {
+            for (uint32_t block = 0; block < blocks; block++)
+                for (uint32_t word = 0; word < XA_WORDS_PER_CHUNK; word++)
+                    cd_push_resampled_frame(cd, decoded[block][word],
+                                            decoded[block][word], source_rate);
+        }
+    }
+
+    if (submode & 0x80u)
+        reset_xa_stream(cd);
+}
+
+static void process_cdda_sector(Cdrom *cd, const uint8_t raw[DISC_SECTOR_SIZE])
+{
+    if (!cd->cdda_en || cd->muted)
+        return;
+    for (uint32_t i = 0; i + 3u < DISC_SECTOR_SIZE; i += 4u)
+        cd_push_audio_frame(cd, le_i16(raw + i), le_i16(raw + i + 2u));
 }
 
 /* ---- Event queue helpers ---- */
@@ -214,28 +391,63 @@ static void cmd_init(Cdrom *cd, Scheduler *sched)
     evq_clear(&cd->evq);
     cd->double_speed = false;
     cd->xa_adpcm_en = false;
+    cd->xa_filter_en = false;
     cd->report_mode = false;
     cd->auto_pause = false;
+    cd->cdda_en = false;
+    cd->playing_cdda = false;
+    cd->muted = false;
+    cd->adpcm_muted = false;
     cd->mode = 0;
     cd->state = CDROM_STATE_IDLE;
+    reset_xa_stream(cd);
     resp_clear(cd);
     resp_push(cd, make_stat(cd));
     queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_INIT_ACK, CDROM_CMD_DELAY);
     LOG(LOG_CDROM, "Init");
 }
 
+static void cmd_play(Cdrom *cd, Scheduler *sched)
+{
+    if (cd->seek_pending)
+    {
+        cd->cur_lba = msf_to_lba(cd->seek_target);
+        cd->seek_pending = false;
+    }
+    cd->state = CDROM_STATE_READING;
+    cd->playing_cdda = true;
+    cd->cdda_en = true;
+    resp_clear(cd);
+    resp_push(cd, make_stat(cd));
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_READ_DATA, CDROM_ACK_DELAY);
+    LOG(LOG_CDROM, "Play LBA=%u", cd->cur_lba);
+}
+
 /* Setmode (0x0E) */
 static void cmd_setmode(Cdrom *cd, Scheduler *sched)
 {
     cd->mode = param_pop(cd);
+    cd->cdda_en = (cd->mode >> 0) & 1;
     cd->double_speed = (cd->mode >> 7) & 1;
     cd->xa_adpcm_en = (cd->mode >> 6) & 1;
+    cd->xa_filter_en = (cd->mode >> 3) & 1;
     cd->report_mode = (cd->mode >> 2) & 1;
     cd->auto_pause = (cd->mode >> 1) & 1;
     resp_clear(cd);
     resp_push(cd, make_stat(cd));
     queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
     LOG(LOG_CDROM, "Setmode mode=0x%02X", cd->mode);
+}
+
+static void cmd_setfilter(Cdrom *cd, Scheduler *sched)
+{
+    cd->xa_filter_file = param_pop(cd);
+    cd->xa_filter_channel = param_pop(cd);
+    cd->xa_current_set = false;
+    resp_clear(cd);
+    resp_push(cd, make_stat(cd));
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+    LOG(LOG_CDROM, "Setfilter file=%u channel=%u", cd->xa_filter_file, cd->xa_filter_channel);
 }
 
 /* GetID (0x1A) */
@@ -300,6 +512,7 @@ static void cmd_read(Cdrom *cd, uint8_t cmd, Scheduler *sched)
         cd->seek_pending = false;
     }
     cd->state = CDROM_STATE_READING;
+    cd->playing_cdda = false;
     resp_clear(cd);
     resp_push(cd, make_stat(cd)); /* stat with READING bit set */
     queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_READ_DATA, CDROM_ACK_DELAY);
@@ -310,7 +523,10 @@ static void cmd_read(Cdrom *cd, uint8_t cmd, Scheduler *sched)
 static void cmd_pause(Cdrom *cd, Scheduler *sched)
 {
     cd->state = CDROM_STATE_IDLE;
+    cd->playing_cdda = false;
     evq_clear(&cd->evq);
+    if (cd->spu)
+        spu_clear_cd_audio(cd->spu);
     resp_clear(cd);
     resp_push(cd, make_stat(cd));
     queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_PAUSE_ACK, CDROM_ACK_DELAY);
@@ -321,6 +537,9 @@ static void cmd_pause(Cdrom *cd, Scheduler *sched)
 static void cmd_stop(Cdrom *cd, Scheduler *sched)
 {
     cd->state = CDROM_STATE_IDLE;
+    cd->playing_cdda = false;
+    if (cd->spu)
+        spu_clear_cd_audio(cd->spu);
     resp_clear(cd);
     resp_push(cd, make_stat(cd));
     queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
@@ -332,6 +551,9 @@ static void cmd_stop(Cdrom *cd, Scheduler *sched)
    to acknowledge successfully while configuring CD-DA playback state. */
 static void cmd_audio_mute(Cdrom *cd, Scheduler *sched, bool muted)
 {
+    cd->muted = muted;
+    if (muted && cd->spu)
+        spu_clear_cd_audio(cd->spu);
     resp_clear(cd);
     resp_push(cd, make_stat(cd));
     queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
@@ -360,6 +582,9 @@ static void execute_command(Cdrom *cd, uint8_t cmd, Scheduler *sched)
     case 0x02:
         cmd_setloc(cd, sched);
         break;
+    case 0x03:
+        cmd_play(cd, sched);
+        break;
     case 0x06:
     case 0x1B:
         cmd_read(cd, cmd, sched);
@@ -378,6 +603,9 @@ static void execute_command(Cdrom *cd, uint8_t cmd, Scheduler *sched)
         break;
     case 0x0C:
         cmd_audio_mute(cd, sched, false);
+        break;
+    case 0x0D:
+        cmd_setfilter(cd, sched);
         break;
     case 0x0E:
         cmd_setmode(cd, sched);
@@ -452,7 +680,16 @@ void cdrom_init(Cdrom *cd, Disc *disc)
     cd->disc = disc;
     cd->state = CDROM_STATE_IDLE;
     cd->irq_en = 0x1F;
+    cd->cd_audio_volume[0][0] = 0x80;
+    cd->cd_audio_volume[1][1] = 0x80;
+    cd->next_cd_audio_volume[0][0] = 0x80;
+    cd->next_cd_audio_volume[1][1] = 0x80;
     evq_clear(&cd->evq);
+}
+
+void cdrom_set_spu(Cdrom *cd, Spu *spu)
+{
+    cd->spu = spu;
 }
 
 uint8_t cdrom_load8(Cdrom *cd, uint32_t offset)
@@ -511,6 +748,9 @@ void cdrom_store8(Cdrom *cd, uint32_t offset, uint8_t val,
         case 0:
             execute_or_defer_command(cd, val, sched);
             return;
+        case 3:
+            cd->next_cd_audio_volume[1][1] = val;
+            return;
         default:
             return; /* sound map / other — ignore */
         }
@@ -523,6 +763,12 @@ void cdrom_store8(Cdrom *cd, uint32_t offset, uint8_t val,
             return;
         case 1:
             cd->irq_en = val & 0x1F;
+            return;
+        case 2:
+            cd->next_cd_audio_volume[0][0] = val;
+            return;
+        case 3:
+            cd->next_cd_audio_volume[1][0] = val;
             return;
         default:
             return;
@@ -544,6 +790,15 @@ void cdrom_store8(Cdrom *cd, uint32_t offset, uint8_t val,
             if (val & 0x40)
                 cd->param_len = 0; /* reset param FIFO */
             execute_pending_command(cd, sched);
+            return;
+        case 2:
+            cd->next_cd_audio_volume[0][1] = val;
+            return;
+        case 3:
+            cd->adpcm_muted = (val & 0x01u) != 0;
+            if (val & 0x20u)
+                memcpy(cd->cd_audio_volume, cd->next_cd_audio_volume,
+                       sizeof(cd->cd_audio_volume));
             return;
         default:
             return;
@@ -605,9 +860,16 @@ static void deliver_sector(Cdrom *cd, Irq *irq, Scheduler *sched)
     uint8_t raw[DISC_SECTOR_SIZE];
     disc_read_sector(cd->disc, cd->cur_lba, raw);
     cd->cur_lba++;
+    process_cdda_sector(cd, raw);
+    decode_xa_sector(cd, raw);
 
     bool raw_mode = (cd->mode & 0x20) != 0;
-    if (raw_mode)
+    if (cd->playing_cdda)
+    {
+        cd->data_len = 0;
+        cd->data_pos = 0;
+    }
+    else if (raw_mode)
     {
         cd->data_len = 2340;
         cd->data_pos = 0;

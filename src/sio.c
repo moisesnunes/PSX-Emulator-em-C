@@ -6,7 +6,7 @@
 #define STAT_TX_READY (1u << 0) /* TX FIFO not full — always ready */
 #define STAT_RX_AVAIL (1u << 1) /* RX FIFO has data */
 #define STAT_TX_IDLE (1u << 2)  /* TX finished — always idle */
-#define STAT_ACK (1u << 7)      /* /ACK from device (active-low; 0=ack) */
+#define STAT_ACK (1u << 7)      /* ACK/DSR input from device */
 #define STAT_IRQ (1u << 9)      /* SIO interrupt pending */
 
 /* CTRL register bits */
@@ -19,6 +19,7 @@
 
 /* Digital pad device-id response byte */
 #define PAD_ID_DIGITAL 0x41
+#define ACK_DELAY_STEPS 15
 
 /* Key map: SDL scancode → button bitmask */
 static const struct
@@ -80,11 +81,12 @@ static void reset_transaction(Sio *sio)
     sio->slot2 = false;
     sio->memcard_access = false;
     sio->pad_access = false;
+    sio->ack_active = false;
 }
 
 static void schedule_ack_irq(Sio *sio)
 {
-    sio->irq_timer = 5;
+    sio->irq_timer = ACK_DELAY_STEPS;
 }
 
 static uint32_t build_stat(const Sio *sio)
@@ -92,10 +94,8 @@ static uint32_t build_stat(const Sio *sio)
     uint32_t s = STAT_TX_READY | STAT_TX_IDLE;
     if (sio->rx_pos < sio->rx_len)
         s |= STAT_RX_AVAIL;
-    /* /ACK is asserted (bit=0) only while a real device is responding. */
-    bool device_selected = sio->selected && !sio->slot2 && !sio->memcard_access;
-    if (!device_selected || sio->rx_pos >= sio->rx_len)
-        s |= STAT_ACK; /* no ACK (bit=1 means not asserted) */
+    if (sio->ack_active)
+        s |= STAT_ACK;
     if (sio->irq_pending)
         s |= STAT_IRQ;
     return s;
@@ -105,7 +105,7 @@ void sio_init(Sio *sio)
 {
     memset(sio, 0, sizeof(*sio));
     refresh_pad_buttons(sio);
-    sio->stat = STAT_TX_READY | STAT_TX_IDLE | STAT_ACK;
+    sio->stat = STAT_TX_READY | STAT_TX_IDLE;
     sio->baud = 0x0088; /* typical BIOS init value */
 }
 
@@ -175,7 +175,12 @@ uint16_t sio_load16(Sio *sio, uint32_t off)
     case 0x00:
         return (uint16_t)sio_load8(sio, 0x00);
     case 0x04:
-        return (uint16_t)(sio->stat & 0xFFFF);
+    {
+        uint16_t bits = (uint16_t)(build_stat(sio) & 0xFFFF);
+        sio->ack_active = false;
+        sio->stat = build_stat(sio);
+        return bits;
+    }
     case 0x06:
         return (uint16_t)(sio->stat >> 16);
     case 0x08:
@@ -211,7 +216,7 @@ void sio_store16(Sio *sio, uint32_t off, uint16_t val, Irq *irq)
         else if (val & CTRL_ACK_RESET)
         {
             sio->irq_pending = false;
-            sio->stat = build_stat(sio);
+            sio->ctrl &= (uint16_t)~CTRL_ACK_RESET;
         }
         else if (val & CTRL_SELECT)
         {
@@ -228,7 +233,7 @@ void sio_store16(Sio *sio, uint32_t off, uint16_t val, Irq *irq)
                 sio->pad_access = false;
             }
         }
-        else if (!(val & CTRL_SELECT) && sio->selected)
+        else if (sio->selected)
         {
             /* /CS deasserted */
             reset_transaction(sio);
@@ -252,6 +257,7 @@ void sio_step(Sio *sio, Irq *irq)
         if (sio->irq_timer == 0)
         {
             sio->irq_pending = true;
+            sio->ack_active = true;
             sio->stat = build_stat(sio);
         }
     }

@@ -1,10 +1,13 @@
 #include "spu.h"
+#include "scheduler.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 /* ---- constants ---- */
 #define ENVELOPE_COUNTER_MAX (1u << (33 - 11))
+#define SPU_SAMPLE_RATE 44100u
+#define SPU_MAX_AUDIO_QUEUE_BYTES (SPU_SAMPLE_RATE / 10u * 2u * sizeof(int16_t))
 
 static const int16_t FIR_FILTER[FIR_LEN] = {
     -0x0001,
@@ -164,7 +167,7 @@ static void decode_adpcm_block(const uint8_t *block, int16_t decoded[28],
 static void voice_init(Voice *v)
 {
     memset(v, 0, sizeof(*v));
-    v->keyed_on = true;
+    v->keyed_on = false;
     v->volume_l = 0x7FFF;
     v->volume_r = 0x7FFF;
     v->envelope.phase = ADSR_RELEASE;
@@ -413,7 +416,7 @@ static int16_t apply_apf2(Spu *spu, int16_t input)
 }
 
 /* ---- Init / destroy ---- */
-int spu_init(Spu *spu)
+int spu_init(Spu *spu, bool enable_audio)
 {
     memset(spu, 0, sizeof(*spu));
     for (int i = 0; i < NUM_VOICES; i++)
@@ -421,6 +424,9 @@ int spu_init(Spu *spu)
     spu->main_volume_l = 0x7FFF;
     spu->main_volume_r = 0x7FFF;
     spu->reverb_left = true;
+
+    if (!enable_audio)
+        return 0;
 
     SDL_AudioSpec desired, obtained;
     SDL_zero(desired);
@@ -442,7 +448,46 @@ int spu_init(Spu *spu)
 void spu_destroy(Spu *spu)
 {
     if (spu->device)
+    {
         SDL_CloseAudioDevice(spu->device);
+        spu->device = 0;
+    }
+}
+
+void spu_push_cd_audio_frame(Spu *spu, int16_t left, int16_t right)
+{
+    if (spu->cd_audio_count >= SPU_CD_AUDIO_BUFFER_FRAMES)
+    {
+        spu->cd_audio_head = (spu->cd_audio_head + 1u) % SPU_CD_AUDIO_BUFFER_FRAMES;
+        spu->cd_audio_count--;
+    }
+
+    spu->cd_audio_l[spu->cd_audio_tail] = left;
+    spu->cd_audio_r[spu->cd_audio_tail] = right;
+    spu->cd_audio_tail = (spu->cd_audio_tail + 1u) % SPU_CD_AUDIO_BUFFER_FRAMES;
+    spu->cd_audio_count++;
+}
+
+void spu_clear_cd_audio(Spu *spu)
+{
+    spu->cd_audio_head = 0;
+    spu->cd_audio_tail = 0;
+    spu->cd_audio_count = 0;
+}
+
+static void spu_pop_cd_audio_frame(Spu *spu, int16_t *left, int16_t *right)
+{
+    if (spu->cd_audio_count == 0)
+    {
+        *left = 0;
+        *right = 0;
+        return;
+    }
+
+    *left = spu->cd_audio_l[spu->cd_audio_head];
+    *right = spu->cd_audio_r[spu->cd_audio_head];
+    spu->cd_audio_head = (spu->cd_audio_head + 1u) % SPU_CD_AUDIO_BUFFER_FRAMES;
+    spu->cd_audio_count--;
 }
 
 /* ---- Load / Store ---- */
@@ -484,32 +529,32 @@ void spu_store(Spu *spu, uint32_t abs_addr, uint32_t offset, uint16_t val)
         spu->write_count++;
         break;
     case 0x0188:
-        for (int i = 0; i < 15; i++)
+        for (int i = 0; i < 16; i++)
             if (val & (1 << i))
                 voice_key_on(&spu->voices[i], spu->sound_ram);
         break;
     case 0x018A:
-        for (int i = 0; i < 9; i++)
+        for (int i = 0; i < 8; i++)
             if (val & (1 << i))
-                voice_key_on(&spu->voices[15 + i], spu->sound_ram);
+                voice_key_on(&spu->voices[16 + i], spu->sound_ram);
         break;
     case 0x018C:
-        for (int i = 0; i < 15; i++)
+        for (int i = 0; i < 16; i++)
             if (val & (1 << i))
                 voice_key_off(&spu->voices[i]);
         break;
     case 0x018E:
-        for (int i = 0; i < 9; i++)
+        for (int i = 0; i < 8; i++)
             if (val & (1 << i))
-                voice_key_off(&spu->voices[15 + i]);
+                voice_key_off(&spu->voices[16 + i]);
         break;
     case 0x0198:
-        for (int i = 0; i < 15; i++)
+        for (int i = 0; i < 16; i++)
             spu->voices[i].reverb_enabled = (val & (1 << i)) != 0;
         break;
     case 0x019A:
-        for (int i = 0; i < 9; i++)
-            spu->voices[15 + i].reverb_enabled = (val & (1 << i)) != 0;
+        for (int i = 0; i < 8; i++)
+            spu->voices[16 + i].reverb_enabled = (val & (1 << i)) != 0;
         break;
     case 0x0180:
         if (!(val & 0x8000))
@@ -680,11 +725,32 @@ void spu_clock(Spu *spu)
 
     int16_t with_l = clamped_l + out_reverb_l;
     int16_t with_r = clamped_r + out_reverb_r;
+    int16_t cd_l, cd_r;
+    spu_pop_cd_audio_frame(spu, &cd_l, &cd_r);
+    with_l = clamp16((int32_t)with_l + cd_l);
+    with_r = clamp16((int32_t)with_r + cd_r);
     int16_t out_l = apply_volume(with_l, spu->main_volume_l);
     int16_t out_r = apply_volume(with_r, spu->main_volume_r);
 
-    int16_t samples[2] = {out_l, out_r};
-    SDL_QueueAudio(spu->device, samples, sizeof(samples));
+    if (spu->device)
+    {
+        if (SDL_GetQueuedAudioSize(spu->device) > SPU_MAX_AUDIO_QUEUE_BYTES)
+            SDL_ClearQueuedAudio(spu->device);
+        int16_t samples[2] = {out_l, out_r};
+        SDL_QueueAudio(spu->device, samples, sizeof(samples));
+    }
+}
+
+void spu_step(Spu *spu, uint32_t cpu_cycles)
+{
+    uint64_t accum = (uint64_t)spu->sample_cycle_accum +
+                     (uint64_t)cpu_cycles * SPU_SAMPLE_RATE;
+    while (accum >= PS1_CPU_HZ)
+    {
+        accum -= PS1_CPU_HZ;
+        spu_clock(spu);
+    }
+    spu->sample_cycle_accum = (uint32_t)accum;
 }
 
 void spu_dma_write(Spu *spu, uint32_t word)
