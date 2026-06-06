@@ -135,6 +135,13 @@ int disc_read_sector(Disc *disc, uint32_t lba, uint8_t buf[DISC_SECTOR_SIZE])
     return 0;
 }
 
+uint32_t disc_data_offset_for_lba(const Disc *disc, uint32_t lba)
+{
+    (void)disc;
+    (void)lba;
+    return DISC_DATA_OFFSET;
+}
+
 uint8_t disc_track_count_bcd(const Disc *disc)
 {
     return to_bcd(disc->track_count);
@@ -629,6 +636,85 @@ static void test_play_cdda_pushes_audio(void)
     printf("ok\n");
 }
 
+/* GetlocL: reads back absolute MSF of current LBA (after Setloc+SeekL). */
+static void test_getlocl(void)
+{
+    printf("test_getlocl ... ");
+    Cdrom cd;
+    Irq irq;
+    Scheduler sched;
+    Disc disc;
+    setup(&cd, &irq, &sched, &disc);
+
+    /* Seek to 00:03:00 = LBA 75 */
+    push_param(&cd, 0x00, &irq, &sched);
+    push_param(&cd, 0x03, &irq, &sched);
+    push_param(&cd, 0x00, &irq, &sched);
+    send_cmd(&cd, 0x02, &irq, &sched); /* Setloc */
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+    ack_cdrom_irq(&cd, &irq, &sched);
+    cdrom_event_log_reset();
+
+    send_cmd(&cd, 0x15, &irq, &sched); /* SeekL */
+    run_until_quiet(&cd, &irq, &sched, 2ULL * PS1_CPU_HZ);
+    ack_cdrom_irq(&cd, &irq, &sched);
+    ack_cdrom_irq(&cd, &irq, &sched);
+    cdrom_event_log_reset();
+    irq.status = 0;
+
+    send_cmd(&cd, 0x10, &irq, &sched); /* GetlocL */
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+
+    EXPECT_EQ(cdrom_event_log_count(), 1u);
+    EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT3);
+    /* LBA 75 → absolute MSF 00:03:00 (BCD) */
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x00u); /* amm */
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x03u); /* ass */
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x00u); /* asect */
+    /* amode = 0x02 (Mode 2) */
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x02u);
+    printf("ok\n");
+}
+
+/* GetlocP: reads back track/index/relative/absolute MSF. */
+static void test_getlocp(void)
+{
+    printf("test_getlocp ... ");
+    Cdrom cd;
+    Irq irq;
+    Scheduler sched;
+    Disc disc;
+    setup(&cd, &irq, &sched, &disc);
+    cdrom_event_log_reset();
+    irq.status = 0;
+
+    /* At startup cur_lba = 0. Send GetlocP. */
+    send_cmd(&cd, 0x11, &irq, &sched); /* GetlocP */
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+
+    EXPECT_EQ(cdrom_event_log_count(), 1u);
+    EXPECT_EQ(cdrom_event_log_get(0), CDROM_INT3);
+    /* track = 0x01 (BCD 1), index = 0x01 */
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x01u); /* track */
+    EXPECT_EQ(cdrom_load8(&cd, 1), 0x01u); /* index */
+    /* Relative MSF starts at the current track's index 1, without lead-in. */
+    uint8_t rel_mm = cdrom_load8(&cd, 1);
+    uint8_t rel_ss = cdrom_load8(&cd, 1);
+    uint8_t rel_ff = cdrom_load8(&cd, 1);
+    EXPECT_EQ(rel_mm, 0x00u);
+    EXPECT_EQ(rel_ss, 0x00u);
+    EXPECT_EQ(rel_ff, 0x00u);
+
+    /* Absolute MSF includes the PS1 150-sector lead-in. */
+    uint8_t abs_mm = cdrom_load8(&cd, 1);
+    uint8_t abs_ss = cdrom_load8(&cd, 1);
+    uint8_t abs_ff = cdrom_load8(&cd, 1);
+    EXPECT_EQ(abs_mm, 0x00u);
+    EXPECT_EQ(abs_ss, 0x02u);
+    EXPECT_EQ(abs_ff, 0x00u);
+    printf("ok\n");
+}
+
 /* =========================================================================
  * Main
  * ========================================================================= */
@@ -646,6 +732,8 @@ int main(void)
     test_overlap_cmd_during_readn();
     test_audio_controls();
     test_play_cdda_pushes_audio();
+    test_getlocl();
+    test_getlocp();
     printf("========================\n");
     printf("pass: %d  fail: %d\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;

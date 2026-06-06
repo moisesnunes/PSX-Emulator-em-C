@@ -43,11 +43,14 @@ typedef struct
     uint32_t current_address;
     uint16_t pitch_counter;
     int16_t decode_buffer[28];
+    int16_t adpcm_old;
+    int16_t adpcm_older;
     AdsrEnvelope envelope;
     uint16_t sample_rate;
     uint8_t current_buffer_idx;
     int16_t current_sample;
     bool keyed_on;
+    bool reached_loop_end;  /* set when loop-end flag seen, cleared on key-on */
     int16_t volume_l;
     int16_t volume_r;
     bool enable_sweep_l;
@@ -57,6 +60,8 @@ typedef struct
     uint16_t adsr1;
     uint16_t adsr2;
     bool reverb_enabled;
+    bool noise_enabled;
+    bool pitch_mod_enabled;
 } Voice;
 
 /* circular buffer for FIR filter */
@@ -77,6 +82,15 @@ typedef struct
     uint32_t cd_audio_head;
     uint32_t cd_audio_tail;
     uint32_t cd_audio_count;
+
+    /* Noise generator state */
+    uint32_t noise_level;   /* current noise sample (-0x8000..0x7FFF range, stored as uint) */
+    uint32_t noise_timer;   /* fractional cycle accumulator */
+    uint8_t  noise_shift;   /* noise frequency shift (from SPUCNT bits 13:10) */
+    uint8_t  noise_step;    /* noise frequency step (bits 9:8) */
+
+    /* PMON: pitch-modulation enable bitmask (voices 1..23; voice 0 ignored) */
+    uint32_t pmon_mask;
 
     uint16_t regs[SPU_REG_WORDS];
     uint8_t sound_ram[SOUND_RAM_SIZE];
@@ -117,3 +131,4 @@ void spu_clear_cd_audio(Spu *spu);
 void spu_destroy(Spu *spu);
 /* DMA channel 4 (RAM→SPU): writes one 32-bit word (two 16-bit samples) to sound RAM. */
 void spu_dma_write(Spu *spu, uint32_t word);
+uint32_t spu_dma_read(Spu *spu);

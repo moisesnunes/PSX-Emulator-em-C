@@ -97,7 +97,8 @@ def filter_cases(cases: Iterable[TestCase], categories: set[str], names: set[str
     return out
 
 
-def read_ppm(path: Path) -> tuple[int, int, bytes]:
+def read_ppm(path: Path) -> tuple[int, int, bytes, int]:
+    """Read P6 (RGB) or P7/PAM (RGBA) image.  Returns (width, height, pixels, channels)."""
     data = path.read_bytes()
     pos = 0
 
@@ -115,20 +116,45 @@ def read_ppm(path: Path) -> tuple[int, int, bytes]:
         return data[start:pos]
 
     magic = token()
-    if magic != b"P6":
-        raise ValueError(f"{path}: unsupported PPM magic {magic!r}")
-    width = int(token())
-    height = int(token())
-    maxval = int(token())
-    if maxval != 255:
-        raise ValueError(f"{path}: unsupported maxval {maxval}")
-    if pos < len(data) and data[pos] in b" \t\r\n":
-        pos += 1
-    pixels = data[pos:]
-    expected = width * height * 3
-    if len(pixels) != expected:
-        raise ValueError(f"{path}: expected {expected} RGB bytes, got {len(pixels)}")
-    return width, height, pixels
+    if magic == b"P6":
+        width = int(token())
+        height = int(token())
+        maxval = int(token())
+        if maxval != 255:
+            raise ValueError(f"{path}: unsupported maxval {maxval}")
+        if pos < len(data) and data[pos] in b" \t\r\n":
+            pos += 1
+        pixels = data[pos:]
+        expected = width * height * 3
+        if len(pixels) != expected:
+            raise ValueError(f"{path}: expected {expected} RGB bytes, got {len(pixels)}")
+        return width, height, pixels, 3
+    elif magic == b"P7":
+        # PAM format: key-value header lines until ENDHDR
+        width = height = depth = 0
+        while pos < len(data):
+            # read a line
+            line_start = pos
+            while pos < len(data) and data[pos] not in b"\r\n":
+                pos += 1
+            line = data[line_start:pos].decode("ascii", errors="replace").strip()
+            while pos < len(data) and data[pos] in b"\r\n":
+                pos += 1
+            if line == "ENDHDR":
+                break
+            if line.startswith("WIDTH"):
+                width = int(line.split()[1])
+            elif line.startswith("HEIGHT"):
+                height = int(line.split()[1])
+            elif line.startswith("DEPTH"):
+                depth = int(line.split()[1])
+        pixels = data[pos:]
+        expected = width * height * depth
+        if len(pixels) != expected:
+            raise ValueError(f"{path}: PAM expected {expected} bytes, got {len(pixels)}")
+        return width, height, pixels, depth
+    else:
+        raise ValueError(f"{path}: unsupported image magic {magic!r}")
 
 
 def png_chunk(kind: bytes, payload: bytes) -> bytes:
@@ -144,25 +170,187 @@ def png_color_type(png: Path) -> int:
     return data[25]
 
 
-def ppm_to_png(ppm: Path, png: Path, color_type: int = 2) -> None:
-    width, height, pixels = read_ppm(ppm)
+def png_rgba_has_variable_alpha(png: Path) -> bool:
+    data = png.read_bytes()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return False
+
+    pos = 8
+    width = height = bit_depth = color_type = None
+    idat = b""
+    while pos < len(data):
+        size = struct.unpack(">I", data[pos : pos + 4])[0]
+        kind = data[pos + 4 : pos + 8]
+        payload = data[pos + 8 : pos + 8 + size]
+        pos += 12 + size
+        if kind == b"IHDR":
+            width, height, bit_depth, color_type, _, _, _ = struct.unpack(">IIBBBBB", payload)
+        elif kind == b"IDAT":
+            idat += payload
+        elif kind == b"IEND":
+            break
+
+    if width is None or height is None or bit_depth != 8 or color_type != 6:
+        return False
+
+    raw = zlib.decompress(idat)
+    stride = width * 4
+    prev = bytearray(stride)
+    off = 0
+    first_alpha = None
+    for _y in range(height):
+        filt = raw[off]
+        off += 1
+        cur = bytearray(raw[off : off + stride])
+        off += stride
+        for i in range(stride):
+            left = cur[i - 4] if i >= 4 else 0
+            up = prev[i]
+            up_left = prev[i - 4] if i >= 4 else 0
+            if filt == 1:
+                cur[i] = (cur[i] + left) & 0xFF
+            elif filt == 2:
+                cur[i] = (cur[i] + up) & 0xFF
+            elif filt == 3:
+                cur[i] = (cur[i] + ((left + up) >> 1)) & 0xFF
+            elif filt == 4:
+                p = left + up - up_left
+                pa = abs(p - left)
+                pb = abs(p - up)
+                pc = abs(p - up_left)
+                pred = left if pa <= pb and pa <= pc else (up if pb <= pc else up_left)
+                cur[i] = (cur[i] + pred) & 0xFF
+            elif filt != 0:
+                return False
+        for i in range(3, stride, 4):
+            if first_alpha is None:
+                first_alpha = cur[i]
+            elif cur[i] != first_alpha:
+                return True
+        prev = cur
+
+    return first_alpha is not None and first_alpha != 255
+
+
+def png_palette_to_rgb_png(src: Path, dst: Path) -> None:
+    data = src.read_bytes()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError(f"{src}: not a PNG")
+
+    pos = 8
+    width = height = bit_depth = color_type = None
+    palette: list[tuple[int, int, int]] = []
+    idat = b""
+    while pos < len(data):
+        size = struct.unpack(">I", data[pos : pos + 4])[0]
+        kind = data[pos + 4 : pos + 8]
+        payload = data[pos + 8 : pos + 8 + size]
+        pos += 12 + size
+        if kind == b"IHDR":
+            width, height, bit_depth, color_type, _, _, _ = struct.unpack(">IIBBBBB", payload)
+        elif kind == b"PLTE":
+            palette = [tuple(payload[i : i + 3]) for i in range(0, len(payload), 3)]
+        elif kind == b"IDAT":
+            idat += payload
+        elif kind == b"IEND":
+            break
+
+    if width is None or height is None or bit_depth not in (1, 2, 4, 8) or color_type != 3:
+        raise ValueError(f"{src}: unsupported indexed PNG")
+
+    raw = zlib.decompress(idat)
     rows = []
-    stride = width * 3
+    stride = (width * bit_depth + 7) // 8
+    prev = bytearray(stride)
+    off = 0
+    for _y in range(height):
+        filt = raw[off]
+        off += 1
+        cur = bytearray(raw[off : off + stride])
+        off += stride
+        for i in range(stride):
+            left = cur[i - 1] if i > 0 else 0
+            up = prev[i]
+            up_left = prev[i - 1] if i > 0 else 0
+            if filt == 1:
+                cur[i] = (cur[i] + left) & 0xFF
+            elif filt == 2:
+                cur[i] = (cur[i] + up) & 0xFF
+            elif filt == 3:
+                cur[i] = (cur[i] + ((left + up) >> 1)) & 0xFF
+            elif filt == 4:
+                p = left + up - up_left
+                pa = abs(p - left)
+                pb = abs(p - up)
+                pc = abs(p - up_left)
+                pred = left if pa <= pb and pa <= pc else (up if pb <= pc else up_left)
+                cur[i] = (cur[i] + pred) & 0xFF
+            elif filt != 0:
+                raise ValueError(f"{src}: unsupported PNG filter {filt}")
+        indices = []
+        if bit_depth == 8:
+            indices = list(cur[:width])
+        else:
+            mask = (1 << bit_depth) - 1
+            for byte in cur:
+                for shift in range(8 - bit_depth, -1, -bit_depth):
+                    indices.append((byte >> shift) & mask)
+                    if len(indices) == width:
+                        break
+                if len(indices) == width:
+                    break
+
+        rgb = bytearray(width * 3)
+        for x, idx in enumerate(indices):
+            r, g, b = palette[idx]
+            rgb[x * 3 : x * 3 + 3] = bytes((r, g, b))
+        rows.append(b"\x00" + bytes(rgb))
+        prev = cur
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    dst.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", ihdr)
+        + png_chunk(b"IDAT", zlib.compress(b"".join(rows), 9))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def ppm_to_png(ppm: Path, png: Path, color_type: int = 2) -> None:
+    width, height, pixels, channels = read_ppm(ppm)
+    rows = []
+    stride = width * channels
     if color_type == 6:
         for y in range(height):
             row = pixels[y * stride : (y + 1) * stride]
             rgba = bytearray(width * 4)
             for x in range(width):
-                src = x * 3
+                src = x * channels
                 dst = x * 4
-                rgba[dst : dst + 3] = row[src : src + 3]
-                rgba[dst + 3] = 255
+                rgba[dst] = row[src]
+                rgba[dst + 1] = row[src + 1]
+                rgba[dst + 2] = row[src + 2]
+                rgba[dst + 3] = row[src + 3] if channels >= 4 else 255
             rows.append(b"\x00" + bytes(rgba))
+    elif color_type == 0:
+        for y in range(height):
+            row = pixels[y * stride : (y + 1) * stride]
+            gray = bytearray(width)
+            for x in range(width):
+                gray[x] = row[x * channels]
+            rows.append(b"\x00" + bytes(gray))
     else:
         color_type = 2
         for y in range(height):
             row = pixels[y * stride : (y + 1) * stride]
-            rows.append(b"\x00" + row)
+            if channels == 3:
+                rows.append(b"\x00" + row)
+            else:
+                # extract RGB from RGBA
+                rgb = bytearray(width * 3)
+                for x in range(width):
+                    rgb[x * 3 : x * 3 + 3] = row[x * channels : x * channels + 3]
+                rows.append(b"\x00" + bytes(rgb))
     raw = b"".join(rows)
     ihdr = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
     png.write_bytes(
@@ -180,12 +368,15 @@ def run_case(args: argparse.Namespace, case: TestCase) -> bool:
     ppm_path = case_out / "vram.ppm"
     png_path = case_out / "vram.png"
     diff_path = case_out / "diff.png"
+    ref_compare_path = case.ref_vram
 
     env = os.environ.copy()
     if case.ref_vram and not args.no_diff:
         env["PS1_DUMP_VRAM_PPM"] = str(ppm_path)
         env["PS1_DUMP_FULL_VRAM"] = "1"
         env["PS1_DUMP_FRAME"] = str(args.dump_frame)
+        if case.ref_vram and png_color_type(case.ref_vram) == 6 and png_rgba_has_variable_alpha(case.ref_vram):
+            env["PS1_DUMP_STP_ALPHA"] = "1"
 
     cmd = [
         str(args.emulator),
@@ -218,8 +409,12 @@ def run_case(args: argparse.Namespace, case: TestCase) -> bool:
         if not ppm_path.exists():
             print(f"[FAIL] {case.category}/{case.name}: missing VRAM dump ({rel(log_path)})")
             return False
-        ppm_to_png(ppm_path, png_path, png_color_type(case.ref_vram))
-        diff_cmd = [str(args.diffvram), str(case.ref_vram), str(png_path), str(diff_path)]
+        ref_color_type = png_color_type(case.ref_vram)
+        ppm_to_png(ppm_path, png_path, ref_color_type)
+        if ref_color_type == 3:
+            ref_compare_path = case_out / "ref-rgb.png"
+            png_palette_to_rgb_png(case.ref_vram, ref_compare_path)
+        diff_cmd = [str(args.diffvram), str(ref_compare_path), str(png_path), str(diff_path)]
         diff = subprocess.run(diff_cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if diff.returncode != 0:
             (case_out / "diffvram.log").write_bytes(diff.stdout)

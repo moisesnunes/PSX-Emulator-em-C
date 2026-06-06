@@ -37,7 +37,7 @@ PSX_TEST_RUNNER = python3 tests/run_psx_tests.py
 PSX_TEST_ARGS ?=
 
 .PHONY: all clean run run-exe run-exe-headless run-psxtest-cpu run-psxtest-gpu \
-        run-psxtest-cpx run-psxtest-gte debug smoke test-cdrom test-sio test-gte test-dma \
+        run-psxtest-cpx run-psxtest-gte debug smoke test-cdrom test-disc test-sio test-gte test-dma \
         test-psx-list test-psx-all test-psx-cdrom test-psx-cpu test-psx-dma \
         test-psx-gpu test-psx-gte test-psx-gte-fuzz test-psx-input \
         test-psx-mdec test-psx-spu test-spu test-psx-timer-dump test-psx-timers \
@@ -105,6 +105,12 @@ test-cdrom: src/cdrom.c src/spu.c tests/cdrom_test.c
 	    $(shell sdl2-config --libs) \
 	    -o tests/cdrom_test
 	./tests/cdrom_test
+
+test-disc: src/disc.c tests/disc_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
+	    tests/disc_test.c src/disc.c \
+	    -o tests/disc_test
+	./tests/disc_test
 
 test-sio: src/sio.c tests/sio_test.c
 	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc $(shell sdl2-config --cflags) \
@@ -191,4 +197,4 @@ test-psx-extras: $(TARGET)
 	    --keep-going $(PSX_TEST_ARGS)
 
 clean:
-	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cdrom_test tests/sio_test tests/gte_test tests/dma_test tests/spu_test
+	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cdrom_test tests/disc_test tests/sio_test tests/gte_test tests/dma_test tests/spu_test

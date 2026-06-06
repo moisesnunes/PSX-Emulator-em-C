@@ -23,6 +23,7 @@ make              # compila
 make run          # compila e executa (usa bios/BIOS.ROM)
 make smoke        # roda 500k instruções sem janela e sai (CI)
 make test-cdrom   # roda testes unitários do controlador CD-ROM
+make test-disc    # roda testes unitários de imagens .bin/.cue
 make test-sio     # roda testes unitários de SIO/joypad
 make test-gte     # roda testes unitários do GTE
 make test-dma     # roda testes unitários de DMA
@@ -102,6 +103,7 @@ Testes unitários locais:
 
 ```bash
 make test-cdrom
+make test-disc
 make test-sio
 make test-gte
 make test-dma
@@ -143,3 +145,7 @@ O runner gera saidas em `tests/out/`. Para investigar diferencas de GPU, veja
 - [psx-guide](https://github.com/simias/psx-guide) — guia de implementação
 - [rustation](https://github.com/simias/rustation) — emulador Rust de referência
 - [DuckStation](https://github.com/stenzek/duckstation) — referência moderna para comparar detalhes de GPU/GTE
+
+## Jogo 
+
+![jogo](./img/jogo.png)

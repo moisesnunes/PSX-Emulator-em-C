@@ -1,6 +1,7 @@
 #include "mdec.h"
 #include "log.h"
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #define MDEC_STATUS_DATA_OUT_EMPTY (1u << 31)
@@ -369,9 +370,9 @@ static void yuv_to_rgb(const Mdec *mdec, int16_t y, int16_t cr, int16_t cb,
     int32_t yy = signed9_to_s8(y);
     int32_t rr_chroma = signed9_to_s8(cr);
     int32_t bb_chroma = signed9_to_s8(cb);
-    int32_t rr = yy + (rr_chroma * 5743) / 4096;
-    int32_t gg = yy - (rr_chroma * 2926 + bb_chroma * 1408) / 4096;
-    int32_t bb = yy + (bb_chroma * 7258) / 4096;
+    int32_t rr = yy + ((rr_chroma * 359 + 0x80) >> 8);
+    int32_t gg = yy + ((-bb_chroma * 88 - rr_chroma * 183 + 0x80) >> 8);
+    int32_t bb = yy + ((bb_chroma * 454 + 0x80) >> 8);
     rr = clamp_i32(rr, -128, 127);
     gg = clamp_i32(gg, -128, 127);
     bb = clamp_i32(bb, -128, 127);

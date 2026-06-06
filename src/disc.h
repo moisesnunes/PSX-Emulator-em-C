@@ -20,9 +20,21 @@ uint32_t msf_to_lba(Msf msf);
 uint8_t to_bcd(uint8_t v);
 uint8_t from_bcd(uint8_t v);
 
+typedef enum
+{
+    DISC_TRACK_DATA,   /* MODE1/2048, MODE2/2352, etc. */
+    DISC_TRACK_AUDIO,  /* AUDIO */
+} DiscTrackType;
+
 typedef struct
 {
-    uint32_t start_lba; /* absolute LBA of track start (including lead-in) */
+    uint32_t start_lba;       /* logical disc LBA of track start; MSF adds lead-in */
+    FILE    *fp;
+    long     file_offset;     /* byte offset within fp where this track begins */
+    long     file_size;
+    uint32_t sector_size;     /* bytes per sector in the image file */
+    uint32_t data_offset;     /* byte offset to user data within a sector */
+    DiscTrackType type;
 } DiscTrack;
 
 typedef struct
@@ -39,6 +51,7 @@ void disc_close(Disc *disc);
 
 /* Read one raw 2352-byte sector at LBA `lba` into `buf`. */
 int disc_read_sector(Disc *disc, uint32_t lba, uint8_t buf[DISC_SECTOR_SIZE]);
+uint32_t disc_data_offset_for_lba(const Disc *disc, uint32_t lba);
 
 /* Track table helpers (used by CDROM GetTN/GetTD). */
 uint8_t disc_track_count_bcd(const Disc *disc);

@@ -93,6 +93,12 @@ struct Gpu
     /* CLUT address (updated from texture commands) */
     uint16_t clut_x;
     uint16_t clut_y;
+    bool texture_clut_cache_valid;
+    bool texture_clut_cache_stale;
+    uint16_t texture_clut_cache_x;
+    uint16_t texture_clut_cache_y;
+    TextureDepth texture_clut_cache_depth;
+    uint16_t texture_clut_cache[256];
 
     /* Display state */
     HorizontalRes hres;

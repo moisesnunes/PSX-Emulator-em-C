@@ -289,6 +289,70 @@ static void log_irq_event(uint8_t int_type)
 
 /* ---- Command handlers ---- */
 
+/* GetlocL (0x10) — current position as absolute MSF + sub-header bytes.
+   Returns 8 bytes: amm, ass, asect, amode, file, channel, submode, coding. */
+static void cmd_getlocl(Cdrom *cd, Scheduler *sched)
+{
+    resp_clear(cd);
+    Msf pos = msf_from_lba(cd->cur_lba);
+    resp_push(cd, pos.m);       /* amm */
+    resp_push(cd, pos.s);       /* ass */
+    resp_push(cd, pos.f);       /* asect */
+    resp_push(cd, 0x02);        /* amode — Mode 2 */
+    resp_push(cd, cd->xa_current_set ? cd->xa_current_file    : 0x01);
+    resp_push(cd, cd->xa_current_set ? cd->xa_current_channel : 0x00);
+    resp_push(cd, 0x08);        /* submode: data */
+    resp_push(cd, 0x00);        /* coding info */
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+    LOG(LOG_CDROM, "GetlocL LBA=%u %02X:%02X:%02X", cd->cur_lba, pos.m, pos.s, pos.f);
+}
+
+/* GetlocP (0x11) — current position in TOC format.
+   Returns 8 bytes: track, index, mm, ss, sect, amm, ass, asect. */
+static void cmd_getlocp(Cdrom *cd, Scheduler *sched)
+{
+    resp_clear(cd);
+    Msf abs_msf = msf_from_lba(cd->cur_lba);
+
+    /* Find which track contains cur_lba. */
+    uint8_t track_num = 1;
+    uint32_t track_start = 0;
+    if (cd->disc)
+    {
+        uint8_t tc = cd->disc->track_count;
+        for (uint8_t t = 1; t <= tc; t++)
+        {
+            uint32_t ts = cd->disc->tracks[t].start_lba;
+            if (ts <= cd->cur_lba)
+            {
+                track_num = t;
+                track_start = ts;
+            }
+        }
+    }
+
+    uint32_t rel_lba = cd->cur_lba >= track_start ? cd->cur_lba - track_start : 0;
+    Msf rel_msf = {
+        to_bcd((uint8_t)(rel_lba / 75 / 60)),
+        to_bcd((uint8_t)((rel_lba / 75) % 60)),
+        to_bcd((uint8_t)(rel_lba % 75)),
+    };
+
+    resp_push(cd, to_bcd(track_num)); /* track (BCD) */
+    resp_push(cd, 0x01);              /* index 1 (BCD) */
+    resp_push(cd, rel_msf.m);
+    resp_push(cd, rel_msf.s);
+    resp_push(cd, rel_msf.f);
+    resp_push(cd, abs_msf.m);
+    resp_push(cd, abs_msf.s);
+    resp_push(cd, abs_msf.f);
+    queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
+    LOG(LOG_CDROM, "GetlocP LBA=%u track=%02X abs=%02X:%02X:%02X rel=%02X:%02X:%02X",
+        cd->cur_lba, to_bcd(track_num),
+        abs_msf.m, abs_msf.s, abs_msf.f,
+        rel_msf.m, rel_msf.s, rel_msf.f);
+}
+
 /* GetTN (0x13) — first and last track number */
 static void cmd_gettn(Cdrom *cd, Scheduler *sched)
 {
@@ -579,6 +643,12 @@ static void execute_command(Cdrom *cd, uint8_t cmd, Scheduler *sched)
     case 0x01:
         cmd_getstat(cd, sched);
         break;
+    case 0x10:
+        cmd_getlocl(cd, sched);
+        break;
+    case 0x11:
+        cmd_getlocp(cd, sched);
+        break;
     case 0x02:
         cmd_setloc(cd, sched);
         break;
@@ -858,7 +928,9 @@ static void deliver_sector(Cdrom *cd, Irq *irq, Scheduler *sched)
     }
 
     uint8_t raw[DISC_SECTOR_SIZE];
-    disc_read_sector(cd->disc, cd->cur_lba, raw);
+    uint32_t sector_lba = cd->cur_lba;
+    uint32_t data_offset = disc_data_offset_for_lba(cd->disc, sector_lba);
+    disc_read_sector(cd->disc, sector_lba, raw);
     cd->cur_lba++;
     process_cdda_sector(cd, raw);
     decode_xa_sector(cd, raw);
@@ -879,7 +951,7 @@ static void deliver_sector(Cdrom *cd, Irq *irq, Scheduler *sched)
     {
         cd->data_len = DISC_DATA_SIZE;
         cd->data_pos = 0;
-        memcpy(cd->data_fifo, raw + DISC_DATA_OFFSET, DISC_DATA_SIZE);
+        memcpy(cd->data_fifo, raw + data_offset, DISC_DATA_SIZE);
     }
 
     resp_clear(cd);

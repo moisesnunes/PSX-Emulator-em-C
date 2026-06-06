@@ -271,7 +271,49 @@ static inline int32_t gpu_xy_y(uint32_t xy) { return gpu_coord11(xy >> 16); }
 static inline int32_t gpu_truncate_coord(int32_t v) { return gpu_coord11((uint32_t)v); }
 
 /* ---- Texture fetch ---- */
-static uint16_t texel_fetch(const Gpu *gpu, uint8_t u, uint8_t v)
+typedef struct
+{
+    bool clut_valid;
+    uint16_t clut[256];
+} TextureCache;
+
+static void texture_clut_cache_invalidate(Gpu *gpu)
+{
+    gpu->texture_clut_cache_valid = false;
+    gpu->texture_clut_cache_stale = false;
+}
+
+static void texture_cache_init(Gpu *gpu, TextureCache *cache)
+{
+    cache->clut_valid = false;
+    if (gpu->texture_disable || gpu->texture_depth == TEXTURE_DEPTH_15BIT)
+        return;
+
+    uint32_t entries = (gpu->texture_depth == TEXTURE_DEPTH_4BIT) ? 16u : 256u;
+    bool stale_compatible =
+        gpu->texture_clut_cache_valid &&
+        gpu->texture_clut_cache_stale &&
+        gpu->texture_clut_cache_x == gpu->clut_x &&
+        gpu->texture_clut_cache_y == gpu->clut_y &&
+        (gpu->texture_clut_cache_depth == gpu->texture_depth ||
+         (gpu->texture_clut_cache_depth == TEXTURE_DEPTH_8BIT && gpu->texture_depth == TEXTURE_DEPTH_4BIT));
+
+    if (!stale_compatible)
+    {
+        for (uint32_t i = 0; i < entries; i++)
+            gpu->texture_clut_cache[i] = vram_load(gpu->vram, gpu->clut_x + i, gpu->clut_y);
+        gpu->texture_clut_cache_x = gpu->clut_x;
+        gpu->texture_clut_cache_y = gpu->clut_y;
+        gpu->texture_clut_cache_depth = gpu->texture_depth;
+        gpu->texture_clut_cache_valid = true;
+        gpu->texture_clut_cache_stale = false;
+    }
+
+    memcpy(cache->clut, gpu->texture_clut_cache, entries * sizeof(cache->clut[0]));
+    cache->clut_valid = true;
+}
+
+static uint16_t texel_fetch(const Gpu *gpu, const TextureCache *cache, uint8_t u, uint8_t v)
 {
     /* When texture_disable is set the rasterizer still runs but ignores the
        texture map; returning 0x7FFF (full white, non-transparent) causes the
@@ -297,7 +339,7 @@ static uint16_t texel_fetch(const Gpu *gpu, uint8_t u, uint8_t v)
         uint32_t ty = page_y + v;
         uint16_t raw = vram_load(gpu->vram, tx, ty);
         uint8_t idx = (raw >> ((u % 4) * 4)) & 0xF;
-        return vram_load(gpu->vram, gpu->clut_x + idx, gpu->clut_y);
+        return (cache && cache->clut_valid) ? cache->clut[idx] : vram_load(gpu->vram, gpu->clut_x + idx, gpu->clut_y);
     }
     case TEXTURE_DEPTH_8BIT:
     {
@@ -306,7 +348,7 @@ static uint16_t texel_fetch(const Gpu *gpu, uint8_t u, uint8_t v)
         uint32_t ty = page_y + v;
         uint16_t raw = vram_load(gpu->vram, tx, ty);
         uint8_t idx = (u & 1) ? (raw >> 8) & 0xFF : raw & 0xFF;
-        return vram_load(gpu->vram, gpu->clut_x + idx, gpu->clut_y);
+        return (cache && cache->clut_valid) ? cache->clut[idx] : vram_load(gpu->vram, gpu->clut_x + idx, gpu->clut_y);
     }
     case TEXTURE_DEPTH_15BIT:
     {
@@ -397,6 +439,12 @@ static bool edge_is_top_left(int32_t ax, int32_t ay, int32_t bx, int32_t by)
     return (ay == by && ax > bx) || (ay < by);
 }
 
+static bool edge_accepts_zero(int32_t ax, int32_t ay, int32_t bx, int32_t by, bool neg)
+{
+    return neg ? edge_is_top_left(bx, by, ax, ay)
+               : edge_is_top_left(ax, ay, bx, by);
+}
+
 /* Filled shaded triangle via scanline rasterization */
 static void fill_triangle(Gpu *gpu,
                           int32_t x0, int32_t y0, uint8_t r0, uint8_t g0, uint8_t b0,
@@ -424,12 +472,12 @@ static void fill_triangle(Gpu *gpu,
     if (y2 > max_y)
         max_y = y2;
 
-    bool tl01 = edge_is_top_left(x0, y0, x1, y1);
-    bool tl12 = edge_is_top_left(x1, y1, x2, y2);
-    bool tl20 = edge_is_top_left(x2, y2, x0, y0);
     bool neg = area < 0;
     if (neg)
         area = -area;
+    bool tl01 = edge_accepts_zero(x0, y0, x1, y1, neg);
+    bool tl12 = edge_accepts_zero(x1, y1, x2, y2, neg);
+    bool tl20 = edge_accepts_zero(x2, y2, x0, y0, neg);
 
     for (int32_t y = min_y; y <= max_y; y++)
     {
@@ -466,7 +514,7 @@ static void fill_triangle_tex(Gpu *gpu,
                               int32_t x0, int32_t y0, uint8_t u0, uint8_t v0, uint8_t r0, uint8_t g0, uint8_t b0,
                               int32_t x1, int32_t y1, uint8_t u1, uint8_t v1, uint8_t r1, uint8_t g1, uint8_t b1,
                               int32_t x2, int32_t y2, uint8_t u2, uint8_t v2, uint8_t r2, uint8_t g2, uint8_t b2,
-                              bool blend, bool semi)
+                              bool blend, bool semi, const TextureCache *cache)
 {
     int32_t sx0 = x0 * 2, sy0 = y0 * 2;
     int32_t sx1 = x1 * 2, sy1 = y1 * 2;
@@ -494,6 +542,9 @@ static void fill_triangle_tex(Gpu *gpu,
     bool neg = area < 0;
     if (neg)
         area = -area;
+    bool tl01 = edge_accepts_zero(sx0, sy0, sx1, sy1, neg);
+    bool tl12 = edge_accepts_zero(sx1, sy1, sx2, sy2, neg);
+    bool tl20 = edge_accepts_zero(sx2, sy2, sx0, sy0, neg);
 
     for (int32_t y = min_y; y <= max_y; y++)
     {
@@ -511,24 +562,17 @@ static void fill_triangle_tex(Gpu *gpu,
                 w2 = -w2;
             }
 
-            if (w0 < 0 || w1 < 0 || w2 < 0)
+            if (!((w0 > 0 || (w0 == 0 && tl12)) &&
+                  (w1 > 0 || (w1 == 0 && tl20)) &&
+                  (w2 > 0 || (w2 == 0 && tl01))))
                 continue;
 
-            int64_t uw0 = edge_i64(sx1, sy1, sx2, sy2, x * 2, y * 2);
-            int64_t uw1 = edge_i64(sx2, sy2, sx0, sy0, x * 2, y * 2);
-            int64_t uw2 = edge_i64(sx0, sy0, sx1, sy1, x * 2, y * 2);
-            if (neg)
-            {
-                uw0 = -uw0;
-                uw1 = -uw1;
-                uw2 = -uw2;
-            }
-            uint8_t fu = (uint8_t)((uw0 * u0 + uw1 * u1 + uw2 * u2 + (area - 1) / 2) / area);
-            uint8_t fv = (uint8_t)((uw0 * v0 + uw1 * v1 + uw2 * v2 + (area - 1) / 2) / area);
+            uint8_t fu = (uint8_t)((w0 * u0 + w1 * u1 + w2 * u2 + (area - 1) / 2) / area);
+            uint8_t fv = (uint8_t)((w0 * v0 + w1 * v1 + w2 * v2 + (area - 1) / 2) / area);
             uint8_t mcr = (uint8_t)((w0 * r0 + w1 * r1 + w2 * r2 + area / 2) / area);
             uint8_t mcg = (uint8_t)((w0 * g0 + w1 * g1 + w2 * g2 + area / 2) / area);
             uint8_t mcb = (uint8_t)((w0 * b0 + w1 * b1 + w2 * b2 + area / 2) / area);
-            uint16_t texel = texel_fetch(gpu, fu, fv);
+            uint16_t texel = texel_fetch(gpu, cache, fu, fv);
             if (texel == 0)
                 continue; /* transparent */
             bool pix_semi = semi && (texel & 0x8000u);
@@ -547,10 +591,11 @@ static void fill_triangle_tex(Gpu *gpu,
                 pixel = gpu->dithering
                             ? rgb_to_1555_dither((uint8_t)tr, (uint8_t)tg, (uint8_t)tb, x, y)
                             : rgb_to_1555((uint8_t)tr, (uint8_t)tg, (uint8_t)tb);
+                pixel |= texel & 0x8000u;
             }
             else
             {
-                pixel = texel & 0x7FFFu; /* strip STP bit before writing */
+                pixel = texel;
             }
             draw_pixel(gpu, x, y, pixel, pix_semi);
         }
@@ -1151,6 +1196,19 @@ static void gp0_fill_rect(Gpu *gpu)
     uint16_t h = (uint16_t)((wh >> 16) & 0x1FF);
     trace_prim("fill xy=(%u,%u) size=%ux%u color=%02X,%02X,%02X",
                x, y, w, h, r, g, b);
+    if (gpu->texture_clut_cache_valid)
+    {
+        uint32_t entries = (gpu->texture_clut_cache_depth == TEXTURE_DEPTH_4BIT) ? 16u : 256u;
+        uint32_t cache_x0 = gpu->texture_clut_cache_x;
+        uint32_t cache_x1 = cache_x0 + entries;
+        uint32_t fill_x0 = x;
+        uint32_t fill_x1 = fill_x0 + w;
+        uint32_t fill_y0 = y;
+        uint32_t fill_y1 = fill_y0 + h;
+        if (gpu->texture_clut_cache_y >= fill_y0 && gpu->texture_clut_cache_y < fill_y1 &&
+            cache_x0 < fill_x1 && fill_x0 < cache_x1)
+            gpu->texture_clut_cache_stale = true;
+    }
     for (uint16_t dy = 0; dy < h; dy++)
         for (uint16_t dx = 0; dx < w; dx++)
             vram_store(gpu->vram, (x + dx) & 1023u, (y + dy) & 511u, col);
@@ -1358,7 +1416,9 @@ static void gp0_triangle_tex_opaque(Gpu *gpu)
     /* bit 0 of the command byte: 0 = blend modulation color, 1 = raw texture */
     bool blend = ((gpu->gp0_command.buffer[0] >> 24) & 0x01) == 0;
     bool semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
-    fill_triangle_tex(gpu, x0, y0, u0, v0, cr, cg, cb, x1, y1, u1, v1, cr, cg, cb, x2, y2, u2, v2, cr, cg, cb, blend, semi);
+    TextureCache cache;
+    texture_cache_init(gpu, &cache);
+    fill_triangle_tex(gpu, x0, y0, u0, v0, cr, cg, cb, x1, y1, u1, v1, cr, cg, cb, x2, y2, u2, v2, cr, cg, cb, blend, semi, &cache);
 }
 
 /* ---- Textured quads (9 words) ---- */
@@ -1432,8 +1492,14 @@ static void gp0_quad_tex_opaque(Gpu *gpu)
                gpu->drawing_area_left, gpu->drawing_area_top,
                gpu->drawing_area_right, gpu->drawing_area_bottom,
                gpu->drawing_x_offset, gpu->drawing_y_offset);
-    fill_triangle_tex(gpu, xs[0], ys[0], us[0], vs[0], cr, cg, cb, xs[2], ys[2], us[2], vs[2], cr, cg, cb, xs[1], ys[1], us[1], vs[1], cr, cg, cb, blend, semi);
-    fill_triangle_tex(gpu, xs[1], ys[1], us[1], vs[1], cr, cg, cb, xs[2], ys[2], us[2], vs[2], cr, cg, cb, xs[3], ys[3], us[3], vs[3], cr, cg, cb, blend, semi);
+    TextureCache cache;
+    texture_cache_init(gpu, &cache);
+    fill_triangle_tex(gpu, xs[0], ys[0], us[0], vs[0], cr, cg, cb,
+                      xs[1], ys[1], us[1], vs[1], cr, cg, cb,
+                      xs[3], ys[3], us[3], vs[3], cr, cg, cb, blend, semi, &cache);
+    fill_triangle_tex(gpu, xs[0], ys[0], us[0], vs[0], cr, cg, cb,
+                      xs[3], ys[3], us[3], vs[3], cr, cg, cb,
+                      xs[2], ys[2], us[2], vs[2], cr, cg, cb, blend, semi, &cache);
 }
 
 /* ---- Shaded+textured triangle (9 words) ---- */
@@ -1481,7 +1547,9 @@ static void gp0_triangle_shaded_tex_opaque(Gpu *gpu)
     apply_offset(gpu, &x2, &y2);
     bool blend = ((gpu->gp0_command.buffer[0] >> 24) & 0x01) == 0;
     bool semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
-    fill_triangle_tex(gpu, x0, y0, u0, v0, r0, g0, b0, x1, y1, u1, v1, r1, g1, b1, x2, y2, u2, v2, r2, g2, b2, blend, semi);
+    TextureCache cache;
+    texture_cache_init(gpu, &cache);
+    fill_triangle_tex(gpu, x0, y0, u0, v0, r0, g0, b0, x1, y1, u1, v1, r1, g1, b1, x2, y2, u2, v2, r2, g2, b2, blend, semi, &cache);
 }
 
 /* ---- Shaded+textured quad (12 words) ---- */
@@ -1530,12 +1598,14 @@ static void gp0_quad_shaded_tex_opaque(Gpu *gpu)
     }
     bool blend = ((gpu->gp0_command.buffer[0] >> 24) & 0x01) == 0;
     bool semi = ((gpu->gp0_command.buffer[0] >> 24) & 0x02) != 0;
+    TextureCache cache;
+    texture_cache_init(gpu, &cache);
     fill_triangle_tex(gpu, xs[0], ys[0], us[0], vs[0], rs[0], gs[0], bs[0],
-                      xs[2], ys[2], us[2], vs[2], rs[2], gs[2], bs[2],
-                      xs[1], ys[1], us[1], vs[1], rs[1], gs[1], bs[1], blend, semi);
-    fill_triangle_tex(gpu, xs[1], ys[1], us[1], vs[1], rs[1], gs[1], bs[1],
-                      xs[2], ys[2], us[2], vs[2], rs[2], gs[2], bs[2],
-                      xs[3], ys[3], us[3], vs[3], rs[3], gs[3], bs[3], blend, semi);
+                      xs[1], ys[1], us[1], vs[1], rs[1], gs[1], bs[1],
+                      xs[3], ys[3], us[3], vs[3], rs[3], gs[3], bs[3], blend, semi, &cache);
+    fill_triangle_tex(gpu, xs[0], ys[0], us[0], vs[0], rs[0], gs[0], bs[0],
+                      xs[3], ys[3], us[3], vs[3], rs[3], gs[3], bs[3],
+                      xs[2], ys[2], us[2], vs[2], rs[2], gs[2], bs[2], blend, semi, &cache);
 }
 
 /* ---- Rectangle helpers ---- */
@@ -1546,7 +1616,8 @@ static void fill_rect_sw(Gpu *gpu, int32_t rx, int32_t ry, int32_t rw, int32_t r
             draw_pixel(gpu, rx + dx, ry + dy, color, semi);
 }
 static void fill_rect_tex_sw(Gpu *gpu, int32_t rx, int32_t ry, int32_t rw, int32_t rh,
-                             uint8_t u0, uint8_t v0, uint8_t cr, uint8_t cg, uint8_t cb, bool blend, bool semi)
+                             uint8_t u0, uint8_t v0, uint8_t cr, uint8_t cg, uint8_t cb, bool blend, bool semi,
+                             const TextureCache *cache)
 {
     for (int32_t dy = 0; dy < rh; dy++)
     {
@@ -1558,7 +1629,7 @@ static void fill_rect_tex_sw(Gpu *gpu, int32_t rx, int32_t ry, int32_t rw, int32
             uint8_t fu = (uint8_t)(u0 + dx);
             if (gpu->rectangle_texture_x_flip)
                 fu = (uint8_t)(u0 + 1 - dx);
-            uint16_t texel = texel_fetch(gpu, fu, fv);
+            uint16_t texel = texel_fetch(gpu, cache, fu, fv);
             if (texel == 0)
                 continue;
             bool pix_semi = semi && (texel & 0x8000u);
@@ -1574,11 +1645,11 @@ static void fill_rect_tex_sw(Gpu *gpu, int32_t rx, int32_t ry, int32_t rw, int32
                     tg = 255u;
                 if (tb > 255u)
                     tb = 255u;
-                pixel = rgb_to_1555((uint8_t)tr, (uint8_t)tg, (uint8_t)tb);
+                pixel = rgb_to_1555((uint8_t)tr, (uint8_t)tg, (uint8_t)tb) | (texel & 0x8000u);
             }
             else
             {
-                pixel = texel & 0x7FFFu;
+                pixel = texel;
             }
             draw_pixel(gpu, rx + dx, ry + dy, pixel, pix_semi);
         }
@@ -1643,7 +1714,9 @@ static void rect_tex_common(Gpu *gpu, int32_t w, int32_t h)
                blend ? 1u : 0u, semi ? 1u : 0u, (unsigned)gpu->semi_transparency,
                (unsigned)gpu->texture_depth, gpu->clut_x, gpu->clut_y,
                gpu->page_base_x, gpu->page_base_y);
-    fill_rect_tex_sw(gpu, rx, ry, w, h, u0, v0, cr, cg, cb, blend, semi);
+    TextureCache cache;
+    texture_cache_init(gpu, &cache);
+    fill_rect_tex_sw(gpu, rx, ry, w, h, u0, v0, cr, cg, cb, blend, semi, &cache);
 }
 static void rect_tex_common_var(Gpu *gpu)
 {
@@ -1668,7 +1741,9 @@ static void rect_tex_common_var(Gpu *gpu)
                blend ? 1u : 0u, semi ? 1u : 0u, (unsigned)gpu->semi_transparency,
                (unsigned)gpu->texture_depth, gpu->clut_x, gpu->clut_y,
                gpu->page_base_x, gpu->page_base_y);
-    fill_rect_tex_sw(gpu, rx, ry, w, h, u0, v0, cr, cg, cb, blend, semi);
+    TextureCache cache;
+    texture_cache_init(gpu, &cache);
+    fill_rect_tex_sw(gpu, rx, ry, w, h, u0, v0, cr, cg, cb, blend, semi, &cache);
 }
 static void gp0_rect_variable_tex_opaque(Gpu *gpu) { rect_tex_common_var(gpu); }
 static void gp0_rect_1x1_tex_opaque(Gpu *gpu) { rect_tex_common(gpu, 1, 1); }
@@ -1683,6 +1758,7 @@ static void gp0_image_load(Gpu *gpu)
     uint16_t w = res & 0xFFFF, h = res >> 16;
     if (w == 0 || h == 0)
         return;
+    texture_clut_cache_invalidate(gpu);
     LOG(LOG_GPU, "GP0 image load dst=%u,%u size=%ux%u words=%u",
         x, y, w, h, ((uint32_t)w * h + 1u) / 2u);
     gpu->image_load_x = x;
@@ -1968,6 +2044,7 @@ static void gp1_reset(Gpu *gpu)
     gpu->display_line_start = 0x0010;
     gpu->display_line_end = 0x0100;
     gpu->display_depth = DISPLAY_DEPTH_15;
+    texture_clut_cache_invalidate(gpu);
     gp1_reset_command_buffer(gpu);
 }
 
@@ -2050,6 +2127,7 @@ void gpu_vblank(Gpu *gpu)
     const char *dump_path = getenv("PS1_DUMP_VRAM_PPM");
     const char *dump_frame_env = getenv("PS1_DUMP_FRAME");
     bool dump_full_vram = getenv("PS1_DUMP_FULL_VRAM") != NULL;
+    bool dump_stp_alpha = getenv("PS1_DUMP_STP_ALPHA") != NULL;
     uint32_t dump_frame = dump_frame_env ? (uint32_t)strtoul(dump_frame_env, NULL, 10) : 120u;
     if (dump_path && !dumped && frame_count >= dump_frame)
     {
@@ -2058,12 +2136,14 @@ void gpu_vblank(Gpu *gpu)
         {
             uint32_t dump_w = dump_full_vram ? 1024u : w;
             uint32_t dump_h = dump_full_vram ? 512u : h;
-            fprintf(f, "P6\n%u %u\n255\n", dump_w, dump_h);
+            /* P7 PAM: 4 channels (RGBA) so the STP/mask bit is preserved as alpha */
+            fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
+                    dump_w, dump_h);
             for (uint32_t y = 0; y < dump_h; y++)
             {
                 for (uint32_t x = 0; x < dump_w; x++)
                 {
-                    uint8_t r8, g8, b8;
+                    uint8_t r8, g8, b8, a8;
                     if (!dump_full_vram && display_24bit)
                     {
                         uint32_t byte_base = (((display_y + y) & 511u) * 1024u +
@@ -2078,6 +2158,7 @@ void gpu_vblank(Gpu *gpu)
                         r8 = bytes & 0xFFu;
                         g8 = (bytes >> 8) & 0xFFu;
                         b8 = (bytes >> 16) & 0xFFu;
+                        a8 = 255u;
                     }
                     else
                     {
@@ -2090,10 +2171,12 @@ void gpu_vblank(Gpu *gpu)
                         r8 = r5 << 3;
                         g8 = g5 << 3;
                         b8 = b5 << 3;
+                        a8 = dump_stp_alpha ? ((c & 0x8000u) ? 255u : 0u) : 255u;
                     }
                     fputc(r8, f);
                     fputc(g8, f);
                     fputc(b8, f);
+                    fputc(a8, f);
                 }
             }
             fclose(f);

@@ -9,6 +9,10 @@
 #define SPU_SAMPLE_RATE 44100u
 #define SPU_MAX_AUDIO_QUEUE_BYTES (SPU_SAMPLE_RATE / 10u * 2u * sizeof(int16_t))
 
+/* SPUCNT register offset within spu->regs */
+#define SPU_CTRL_OFFSET  0x01AA
+#define SPU_STAT_OFFSET  0x01AE
+
 static const int16_t FIR_FILTER[FIR_LEN] = {
     -0x0001,
     0x0000,
@@ -171,6 +175,9 @@ static void voice_init(Voice *v)
     v->volume_l = 0x7FFF;
     v->volume_r = 0x7FFF;
     v->envelope.phase = ADSR_RELEASE;
+    v->reached_loop_end = false;
+    v->noise_enabled = false;
+    v->pitch_mod_enabled = false;
 }
 
 static void adsr_key_on(AdsrEnvelope *e)
@@ -232,20 +239,19 @@ static void adsr_clock(AdsrEnvelope *e, EnvDirection dir, ChangeRate rate,
 
 static void voice_decode_next_block(Voice *v, const uint8_t *sound_ram)
 {
-    const uint8_t *block = &sound_ram[v->current_address];
-    int16_t old = v->decode_buffer[27];
-    int16_t older = v->decode_buffer[26];
-    decode_adpcm_block(block, v->decode_buffer, &old, &older);
+    const uint8_t *block = &sound_ram[v->current_address & (SOUND_RAM_SIZE - 1u)];
+    decode_adpcm_block(block, v->decode_buffer, &v->adpcm_old, &v->adpcm_older);
 
-    bool loop_end = (block[1] & (1 << 0)) != 0;
+    bool loop_end    = (block[1] & (1 << 0)) != 0;
     bool loop_repeat = (block[1] & (1 << 1)) != 0;
-    bool loop_start = (block[1] & (1 << 2)) != 0;
+    bool loop_start  = (block[1] & (1 << 2)) != 0;
 
     if (loop_start)
         v->repeat_address = v->current_address;
 
     if (loop_end)
     {
+        v->reached_loop_end = true;
         v->current_address = v->repeat_address;
         if (!loop_repeat)
         {
@@ -264,6 +270,10 @@ static void voice_key_on(Voice *v, const uint8_t *sound_ram)
     adsr_key_on(&v->envelope);
     v->current_address = v->start_address;
     v->pitch_counter = 0;
+    v->current_buffer_idx = 0;
+    v->adpcm_old = 0;
+    v->adpcm_older = 0;
+    v->reached_loop_end = false;
     voice_decode_next_block(v, sound_ram);
     v->keyed_on = true;
 }
@@ -274,7 +284,9 @@ static void voice_key_off(Voice *v)
     v->keyed_on = false;
 }
 
-static void voice_clock(Voice *v, const uint8_t *sound_ram)
+/* pitch_mod_sample: output of the previous voice, used when pitch_mod_enabled.
+   Pass 0 if pitch modulation is not active for this voice. */
+static void voice_clock(Voice *v, const uint8_t *sound_ram, int16_t pitch_mod_sample)
 {
     EnvDirection dir = DIR_INCREASING;
     ChangeRate rate = RATE_LINEAR;
@@ -310,7 +322,18 @@ static void voice_clock(Voice *v, const uint8_t *sound_ram)
     }
     adsr_clock(&v->envelope, dir, rate, shift, step);
 
-    uint16_t step_val = v->sample_rate < 0x4000 ? v->sample_rate : 0x4000;
+    /* Pitch modulation: modulate sample_rate by previous voice's output level. */
+    uint32_t effective_rate = v->sample_rate;
+    if (v->pitch_mod_enabled && pitch_mod_sample != 0)
+    {
+        /* Factor = (0x8000 + pitch_mod_sample) >> 15; range ~0..2 */
+        int32_t factor = (int32_t)0x8000 + (int32_t)pitch_mod_sample;
+        effective_rate = (uint32_t)(((int32_t)effective_rate * factor) >> 15);
+        if (effective_rate > 0x3FFF)
+            effective_rate = 0x3FFF;
+    }
+
+    uint16_t step_val = (uint16_t)(effective_rate < 0x4000 ? effective_rate : 0x4000);
     v->pitch_counter += step_val;
     while (v->pitch_counter >= 0x1000)
     {
@@ -360,6 +383,90 @@ static void voice_store(Voice *v, uint32_t offset, uint16_t val)
         break;
     default:
         break;
+    }
+}
+
+/* ---- Noise generator ----
+   PS1 LFSR-based noise: parity of bits 15,12,11,10 XOR'd in, shifted left.
+   Runs at a rate derived from SPUCNT noise-frequency field. */
+static void noise_clock(Spu *spu)
+{
+    /* Parity of bits [15,12,11,10] */
+    uint32_t n = spu->noise_level;
+    uint32_t parity = ((n >> 15) ^ (n >> 12) ^ (n >> 11) ^ (n >> 10)) & 1u;
+    spu->noise_level = ((n << 1) | parity) & 0xFFFFu;
+}
+
+/* Step the noise generator according to its frequency setting.
+   Called once per SPU sample tick. Returns current noise sample.
+   PS1 noise frequency register: SPUCNT bits[13:10]=shift, bits[9:8]=step.
+   The noise LFSR advances every (4+step) << shift CPU-clock cycles.
+   We simplify to: advance every (4+step) << shift SPU ticks (44100 Hz domain). */
+static int16_t noise_step(Spu *spu)
+{
+    uint32_t freq = (uint32_t)(4u + (spu->noise_step & 3u)) << (spu->noise_shift & 0xFu);
+    if (freq == 0)
+        freq = 1;
+    spu->noise_timer++;
+    if (spu->noise_timer >= freq)
+    {
+        spu->noise_timer = 0;
+        noise_clock(spu);
+    }
+    return (int16_t)(spu->noise_level & 0xFFFFu);
+}
+
+/* Sweep volume update — runs once per SPU sample tick for each voice.
+   Sweep register layout (when bit 15 set):
+     bit 14 = direction (0=increase, 1=decrease)
+     bit 13 = mode (0=linear, 1=exponential)
+     bit 12 = phase (0=positive, 1=negative)
+     bits 10:5 = shift, bits 2:1 = step */
+static void voice_sweep_volume(Voice *v)
+{
+    if (!v->enable_sweep_l && !v->enable_sweep_r)
+        return;
+    if (v->enable_sweep_l)
+    {
+        uint16_t sw = v->sweep_l;
+        bool decrease   = (sw & 0x4000) != 0;
+        bool expo       = (sw & 0x2000) != 0;
+        uint8_t sh      = (sw >> 5) & 0x1Fu;
+        int32_t st      = (int32_t)(3 - ((sw >> 1) & 3));
+        int32_t cur     = (int32_t)v->volume_l;
+        int32_t delta   = (1 << (11 - (sh < 11 ? sh : 11)));
+        if (expo && !decrease)
+            delta = (cur < 0x6000) ? delta : delta >> 2;
+        else if (expo && decrease)
+            delta = (delta * cur) >> 15;
+        if (decrease)
+            delta = -delta;
+        delta += st;
+        cur += delta;
+        if (cur > 0x7FFF) cur = 0x7FFF;
+        if (cur < -0x8000) cur = -0x8000;
+        v->volume_l = (int16_t)cur;
+    }
+    if (v->enable_sweep_r)
+    {
+        uint16_t sw = v->sweep_r;
+        bool decrease   = (sw & 0x4000) != 0;
+        bool expo       = (sw & 0x2000) != 0;
+        uint8_t sh      = (sw >> 5) & 0x1Fu;
+        int32_t st      = (int32_t)(3 - ((sw >> 1) & 3));
+        int32_t cur     = (int32_t)v->volume_r;
+        int32_t delta   = (1 << (11 - (sh < 11 ? sh : 11)));
+        if (expo && !decrease)
+            delta = (cur < 0x6000) ? delta : delta >> 2;
+        else if (expo && decrease)
+            delta = (delta * cur) >> 15;
+        if (decrease)
+            delta = -delta;
+        delta += st;
+        cur += delta;
+        if (cur > 0x7FFF) cur = 0x7FFF;
+        if (cur < -0x8000) cur = -0x8000;
+        v->volume_r = (int16_t)cur;
     }
 }
 
@@ -424,6 +531,7 @@ int spu_init(Spu *spu, bool enable_audio)
     spu->main_volume_l = 0x7FFF;
     spu->main_volume_r = 0x7FFF;
     spu->reverb_left = true;
+    spu->noise_level = 0x0001; /* seed LFSR so it doesn't get stuck at 0 */
 
     if (!enable_audio)
         return 0;
@@ -548,6 +656,24 @@ void spu_store(Spu *spu, uint32_t abs_addr, uint32_t offset, uint16_t val)
             if (val & (1 << i))
                 voice_key_off(&spu->voices[16 + i]);
         break;
+    case 0x0190: /* PMON lo — voices 1..15 */
+        spu->pmon_mask = (spu->pmon_mask & 0xFF0000u) | (val & 0xFFFEu); /* bit 0 ignored */
+        for (int i = 1; i < 16; i++)
+            spu->voices[i].pitch_mod_enabled = (spu->pmon_mask & (1u << i)) != 0;
+        break;
+    case 0x0192: /* PMON hi — voices 16..23 */
+        spu->pmon_mask = (spu->pmon_mask & 0x0000FFFFu) | ((uint32_t)(val & 0xFFu) << 16);
+        for (int i = 0; i < 8; i++)
+            spu->voices[16 + i].pitch_mod_enabled = (spu->pmon_mask & (1u << (16 + i))) != 0;
+        break;
+    case 0x0194: /* NON lo — noise enable voices 0..15 */
+        for (int i = 0; i < 16; i++)
+            spu->voices[i].noise_enabled = (val & (1 << i)) != 0;
+        break;
+    case 0x0196: /* NON hi — noise enable voices 16..23 */
+        for (int i = 0; i < 8; i++)
+            spu->voices[16 + i].noise_enabled = (val & (1 << i)) != 0;
+        break;
     case 0x0198:
         for (int i = 0; i < 16; i++)
             spu->voices[i].reverb_enabled = (val & (1 << i)) != 0;
@@ -555,6 +681,10 @@ void spu_store(Spu *spu, uint32_t abs_addr, uint32_t offset, uint16_t val)
     case 0x019A:
         for (int i = 0; i < 8; i++)
             spu->voices[16 + i].reverb_enabled = (val & (1 << i)) != 0;
+        break;
+    case 0x01AA: /* SPUCNT */
+        spu->noise_shift = (val >> 10) & 0x0Fu;
+        spu->noise_step  = (val >>  8) & 0x03u;
         break;
     case 0x0180:
         if (!(val & 0x8000))
@@ -679,15 +809,37 @@ void spu_store(Spu *spu, uint32_t abs_addr, uint32_t offset, uint16_t val)
 void spu_clock(Spu *spu)
 {
     int32_t mixed_l = 0, mixed_r = 0, reverb = 0;
+    int16_t noise_sample = noise_step(spu);
+    int16_t prev_voice_sample = 0; /* for pitch modulation chain */
+
+    /* Update ENDX bitmask in regs (two 16-bit words at 0x019C/0x019E). */
+    uint32_t endx = 0;
+    for (int i = 0; i < NUM_VOICES; i++)
+        if (spu->voices[i].reached_loop_end)
+            endx |= (1u << i);
+    spu->regs[0x019C / 2] = (uint16_t)(endx & 0xFFFF);
+    spu->regs[0x019E / 2] = (uint16_t)((endx >> 16) & 0xFF);
+
+    /* SPUSTAT: mirror lower 6 bits of SPUCNT, set bit 7 = SPU busy (always 0 here). */
+    uint16_t spucnt = spu->regs[SPU_CTRL_OFFSET / 2];
+    spu->regs[SPU_STAT_OFFSET / 2] = (uint16_t)(spucnt & 0x003F);
 
     for (int i = 0; i < NUM_VOICES; i++)
     {
         Voice *v = &spu->voices[i];
         if (!v->keyed_on)
+        {
+            prev_voice_sample = 0;
             continue;
-        voice_clock(v, spu->sound_ram);
+        }
+        voice_sweep_volume(v);
+        voice_clock(v, spu->sound_ram, v->pitch_mod_enabled ? prev_voice_sample : 0);
+
+        int16_t sample = v->noise_enabled ? noise_sample : v->current_sample;
+        prev_voice_sample = sample;
+
         int16_t sl, sr;
-        voice_apply_volume(v, v->current_sample, &sl, &sr);
+        voice_apply_volume(v, sample, &sl, &sr);
         mixed_l += sl;
         mixed_r += sr;
         if (v->reverb_enabled)
@@ -757,9 +909,19 @@ void spu_dma_write(Spu *spu, uint32_t word)
 {
     uint32_t addr = spu->sound_ram_start_address & (SOUND_RAM_SIZE - 1u);
     spu->sound_ram[addr] = (uint8_t)(word & 0xFF);
-    spu->sound_ram[addr + 1] = (uint8_t)((word >> 8) & 0xFF);
-    uint32_t addr2 = (addr + 2u) & (SOUND_RAM_SIZE - 1u);
-    spu->sound_ram[addr2] = (uint8_t)((word >> 16) & 0xFF);
-    spu->sound_ram[addr2 + 1] = (uint8_t)((word >> 24) & 0xFF);
+    spu->sound_ram[(addr + 1u) & (SOUND_RAM_SIZE - 1u)] = (uint8_t)((word >> 8) & 0xFF);
+    spu->sound_ram[(addr + 2u) & (SOUND_RAM_SIZE - 1u)] = (uint8_t)((word >> 16) & 0xFF);
+    spu->sound_ram[(addr + 3u) & (SOUND_RAM_SIZE - 1u)] = (uint8_t)((word >> 24) & 0xFF);
     spu->sound_ram_start_address = (addr + 4u) & (SOUND_RAM_SIZE - 1u);
+}
+
+uint32_t spu_dma_read(Spu *spu)
+{
+    uint32_t addr = spu->sound_ram_start_address & (SOUND_RAM_SIZE - 1u);
+    uint32_t word = (uint32_t)spu->sound_ram[addr] |
+                    ((uint32_t)spu->sound_ram[(addr + 1u) & (SOUND_RAM_SIZE - 1u)] << 8) |
+                    ((uint32_t)spu->sound_ram[(addr + 2u) & (SOUND_RAM_SIZE - 1u)] << 16) |
+                    ((uint32_t)spu->sound_ram[(addr + 3u) & (SOUND_RAM_SIZE - 1u)] << 24);
+    spu->sound_ram_start_address = (addr + 4u) & (SOUND_RAM_SIZE - 1u);
+    return word;
 }
