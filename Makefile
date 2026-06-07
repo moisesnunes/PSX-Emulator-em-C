@@ -19,6 +19,7 @@ SRCS = src/main.c         \
        src/mdec.c         \
        src/renderer.c     \
        src/spu.c          \
+       src/debug_trace.c  \
        src/log.c          \
        src/irq.c          \
        src/scheduler.c    \
@@ -35,6 +36,8 @@ DEPS       = $(wildcard src/*.h)
 TARGET     = ps1_boot
 PSX_TEST_RUNNER = python3 tests/run_psx_tests.py
 PSX_TEST_ARGS ?=
+GAME_SMOKE_RUNNER = python3 tests/run_game_smoke.py
+GAME_SMOKE_ARGS ?=
 
 .PHONY: all clean run run-exe run-exe-headless run-psxtest-cpu run-psxtest-gpu \
         run-psxtest-cpx run-psxtest-gte debug smoke test-cdrom test-disc test-sio test-gte test-dma \
@@ -42,7 +45,7 @@ PSX_TEST_ARGS ?=
         test-psx-gpu test-psx-gte test-psx-gte-fuzz test-psx-input \
         test-psx-mdec test-psx-spu test-spu test-psx-timer-dump test-psx-timers \
         test-psx-psxtest-cpu test-psx-psxtest-cpx test-psx-psxtest-gpu \
-        test-psx-psxtest-gte test-psx-resolution test-psx-extras
+        test-psx-psxtest-gte test-psx-resolution test-psx-extras game-smoke
 
 all: $(TARGET)
 
@@ -120,7 +123,7 @@ test-sio: src/sio.c tests/sio_test.c
 
 test-gte: src/gte.c tests/gte_test.c
 	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
-	    tests/gte_test.c src/gte.c \
+	    tests/gte_test.c src/gte.c src/debug_trace.c \
 	    -o tests/gte_test
 	./tests/gte_test
 
@@ -195,6 +198,9 @@ test-psx-extras: $(TARGET)
 	$(PSX_TEST_RUNNER) --category psxtest_cpu --category psxtest_cpx \
 	    --category psxtest_gpu --category psxtest_gte --category resolution \
 	    --keep-going $(PSX_TEST_ARGS)
+
+game-smoke: $(TARGET)
+	$(GAME_SMOKE_RUNNER) $(GAME_SMOKE_ARGS)
 
 clean:
 	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cdrom_test tests/disc_test tests/sio_test tests/gte_test tests/dma_test tests/spu_test

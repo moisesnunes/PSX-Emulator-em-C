@@ -8,13 +8,13 @@ ps1_boot_debug
 bios/
 
 # Artefatos de teste
-/tests
 /tests/**/*.exe
 /tests/**/*.log
 /tests/cdrom_test
 /tests/sio_test
 /tests/gte_test
 /tests/out
+/tests/__pycache__/
 
 # Documentação e plano local
 CONTINUAR_PROJETO.md

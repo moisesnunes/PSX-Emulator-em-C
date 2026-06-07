@@ -25,6 +25,19 @@ typedef struct
     uint16_t axis_state;
 } InputController;
 
+#define PAD_SCRIPT_MAX_EVENTS 64
+typedef struct
+{
+    uint32_t frame;
+    uint16_t buttons;
+} PadScriptEvent;
+
+static PadScriptEvent g_pad_script[PAD_SCRIPT_MAX_EVENTS];
+static uint32_t g_pad_script_count = 0;
+static uint32_t g_pad_script_pos = 0;
+static uint16_t g_pad_forced_base = 0;
+static uint16_t g_pad_script_buttons = 0;
+
 static uint64_t now_nanos(void)
 {
     struct timespec ts;
@@ -41,6 +54,11 @@ static void usage(const char *prog)
             "  --disc <path>              Disc image (.bin) to mount\n"
             "  --headless                 Run without window or audio\n"
             "  --max-instructions <N>     Exit after N instructions (headless smoke test)\n"
+            "\n"
+            "Debug env:\n"
+            "  PS1_PAD_HELD=START,CROSS   Hold digital pad buttons\n"
+            "  PS1_PAD_SCRIPT=60:START;66:;4500:CROSS;4510:\n"
+            "                              Change held buttons at GPU frames\n"
             "\n"
             "  Positional argument: .exe loads as PS-X EXE, .bin mounts as disc image.\n",
             prog);
@@ -308,31 +326,95 @@ static uint16_t input_button_name_mask(const char *name)
     return 0;
 }
 
-static void input_apply_forced_env(Sio *sio)
+static uint16_t input_parse_button_list(const char *list)
 {
-    const char *env = getenv("PS1_PAD_HELD");
-    if (!env || !*env)
-        return;
-
     char buf[256];
-    strncpy(buf, env, sizeof(buf) - 1);
+    strncpy(buf, list, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
     uint16_t pressed = 0;
-    char *token = strtok(buf, ",+ ");
+    char *save = NULL;
+    char *token = strtok_r(buf, ",+| ", &save);
     while (token)
     {
         uint16_t mask = input_button_name_mask(token);
         if (mask)
             pressed |= mask;
         else
-            fprintf(stderr, "Unknown PS1_PAD_HELD button: %s\n", token);
-        token = strtok(NULL, ",+ ");
+            fprintf(stderr, "Unknown PS1 pad button: %s\n", token);
+        token = strtok_r(NULL, ",+| ", &save);
     }
 
-    sio_set_forced_state(sio, pressed);
+    return pressed;
+}
+
+static void input_apply_forced_state(Sio *sio)
+{
+    sio_set_forced_state(sio, g_pad_forced_base | g_pad_script_buttons);
+}
+
+static void input_apply_forced_env(Sio *sio)
+{
+    const char *env = getenv("PS1_PAD_HELD");
+    if (!env || !*env)
+        return;
+
+    uint16_t pressed = input_parse_button_list(env);
+    g_pad_forced_base = pressed;
+    input_apply_forced_state(sio);
     if (pressed)
         fprintf(stderr, "Holding PS1 pad buttons from PS1_PAD_HELD=0x%04X\n", pressed);
+}
+
+static void input_parse_pad_script(void)
+{
+    const char *env = getenv("PS1_PAD_SCRIPT");
+    if (!env || !*env)
+        return;
+
+    const char *entry = env;
+    while (*entry && g_pad_script_count < PAD_SCRIPT_MAX_EVENTS)
+    {
+        const char *end = strchr(entry, ';');
+        size_t len = end ? (size_t)(end - entry) : strlen(entry);
+        char item[256];
+        if (len >= sizeof(item))
+            len = sizeof(item) - 1;
+        memcpy(item, entry, len);
+        item[len] = '\0';
+
+        char *colon = strchr(item, ':');
+        if (colon)
+        {
+            *colon = '\0';
+            g_pad_script[g_pad_script_count].frame = (uint32_t)strtoul(item, NULL, 0);
+            g_pad_script[g_pad_script_count].buttons = input_parse_button_list(colon + 1);
+            g_pad_script_count++;
+        }
+        else
+        {
+            fprintf(stderr, "Ignoring malformed PS1_PAD_SCRIPT entry: %s\n", item);
+        }
+        if (!end)
+            break;
+        entry = end + 1;
+    }
+
+    if (g_pad_script_count)
+        fprintf(stderr, "Loaded %u PS1_PAD_SCRIPT events\n", g_pad_script_count);
+}
+
+static void input_update_pad_script(Sio *sio, uint32_t frame)
+{
+    while (g_pad_script_pos < g_pad_script_count &&
+           frame >= g_pad_script[g_pad_script_pos].frame)
+    {
+        g_pad_script_buttons = g_pad_script[g_pad_script_pos].buttons;
+        input_apply_forced_state(sio);
+        fprintf(stderr, "PS1_PAD_SCRIPT frame=%u buttons=0x%04X\n",
+                g_pad_script[g_pad_script_pos].frame, g_pad_script_buttons);
+        g_pad_script_pos++;
+    }
 }
 
 static uint32_t debug_load32(Interconnect *inter, uint32_t addr)
@@ -391,6 +473,7 @@ static void advance_system_quantum(Cpu *cpu)
     if (gpu_step(&cpu->inter.gpu, SYSTEM_CYCLE_QUANTUM))
     {
         irq_assert(&cpu->inter.irq, IRQ_VBLANK);
+        input_update_pad_script(&cpu->inter.sio, cpu->inter.gpu.frames);
         gpu_vblank(&cpu->inter.gpu);
     }
 }
@@ -507,6 +590,7 @@ int main(int argc, char **argv)
         return 1;
     }
     input_apply_forced_env(&cpu->inter.sio);
+    input_parse_pad_script();
 
     if (exe_path)
     {

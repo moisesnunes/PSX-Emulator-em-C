@@ -435,60 +435,6 @@ static void spu_store32(Interconnect *inter, uint32_t abs, uint32_t offset, uint
     spu_store(&inter->spu, abs + 2, offset + 2, (uint16_t)(val >> 16));
 }
 
-static void dma_mdec_out_reorder_color(Interconnect *inter, uint32_t addr, uint32_t remsz)
-{
-    uint32_t words_per_macroblock = inter->mdec.output_depth == 3 ? 128u : 192u;
-    uint32_t bytes_per_pixel = inter->mdec.output_depth == 3 ? 2u : 3u;
-    uint8_t raw[192u * 4u];
-    uint8_t ordered[192u * 4u];
-    uint32_t macroblock = 0;
-
-    while (remsz >= words_per_macroblock)
-    {
-        memset(raw, 0, sizeof(raw));
-        memset(ordered, 0, sizeof(ordered));
-
-        for (uint32_t i = 0; i < words_per_macroblock; i++)
-        {
-            uint32_t word = mdec_dma_read(&inter->mdec);
-            raw[i * 4u + 0u] = (uint8_t)word;
-            raw[i * 4u + 1u] = (uint8_t)(word >> 8);
-            raw[i * 4u + 2u] = (uint8_t)(word >> 16);
-            raw[i * 4u + 3u] = (uint8_t)(word >> 24);
-        }
-
-        for (uint32_t block = 0; block < 4; block++)
-        {
-            uint32_t xx = (block & 1u) ? 8u : 0u;
-            uint32_t yy = (block & 2u) ? 8u : 0u;
-            uint32_t block_base = block * 8u * 8u * bytes_per_pixel;
-            for (uint32_t y = 0; y < 8; y++)
-            {
-                for (uint32_t x = 0; x < 8; x++)
-                {
-                    uint32_t src = block_base + (y * 8u + x) * bytes_per_pixel;
-                    uint32_t dst = ((yy + y) * 16u + (xx + x)) * bytes_per_pixel;
-                    for (uint32_t b = 0; b < bytes_per_pixel; b++)
-                        ordered[dst + b] = raw[src + b];
-                }
-            }
-        }
-
-        uint32_t dst_addr = (addr + macroblock * words_per_macroblock * 4u) & 0x001FFFFC;
-        for (uint32_t i = 0; i < words_per_macroblock; i++)
-        {
-            uint32_t word = (uint32_t)ordered[i * 4u + 0u] |
-                            ((uint32_t)ordered[i * 4u + 1u] << 8) |
-                            ((uint32_t)ordered[i * 4u + 2u] << 16) |
-                            ((uint32_t)ordered[i * 4u + 3u] << 24);
-            ram_store32(&inter->ram, (dst_addr + i * 4u) & 0x001FFFFC, word);
-        }
-
-        macroblock++;
-        remsz -= words_per_macroblock;
-    }
-}
-
 static void do_dma_block(Interconnect *inter, Port port)
 {
     Channel *ch = dma_channel(&inter->dma, port);
@@ -509,13 +455,6 @@ static void do_dma_block(Interconnect *inter, Port port)
         remsz = channel_block_count(ch) ? channel_block_count(ch) : channel_block_size(ch);
     LOG(LOG_DMA, "DMA block port=%d dir=%d addr=0x%06X bs=%u bc=%u words=%u", port,
         channel_direction(ch), addr, channel_block_size(ch), channel_block_count(ch), remsz);
-    if (port == PORT_MDEC_OUT && channel_direction(ch) == DIRECTION_TO_RAM &&
-        increment == STEP_INCREMENT && (inter->mdec.output_depth == 2 || inter->mdec.output_depth == 3))
-    {
-        dma_mdec_out_reorder_color(inter, addr, remsz);
-        dma_finish(inter, ch, port);
-        return;
-    }
     while (remsz > 0)
     {
         uint32_t cur_addr = addr & 0x001FFFFC;

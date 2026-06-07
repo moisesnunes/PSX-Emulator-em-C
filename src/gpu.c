@@ -1,4 +1,5 @@
 #include "gpu.h"
+#include "debug_trace.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,7 @@
 #define MAX_PRIMITIVE_WIDTH 1024
 #define MAX_PRIMITIVE_HEIGHT 512
 #define GPU_CPU_CYCLES_PER_FRAME (33868800 / 60)
+#define GPU_NTSC_LINES_PER_FRAME 263u
 
 static uint32_t g_trace_prims_limit = 0;
 static uint32_t g_trace_prims_count = 0;
@@ -197,6 +199,8 @@ static DisplayRect display_rect_from_gpu(const Gpu *gpu)
         uint32_t height = raw_height;
         if (gpu->interlaced)
             height <<= 1;
+        if (!(gpu->vres == VRES_480 && gpu->interlaced) && height > 240u)
+            height = 240u;
         if (height >= 1u && height <= 512u)
             rect.h = (uint16_t)height;
     }
@@ -634,6 +638,20 @@ void gpu_destroy(Gpu *gpu)
 }
 
 /* ---- Status / Read ---- */
+static uint32_t gpu_status_odd_line(const Gpu *gpu)
+{
+    if (gpu->vres == VRES_480)
+        return gpu->field == FIELD_TOP ? (1u << 31) : 0;
+
+    uint32_t cycles_into_frame = 0;
+    if (gpu->vblank_cycles_left > 0 && gpu->vblank_cycles_left <= GPU_CPU_CYCLES_PER_FRAME)
+        cycles_into_frame = (uint32_t)(GPU_CPU_CYCLES_PER_FRAME - gpu->vblank_cycles_left);
+
+    uint32_t cycles_per_line = GPU_CPU_CYCLES_PER_FRAME / GPU_NTSC_LINES_PER_FRAME;
+    uint32_t line = cycles_per_line ? (cycles_into_frame / cycles_per_line) : 0;
+    return (line & 1u) ? (1u << 31) : 0;
+}
+
 uint32_t gpu_status(const Gpu *gpu)
 {
     uint32_t r =
@@ -654,7 +672,8 @@ uint32_t gpu_status(const Gpu *gpu)
         ((uint32_t)gpu->display_disabled << 23) |
         ((uint32_t)gpu->interrupt << 24) |
         (1u << 26) | (1u << 27) | (1u << 28) |
-        ((uint32_t)gpu->dma_direction << 29);
+        ((uint32_t)gpu->dma_direction << 29) |
+        gpu_status_odd_line(gpu);
 
     uint32_t dma_req;
     switch (gpu->dma_direction)
@@ -810,6 +829,7 @@ static void gp0_polyline_mono_start(Gpu *g);
 static void gp0_polyline_shaded_start(Gpu *g);
 static void gp0_image_load(Gpu *g);
 static void gp0_image_store(Gpu *g);
+static void gp0_vram_copy(Gpu *g);
 static void gp0_draw_mode(Gpu *g);
 static void gp0_texture_window(Gpu *g);
 static void gp0_drawing_area_top_left(Gpu *g);
@@ -1094,6 +1114,10 @@ void gpu_gp0(Gpu *gpu, uint32_t val)
             method = gp0_rect_16x16_tex_opaque;
             break;
         /* VRAM transfers */
+        case 0x80:
+            len = 4;
+            method = gp0_vram_copy;
+            break;
         case 0xA0:
             len = 3;
             method = gp0_image_load;
@@ -1146,6 +1170,10 @@ void gpu_gp0(Gpu *gpu, uint32_t val)
         if (gpu->gp0_words_remaining == 0)
         {
             gpu_gp1_reset_consecutive();
+            debug_trace_gp0(gpu->frames, gpu->gp0_command.buffer, gpu->gp0_command.len,
+                            gpu->drawing_x_offset, gpu->drawing_y_offset,
+                            gpu->drawing_area_left, gpu->drawing_area_top,
+                            gpu->drawing_area_right, gpu->drawing_area_bottom);
             gpu->gp0_command_method(gpu);
         }
         break;
@@ -1788,6 +1816,53 @@ static void gp0_image_store(Gpu *gpu)
     gpu->gp0_mode = GP0_MODE_IMAGE_STORE;
 }
 
+static void gp0_vram_copy(Gpu *gpu)
+{
+    uint32_t src = gpu->gp0_command.buffer[1];
+    uint32_t dst = gpu->gp0_command.buffer[2];
+    uint32_t size = gpu->gp0_command.buffer[3];
+    uint32_t src_x = src & 0x3FFu;
+    uint32_t src_y = (src >> 16) & 0x1FFu;
+    uint32_t dst_x = dst & 0x3FFu;
+    uint32_t dst_y = (dst >> 16) & 0x1FFu;
+    uint32_t w = size & 0x3FFu;
+    uint32_t h = (size >> 16) & 0x1FFu;
+    if (w == 0)
+        w = 1024;
+    if (h == 0)
+        h = 512;
+
+    trace_prim("vram_copy src=(%u,%u) dst=(%u,%u) size=%ux%u",
+               src_x, src_y, dst_x, dst_y, w, h);
+    texture_clut_cache_invalidate(gpu);
+
+    uint32_t count = w * h;
+    uint16_t *tmp = malloc(count * sizeof(*tmp));
+    if (!tmp)
+        return;
+
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++)
+            tmp[y * w + x] = vram_load(gpu->vram, src_x + x, src_y + y);
+
+    for (uint32_t y = 0; y < h; y++)
+    {
+        for (uint32_t x = 0; x < w; x++)
+        {
+            uint32_t dx = (dst_x + x) & 1023u;
+            uint32_t dy = (dst_y + y) & 511u;
+            uint16_t color = tmp[y * w + x];
+            if (gpu->preserve_masked_pixels && (gpu->vram[dy * 1024u + dx] & 0x8000u))
+                continue;
+            if (gpu->force_set_mask_bit)
+                color |= 0x8000u;
+            gpu->vram[dy * 1024u + dx] = color;
+        }
+    }
+
+    free(tmp);
+}
+
 /* 0x40-0x47: mono line */
 static void gp0_line_mono(Gpu *gpu)
 {
@@ -2079,6 +2154,9 @@ bool gpu_step(Gpu *gpu, uint32_t cycles)
 /* Called externally (e.g. from scheduler VBlank) to present the frame */
 void gpu_vblank(Gpu *gpu)
 {
+    static bool dumped = false;
+    static uint32_t frame_count = 0;
+
     /* Toggle interlace field each VBlank so GPUSTAT bit 13 reflects the current
        field. The BIOS checks this to decide which scanlines to draw into. */
     if (gpu->interlaced)
@@ -2090,12 +2168,12 @@ void gpu_vblank(Gpu *gpu)
     uint16_t w = display.w;
     uint16_t h = display.h;
     bool display_24bit = gpu->display_depth == DISPLAY_DEPTH_24;
+    debug_trace_frame(frame_count + 1u, display_x, display_y, w, h, display_24bit,
+                      gpu->display_disabled, g_frame_pixels_written);
     renderer_display(&gpu->renderer, gpu->vram, display_x, display_y, w, h,
                      display_24bit);
     gpu->frame_updated = true;
 
-    static bool dumped = false;
-    static uint32_t frame_count = 0;
     frame_count++;
     const char *stats_env = getenv("PS1_GPU_FRAME_STATS");
     if (stats_env)
@@ -2117,10 +2195,12 @@ void gpu_vblank(Gpu *gpu)
                 }
             }
             fprintf(stderr,
-                    "GPU_FRAME %u writes=%llu display_nonzero=%u display=(%u,%u %ux%u) disabled=%d\n",
+                    "GPU_FRAME %u writes=%llu display_nonzero=%u display=(%u,%u %ux%u) disabled=%d depth=%s hres=%u\n",
                     frame_count, (unsigned long long)g_frame_pixels_written, nonzero,
                     display_x, display_y, w, h,
-                    gpu->display_disabled);
+                    gpu->display_disabled,
+                    display_24bit ? "24" : "15",
+                    hres_width(gpu->hres));
         }
         g_frame_pixels_written = 0;
     }

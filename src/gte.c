@@ -1,4 +1,5 @@
 #include "gte.h"
+#include "debug_trace.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -212,6 +213,14 @@ static int32_t set_mac0(Gte *gte, int64_t v)
     return r;
 }
 
+static void check_mac0_overflow(Gte *gte, int64_t v)
+{
+    if (v > (int64_t)0x7FFFFFFF)
+        gte->cr[31] |= F_MAC0_POS;
+    if (v < -(int64_t)0x80000000)
+        gte->cr[31] |= F_MAC0_NEG;
+}
+
 static int16_t set_ir(Gte *gte, int n, int32_t v, bool lm_flag)
 {
     int32_t lo = lm_flag ? 0 : -0x8000;
@@ -398,16 +407,38 @@ static void mat_mul_vec_buggy(Gte *gte, MatFn mf,
 static void gte_rtps(Gte *gte, int v, int sf, bool lm, bool last)
 {
     int16_t vx = VX(v), vy = VY(v), vz = VZ(v);
-    mat_mul_vec(gte, rt, TRX, TRY, TRZ, vx, vy, vz, sf, lm);
 
-    /* SZ3 uses the unshifted transform result shifted by 12. Since set_mac()
-       stores MAC3 after sf*12, sf=0 needs the extra shift here. */
-    int32_t sz = sf ? MAC3 : (MAC3 >> 12);
-    push_sz(gte, sz);
+    int64_t x = mac123_result(gte, 1, (int64_t)TRX * 0x1000 + (int64_t)rt(gte, 0, 0) * vx);
+    x = mac123_result(gte, 1, x + (int64_t)rt(gte, 0, 1) * vy) + (int64_t)rt(gte, 0, 2) * vz;
+    x = mac123_result(gte, 1, x);
+
+    int64_t y = mac123_result(gte, 2, (int64_t)TRY * 0x1000 + (int64_t)rt(gte, 1, 0) * vx);
+    y = mac123_result(gte, 2, y + (int64_t)rt(gte, 1, 1) * vy) + (int64_t)rt(gte, 1, 2) * vz;
+    y = mac123_result(gte, 2, y);
+
+    int64_t z = mac123_result(gte, 3, (int64_t)TRZ * 0x1000 + (int64_t)rt(gte, 2, 0) * vx);
+    z = mac123_result(gte, 3, z + (int64_t)rt(gte, 2, 1) * vy) + (int64_t)rt(gte, 2, 2) * vz;
+    z = mac123_result(gte, 3, z);
+
+    set_mac(gte, 1, x, sf);
+    set_mac(gte, 2, y, sf);
+    int32_t mac3 = set_mac(gte, 3, z, sf);
+    set_ir(gte, 1, MAC1, lm);
+    set_ir(gte, 2, MAC2, lm);
+
+    /* RTP has special IR3 flag behavior: for sf=0 the flag is based on
+       unshifted Z SAR 12, but the stored IR3 value is clamped from MAC3. */
+    int32_t ir3_flag_value = (int32_t)(z >> 12);
+    if (ir3_flag_value < -0x8000 || ir3_flag_value > 0x7FFF)
+        gte->cr[31] |= F_IR3_SAT;
+    int32_t ir3_min = lm ? 0 : -0x8000;
+    gte->dr[11] = (uint32_t)(uint16_t)(int16_t)clamp(mac3, ir3_min, 0x7FFF);
+
+    push_sz(gte, (int32_t)(z >> 12));
 
     /* Division: h / SZ3 */
     uint16_t sz3 = SZ(3);
-    if (sz3 == 0 || H / sz3 >= 2)
+    if ((uint32_t)sz3 * 2u <= H)
         gte->cr[31] |= F_DIV_OVF;
     uint32_t div = gte_divide(H, sz3);
 
@@ -416,6 +447,8 @@ static void gte_rtps(Gte *gte, int v, int sf, bool lm, bool last)
     /* SY2 = (MAC2 * div + OFY) >> 16 */
     int64_t sy64 = ((int64_t)(int16_t)IR2 * div + OFY) >> 16;
 
+    check_mac0_overflow(gte, (int64_t)(int16_t)IR1 * div + OFX);
+    check_mac0_overflow(gte, (int64_t)(int16_t)IR2 * div + OFY);
     push_sxy(gte, (int32_t)sx64, (int32_t)sy64);
 
     if (last)
@@ -963,6 +996,11 @@ uint32_t gte_store(Gte *gte, uint32_t reg)
 
 void gte_execute(Gte *gte, uint32_t cmd)
 {
+    uint32_t before_dr[32];
+    uint32_t before_cr[32];
+    memcpy(before_dr, gte->dr, sizeof(before_dr));
+    memcpy(before_cr, gte->cr, sizeof(before_cr));
+
     uint32_t op = cmd & 0x3F; /* bits 5..0 */
     switch (op)
     {
@@ -1037,4 +1075,5 @@ void gte_execute(Gte *gte, uint32_t cmd)
         fprintf(stderr, "GTE: unknown cmd 0x%02X (full=0x%08X)\n", op, cmd);
         break;
     }
+    debug_trace_gte(cmd, before_dr, before_cr, gte->dr, gte->cr);
 }

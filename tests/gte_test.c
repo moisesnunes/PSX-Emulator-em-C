@@ -103,6 +103,21 @@ static void test_rtps_sf0_sz_shift(void)
     printf("ok\n");
 }
 
+static void test_rtps_ir3_flag_uses_shifted_z(void)
+{
+    printf("test_rtps_ir3_flag_uses_shifted_z ... ");
+    Gte gte;
+    gte_init(&gte);
+
+    gte_write_ctrl(&gte, 4, 0x00001000); /* RT33 = 1.0 */
+    gte_write_ctrl(&gte, 26, 0x0100);    /* H */
+    gte_write_data(&gte, 1, 0x00001000); /* VZ0 */
+    gte_execute(&gte, 0x01);             /* RTPS, sf=0 */
+    EXPECT_EQ(gte_read_data(&gte, 11), 0x00007FFFu);
+    EXPECT_EQ(gte_read_ctrl(&gte, 31) & (1u << 22), 0u);
+    printf("ok\n");
+}
+
 static void test_lighting_opcode_dispatch(void)
 {
     printf("test_lighting_opcode_dispatch ... ");
@@ -132,6 +147,7 @@ int main(void)
     test_nclip();
     test_rtps_divide_flag();
     test_rtps_sf0_sz_shift();
+    test_rtps_ir3_flag_uses_shifted_z();
     test_lighting_opcode_dispatch();
     printf("======================\n");
     printf("pass: %d  fail: %d\n", g_pass, g_fail);

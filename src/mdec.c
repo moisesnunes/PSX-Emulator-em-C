@@ -194,9 +194,6 @@ static void update_status(Mdec *mdec)
         status |= MDEC_STATUS_BUSY;
     if (mdec->dma_in_enabled && (!mdec->receiving || mdec->words_remaining > 0))
         status |= MDEC_STATUS_DATA_IN_REQ;
-    if (mdec->receiving && mdec->words_remaining == 0)
-        status |= MDEC_STATUS_DATA_IN_FULL;
-
     status |= ((uint32_t)mdec->output_depth & 3u) << 25;
     if (mdec->output_signed)
         status |= 1u << 24;
@@ -279,7 +276,10 @@ static size_t decode_block(const Mdec *mdec, size_t pos, const uint8_t *qt, int1
         k += (int)((n >> 10) & 0x3Fu) + 1;
         if (k > 63)
             break;
-        val = div_floor_i32(sign10(n) * (int32_t)qt[k] * (int32_t)q_scale + 4, 8);
+        if (q_scale == 0)
+            val = sign10(n) * 2;
+        else
+            val = div_floor_i32(sign10(n) * (int32_t)qt[k] * (int32_t)q_scale + 4, 8);
     }
 
     int32_t tmp[64];
@@ -371,7 +371,7 @@ static void yuv_to_rgb(const Mdec *mdec, int16_t y, int16_t cr, int16_t cb,
     int32_t rr_chroma = signed9_to_s8(cr);
     int32_t bb_chroma = signed9_to_s8(cb);
     int32_t rr = yy + ((rr_chroma * 359 + 0x80) >> 8);
-    int32_t gg = yy + ((-bb_chroma * 88 - rr_chroma * 183 + 0x80) >> 8);
+    int32_t gg = yy + ((((-bb_chroma * 88) & ~0x1F) + ((-rr_chroma * 183) & ~0x07) + 0x80) >> 8);
     int32_t bb = yy + ((bb_chroma * 454 + 0x80) >> 8);
     rr = clamp_i32(rr, -128, 127);
     gg = clamp_i32(gg, -128, 127);
@@ -385,6 +385,20 @@ static void yuv_to_rgb(const Mdec *mdec, int16_t y, int16_t cr, int16_t cb,
     *r = (uint8_t)rr;
     *g = (uint8_t)gg;
     *b = (uint8_t)bb;
+}
+
+static uint16_t rgb_to_1555_mdec(uint8_t r, uint8_t g, uint8_t b)
+{
+    uint16_t r5 = (uint16_t)(((uint16_t)r + 4u) >> 3);
+    uint16_t g5 = (uint16_t)(((uint16_t)g + 4u) >> 3);
+    uint16_t b5 = (uint16_t)(((uint16_t)b + 4u) >> 3);
+    if (r5 > 31u)
+        r5 = 31u;
+    if (g5 > 31u)
+        g5 = 31u;
+    if (b5 > 31u)
+        b5 = 31u;
+    return (uint16_t)(r5 | (g5 << 5) | (b5 << 10));
 }
 
 static void append_rgb_pixel(Mdec *mdec, uint8_t r, uint8_t g, uint8_t b,
@@ -406,37 +420,35 @@ static void output_color(Mdec *mdec, int16_t blocks[6][64])
 {
     uint8_t bytes[8];
     int byte_count = 0;
-    for (int block = 0; block < 4; block++)
+    for (int py = 0; py < 16; py++)
     {
-        int xx = (block & 1) ? 8 : 0;
-        int yy = (block & 2) ? 8 : 0;
-        for (int y = 0; y < 8; y++)
+        for (int px = 0; px < 16; px++)
         {
-            for (int x = 0; x < 8; x++)
-            {
-                int yi = x + y * 8;
-                int ci = ((x + xx) / 2) + ((y + yy) / 2) * 8;
-                uint8_t r, g, b;
-                yuv_to_rgb(mdec, blocks[2 + block][yi], blocks[0][ci], blocks[1][ci], &r, &g, &b);
+            int block = (px >= 8 ? 1 : 0) + (py >= 8 ? 2 : 0);
+            int x = px & 7;
+            int y = py & 7;
+            int yi = x + y * 8;
+            int ci = (px / 2) + (py / 2) * 8;
+            uint8_t r, g, b;
+            yuv_to_rgb(mdec, blocks[2 + block][yi], blocks[0][ci], blocks[1][ci], &r, &g, &b);
 
-                if (mdec->output_depth == 3)
+            if (mdec->output_depth == 3)
+            {
+                uint16_t pix = rgb_to_1555_mdec(r, g, b);
+                if (mdec->output_bit15)
+                    pix |= 0x8000u;
+                bytes[byte_count++] = (uint8_t)pix;
+                bytes[byte_count++] = (uint8_t)(pix >> 8);
+                if (byte_count == 4)
                 {
-                    uint16_t pix = (uint16_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
-                    if (mdec->output_bit15)
-                        pix |= 0x8000u;
-                    bytes[byte_count++] = (uint8_t)pix;
-                    bytes[byte_count++] = (uint8_t)(pix >> 8);
-                    if (byte_count == 4)
-                    {
-                        push_output(mdec, (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
-                                              ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24));
-                        byte_count = 0;
-                    }
+                    push_output(mdec, (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+                                          ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24));
+                    byte_count = 0;
                 }
-                else
-                {
-                    append_rgb_pixel(mdec, r, g, b, bytes, &byte_count);
-                }
+            }
+            else
+            {
+                append_rgb_pixel(mdec, r, g, b, bytes, &byte_count);
             }
         }
     }
@@ -472,14 +484,16 @@ static void decode_all(Mdec *mdec)
                 mdec->current_block = (uint8_t)((i < 2) ? (4 + i) : (i - 2));
                 size_t next = decode_block(mdec, pos, i < 2 ? mdec->quant_uv : mdec->quant_y, blocks[i]);
                 if (next <= pos)
-                    return;
+                    goto done;
                 pos = next;
             }
             output_color(mdec, blocks);
         }
     }
+done:
     mdec->receiving = false;
     mdec->words_remaining = 0;
+    mdec->current_block = 4;
     update_status(mdec);
 }
 
