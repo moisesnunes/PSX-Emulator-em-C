@@ -59,6 +59,14 @@ typedef struct
     uint8_t len;
 } CommandBuffer;
 
+typedef struct
+{
+    uint32_t dotclock_ticks;
+    uint32_t hblank_count;
+    bool vblank_started;
+    bool frame_ended;
+} GpuTimingEvents;
+
 typedef struct Gpu Gpu;
 typedef void (*Gp0Method)(Gpu *);
 
@@ -144,7 +152,9 @@ struct Gpu
 
     Renderer renderer;
     bool frame_updated;
-    int32_t vblank_cycles_left;
+    uint32_t scanline;
+    uint64_t line_phase;
+    uint64_t dotclock_phase;
     uint32_t frames;
 };
 
@@ -154,6 +164,7 @@ uint32_t gpu_read(Gpu *gpu);
 void gpu_gp0(Gpu *gpu, uint32_t val);
 void gpu_gp1(Gpu *gpu, uint32_t val);
 void gpu_gp1_reset_consecutive(void);
-bool gpu_step(Gpu *gpu, uint32_t cycles);
+GpuTimingEvents gpu_step(Gpu *gpu, uint32_t cycles);
+bool gpu_in_vblank(const Gpu *gpu);
 void gpu_vblank(Gpu *gpu);
 void gpu_destroy(Gpu *gpu);

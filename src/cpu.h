@@ -30,6 +30,7 @@ typedef struct
 
     uint32_t hi;
     uint32_t lo;
+    uint32_t muldiv_busy_cycles;
 
     bool branch;
     bool delay_slot;

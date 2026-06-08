@@ -94,6 +94,7 @@ void timers_store32(Timers *t, uint32_t offset, uint32_t val, Scheduler *sched)
         u->value = 0;
         u->frac_rem = 0;
         u->fired = false;
+        u->sync_started = false;
         u->mode = (uint16_t)(val & 0x1FFF);
         u->mode &= (uint16_t)~(TMODE_TARGET_REACHED | TMODE_OVERFLOW_REACHED);
         /* IRQ bit starts high (not firing) */
@@ -149,7 +150,77 @@ static void fire_irq(TimerUnit *u, int idx, Irq *irq)
     }
 }
 
-void timers_step(Timers *t, uint32_t cycles, Irq *irq, Scheduler *sched)
+static bool external_clock_selected(const TimerUnit *u, int idx)
+{
+    uint32_t src = (u->mode & TMODE_CLK_SRC) >> 8;
+    if (idx == 0 || idx == 1)
+        return (src & 1u) != 0;
+    return false;
+}
+
+static uint32_t timer_ticks(TimerUnit *u, int idx, uint32_t cycles,
+                            uint32_t dotclock_ticks, uint32_t hblank_count)
+{
+    if (idx == 0 && external_clock_selected(u, idx))
+        return dotclock_ticks;
+    if (idx == 1 && external_clock_selected(u, idx))
+        return hblank_count;
+    if (idx == 2 && timer2_div8(u))
+    {
+        uint32_t total = u->frac_rem + cycles;
+        u->frac_rem = (uint8_t)(total & 7);
+        return total >> 3;
+    }
+    u->frac_rem = 0;
+    return cycles;
+}
+
+static uint32_t apply_sync_mode(TimerUnit *u, int idx, uint32_t ticks,
+                                uint32_t hblank_count, bool vblank_started,
+                                bool in_vblank)
+{
+    if (!(u->mode & TMODE_SYNC_ENABLE))
+        return ticks;
+
+    uint32_t sync_mode = (u->mode & TMODE_SYNC_MODE) >> 1;
+    bool sync_event = idx == 0 ? hblank_count != 0 : vblank_started;
+    bool in_sync_period = idx == 0 ? hblank_count != 0 : in_vblank;
+    if (idx == 2)
+    {
+        if (sync_mode == 0 || sync_mode == 3)
+            return 0;
+        return ticks;
+    }
+
+    switch (sync_mode)
+    {
+    case 0: /* pause during HBlank/VBlank */
+        return in_sync_period ? 0 : ticks;
+    case 1: /* reset at HBlank/VBlank */
+        if (sync_event)
+            u->value = 0;
+        return ticks;
+    case 2: /* count only during HBlank/VBlank and reset at entry */
+        if (!sync_event)
+            return 0;
+        u->value = 0;
+        return ticks;
+    case 3: /* pause until first HBlank/VBlank, then free run */
+        if (!u->sync_started)
+        {
+            if (!sync_event)
+                return 0;
+            u->sync_started = true;
+        }
+        return ticks;
+    default:
+        return ticks;
+    }
+}
+
+void timers_step(Timers *t, uint32_t cycles, uint32_t dotclock_ticks,
+                 uint32_t hblank_count, bool vblank_started, bool in_vblank,
+                 Irq *irq, Scheduler *sched)
 {
     (void)sched; /* scheduler not used for per-tick timer events */
 
@@ -157,19 +228,9 @@ void timers_step(Timers *t, uint32_t cycles, Irq *irq, Scheduler *sched)
     {
         TimerUnit *u = &t->units[idx];
 
-        /* Apply /8 divider for Timer 2 when CLK_SRC selects system/8 */
-        uint32_t ticks;
-        if (idx == 2 && timer2_div8(u))
-        {
-            uint32_t total = u->frac_rem + cycles;
-            ticks = total >> 3; /* divide by 8 */
-            u->frac_rem = (uint8_t)(total & 7);
-        }
-        else
-        {
-            ticks = cycles;
-            u->frac_rem = 0;
-        }
+        uint32_t ticks = timer_ticks(u, idx, cycles, dotclock_ticks, hblank_count);
+        ticks = apply_sync_mode(u, idx, ticks, hblank_count,
+                                vblank_started, in_vblank);
 
         if (ticks == 0)
             continue;

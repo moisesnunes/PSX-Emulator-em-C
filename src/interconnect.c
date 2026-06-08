@@ -1,4 +1,5 @@
 #include "interconnect.h"
+#include "bus_policy.h"
 #include "timer.h"
 #include "cdrom.h"
 #include "log.h"
@@ -195,6 +196,41 @@ static void dma_finish(Interconnect *inter, Channel *ch, Port port)
     dma_mark_channel_done(&inter->dma, port);
     dma_update_irq(inter);
     LOG(LOG_DMA, "DMA done port=%d", port);
+}
+
+static EventType dma_event_for_port(Port port)
+{
+    return (EventType)(EVENT_DMA0 + (int)port);
+}
+
+static uint32_t dma_completion_cycles(Port port, uint32_t words)
+{
+    if (words == 0)
+        words = 1;
+
+    switch (port)
+    {
+    case PORT_MDEC_IN:
+        return words;
+    case PORT_MDEC_OUT:
+        return words * 6u + 32u;
+    case PORT_GPU:
+        /*
+         * Keep CHCR busy until a scheduler boundary. A longer delay must come
+         * from actual GP0 command costs; word-count timing corrupts image-load
+         * streams because command and pixel words have very different costs.
+         */
+        return 1u;
+    case PORT_CDROM:
+        return words * 24u;
+    case PORT_SPU:
+        return words * 2u;
+    case PORT_OTC:
+        return words + 16u;
+    case PORT_PIO:
+    default:
+        return words;
+    }
 }
 
 static void dma_reg_write(Interconnect *inter, uint32_t offset, uint32_t val)
@@ -435,7 +471,7 @@ static void spu_store32(Interconnect *inter, uint32_t abs, uint32_t offset, uint
     spu_store(&inter->spu, abs + 2, offset + 2, (uint16_t)(val >> 16));
 }
 
-static void do_dma_block(Interconnect *inter, Port port)
+static uint32_t do_dma_block(Interconnect *inter, Port port)
 {
     Channel *ch = dma_channel(&inter->dma, port);
     Step increment = channel_step(ch);
@@ -444,15 +480,13 @@ static void do_dma_block(Interconnect *inter, Port port)
     if (!channel_transfer_size(ch, &remsz))
     {
         if (port == PORT_OTC)
-        {
-            dma_finish(inter, ch, port);
-            return;
-        }
+            return 1;
         fprintf(stderr, "Couldn't figure out DMA block transfer size\n");
         exit(1);
     }
     if (remsz == 0 && port == PORT_MDEC_OUT)
         remsz = channel_block_count(ch) ? channel_block_count(ch) : channel_block_size(ch);
+    uint32_t words = remsz;
     LOG(LOG_DMA, "DMA block port=%d dir=%d addr=0x%06X bs=%u bc=%u words=%u", port,
         channel_direction(ch), addr, channel_block_size(ch), channel_block_count(ch), remsz);
     while (remsz > 0)
@@ -514,13 +548,15 @@ static void do_dma_block(Interconnect *inter, Port port)
         addr = (increment == STEP_INCREMENT) ? addr + 4 : addr - 4;
         remsz--;
     }
-    dma_finish(inter, ch, port);
+    return words ? words : 1;
 }
 
-static void do_dma_linked_list(Interconnect *inter, Port port)
+static uint32_t do_dma_linked_list(Interconnect *inter, Port port)
 {
     Channel *ch = dma_channel(&inter->dma, port);
     uint32_t addr = channel_base(ch) & 0x001FFFFC;
+    uint8_t visited[RAM_SIZE / 4u / 8u] = {0};
+    uint32_t words = 0;
     if (channel_direction(ch) == DIRECTION_TO_RAM)
     {
         fprintf(stderr, "Invalid DMA direction for linked list\n");
@@ -533,27 +569,57 @@ static void do_dma_linked_list(Interconnect *inter, Port port)
     }
     for (;;)
     {
+        uint32_t word_index = addr >> 2;
+        uint8_t bit = (uint8_t)(1u << (word_index & 7u));
+        if (visited[word_index >> 3] & bit)
+        {
+            LOG(LOG_DMA, "DMA linked-list loop detected port=%d addr=0x%06X", port, addr);
+            return words ? words : 1;
+        }
+        visited[word_index >> 3] |= bit;
+
         uint32_t header = ram_load32(&inter->ram, addr);
         uint32_t remsz = header >> 24;
+        words++;
         while (remsz > 0)
         {
             addr = (addr + 4) & 0x001FFFFC;
             gpu_gp0(&inter->gpu, ram_load32(&inter->ram, addr));
+            words++;
             remsz--;
         }
         if (header & 0x00800000)
             break;
         addr = header & 0x001FFFFC;
     }
-    dma_finish(inter, ch, port);
+    return words;
 }
 
 static void do_dma(Interconnect *inter, Port port)
 {
+    uint32_t words;
     if (port != PORT_OTC && channel_sync(dma_channel(&inter->dma, port)) == SYNC_LINKED_LIST)
-        do_dma_linked_list(inter, port);
+        words = do_dma_linked_list(inter, port);
     else
-        do_dma_block(inter, port);
+        words = do_dma_block(inter, port);
+
+    uint32_t cycles = dma_completion_cycles(port, words);
+    scheduler_schedule(&inter->scheduler, dma_event_for_port(port), cycles);
+    LOG(LOG_DMA, "DMA scheduled port=%d words=%u cycles=%u", port, words, cycles);
+}
+
+void interconnect_on_scheduler_events(Interconnect *inter, uint32_t fired)
+{
+    for (int port = PORT_MDEC_IN; port <= PORT_OTC; port++)
+    {
+        EventType event = dma_event_for_port((Port)port);
+        if (fired & (1u << event))
+        {
+            Channel *ch = dma_channel(&inter->dma, (Port)port);
+            if (channel_active(ch))
+                dma_finish(inter, ch, (Port)port);
+        }
+    }
 }
 
 /* ---- Init / destroy ---- */
@@ -643,8 +709,7 @@ uint32_t interconnect_load32(Interconnect *inter, uint32_t addr)
     if (range_contains(MAP_EXPANSION3, abs, &off))
         return 0xFFFFFFFF;
 
-    fprintf(stderr, "Unhandled load32: %08X\n", addr);
-    exit(1);
+    return bus_unmapped_load(addr, 32);
 }
 
 /* ---- Load16 ---- */
@@ -693,8 +758,7 @@ uint16_t interconnect_load16(Interconnect *inter, uint32_t addr)
     if (range_contains(MAP_EXPANSION3, abs, &off))
         return 0xFFFF;
 
-    fprintf(stderr, "Unhandled load16: %08X\n", addr);
-    exit(1);
+    return (uint16_t)bus_unmapped_load(addr, 16);
 }
 
 /* ---- Load8 ---- */
@@ -738,8 +802,7 @@ uint8_t interconnect_load8(Interconnect *inter, uint32_t addr)
     if (range_contains(MAP_EXPANSION3, abs, &off))
         return 0xFF;
 
-    fprintf(stderr, "Unhandled load8: %08X\n", addr);
-    exit(1);
+    return (uint8_t)bus_unmapped_load(addr, 8);
 }
 
 /* ---- Store32 ---- */
@@ -833,8 +896,7 @@ void interconnect_store32(Interconnect *inter, uint32_t addr, uint32_t val)
         return;
     }
 
-    fprintf(stderr, "Unhandled store32: %08X = %08X\n", addr, val);
-    exit(1);
+    bus_unmapped_store(addr, val, 32);
 }
 
 /* ---- Store16 ---- */
@@ -908,8 +970,7 @@ void interconnect_store16(Interconnect *inter, uint32_t addr, uint16_t val)
         return;
     }
 
-    fprintf(stderr, "Unhandled store16: %08X = %04X\n", addr, val);
-    exit(1);
+    bus_unmapped_store(addr, val, 16);
 }
 
 /* ---- Store8 ---- */
@@ -980,6 +1041,5 @@ void interconnect_store8(Interconnect *inter, uint32_t addr, uint8_t val)
         return;
     }
 
-    fprintf(stderr, "Unhandled store8: %08X = %02X\n", addr, val);
-    exit(1);
+    bus_unmapped_store(addr, val, 8);
 }

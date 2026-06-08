@@ -438,7 +438,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--category", action="append", default=[])
     parser.add_argument("--name", action="append", default=[])
-    parser.add_argument("--max-instructions", type=int, default=int(os.getenv("PSX_TEST_MAX_INSTRUCTIONS", "20000000")))
+    parser.add_argument("--max-instructions", type=int, default=int(os.getenv("PSX_TEST_MAX_INSTRUCTIONS", "40000000")))
     parser.add_argument("--timeout", type=int, default=int(os.getenv("PSX_TEST_TIMEOUT", "20")))
     parser.add_argument("--dump-frame", type=int, default=int(os.getenv("PSX_TEST_DUMP_FRAME", "120")))
     parser.add_argument("--no-diff", action="store_true")

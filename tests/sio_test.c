@@ -196,8 +196,7 @@ static void test_memcard_command_no_ack(void)
     select_slot(&sio, false);
     sio_store8(&sio, 0x00, 0x01, NULL);
     EXPECT_EQ((sio_load16(&sio, 0x04) & 0x0080u) != 0, 0u);
-    for (int i = 0; i < 15; i++)
-        sio_step(&sio, &irq);
+    sio_step(&sio, &irq, 535);
     EXPECT_EQ((sio_load16(&sio, 0x04) & 0x0080u) != 0, 1u);
     EXPECT_EQ(sio_load8(&sio, 0x00), 0xFFu);
     printf("ok\n");
@@ -213,8 +212,9 @@ static void test_pad_ack_irq(void)
 
     exchange(&sio, 0x01);
     EXPECT_EQ((irq.status & IRQ_SIO) != 0, 0u);
-    for (int i = 0; i < 15; i++)
-        sio_step(&sio, &irq);
+    sio_step(&sio, &irq, 534);
+    EXPECT_EQ((irq.status & IRQ_SIO) != 0, 0u);
+    sio_step(&sio, &irq, 1);
     EXPECT_EQ((irq.status & IRQ_SIO) != 0, 1u);
     EXPECT_EQ((sio_load16(&sio, 0x04) & 0x0200u) != 0, 1u);
 
@@ -233,15 +233,13 @@ static void test_ack_reset_keeps_selected_transaction(void)
     select_slot(&sio, false);
 
     EXPECT_EQ(exchange(&sio, 0x01), 0xFFu);
-    for (int i = 0; i < 7; i++)
-        sio_step(&sio, &irq);
+    sio_step(&sio, &irq, 267);
     EXPECT_EQ((sio_load16(&sio, 0x04) & 0x0200u) != 0, 0u);
 
     sio_store16(&sio, 0x0A, 0x0010u, &irq);
     EXPECT_EQ(sio.selected, 1u);
     EXPECT_EQ((sio_load16(&sio, 0x04) & 0x0200u) != 0, 0u);
-    for (int i = 0; i < 8; i++)
-        sio_step(&sio, &irq);
+    sio_step(&sio, &irq, 268);
     EXPECT_EQ((sio_load16(&sio, 0x04) & 0x0200u) != 0, 1u);
     sio_store16(&sio, 0x0A, 0x0010u, &irq);
     EXPECT_EQ(exchange(&sio, 0x42), 0x41u);

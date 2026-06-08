@@ -10,6 +10,8 @@ MAX_INSTRUCTIONS ?= 5000000
 
 SRCS = src/main.c         \
        src/cpu.c          \
+       src/cpu_timing.c   \
+       src/bus_policy.c   \
        src/interconnect.c \
        src/bios.c         \
        src/ram.c          \
@@ -40,7 +42,7 @@ GAME_SMOKE_RUNNER = python3 tests/run_game_smoke.py
 GAME_SMOKE_ARGS ?=
 
 .PHONY: all clean run run-exe run-exe-headless run-psxtest-cpu run-psxtest-gpu \
-        run-psxtest-cpx run-psxtest-gte debug smoke test-cdrom test-disc test-sio test-gte test-dma \
+        run-psxtest-cpx run-psxtest-gte debug smoke test-cpu-timing test-bus-policy test-scheduler test-timer test-gpu-timing test-cdrom test-disc test-sio test-gte test-dma \
         test-psx-list test-psx-all test-psx-cdrom test-psx-cpu test-psx-dma \
         test-psx-gpu test-psx-gte test-psx-gte-fuzz test-psx-input \
         test-psx-mdec test-psx-spu test-spu test-psx-timer-dump test-psx-timers \
@@ -101,6 +103,37 @@ debug: $(DEBUG_OBJS)
 
 smoke: $(TARGET)
 	./$(TARGET) --bios $(BIOS_PATH) --headless --max-instructions 500000
+
+test-cpu-timing: src/cpu_timing.c tests/cpu_timing_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
+	    tests/cpu_timing_test.c src/cpu_timing.c \
+	    -o tests/cpu_timing_test
+	./tests/cpu_timing_test
+
+test-bus-policy: src/bus_policy.c tests/bus_policy_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
+	    tests/bus_policy_test.c src/bus_policy.c \
+	    -o tests/bus_policy_test
+	./tests/bus_policy_test
+
+test-scheduler: src/scheduler.c tests/scheduler_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
+	    tests/scheduler_test.c src/scheduler.c src/irq.c src/log.c \
+	    -o tests/scheduler_test
+	./tests/scheduler_test
+
+test-timer: src/timer.c tests/timer_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
+	    tests/timer_test.c src/timer.c src/scheduler.c src/irq.c src/log.c \
+	    -o tests/timer_test
+	./tests/timer_test
+
+test-gpu-timing: src/gpu.c tests/gpu_timing_test.c
+	$(CC) $(CFLAGS) -Isrc \
+	    tests/gpu_timing_test.c src/gpu.c src/renderer.c src/debug_trace.c src/log.c \
+	    $(LDFLAGS) \
+	    -o tests/gpu_timing_test
+	./tests/gpu_timing_test
 
 test-cdrom: src/cdrom.c src/spu.c tests/cdrom_test.c
 	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc $(shell sdl2-config --cflags) \
@@ -203,4 +236,4 @@ game-smoke: $(TARGET)
 	$(GAME_SMOKE_RUNNER) $(GAME_SMOKE_ARGS)
 
 clean:
-	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cdrom_test tests/disc_test tests/sio_test tests/gte_test tests/dma_test tests/spu_test
+	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cpu_timing_test tests/bus_policy_test tests/scheduler_test tests/timer_test tests/gpu_timing_test tests/cdrom_test tests/disc_test tests/sio_test tests/gte_test tests/dma_test tests/spu_test

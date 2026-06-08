@@ -38,6 +38,7 @@ typedef struct
     uint16_t target;  /* target compare value */
     uint8_t frac_rem; /* sub-cycle remainder for Timer2 /8 divider */
     bool fired;       /* true after first IRQ in one-shot mode */
+    bool sync_started;
 } TimerUnit;
 
 typedef struct
@@ -54,6 +55,8 @@ void timers_store16(Timers *t, uint32_t offset, uint16_t val, Scheduler *sched);
 
 /* Advance all timers by `cycles` system-clock cycles.
    Fires IRQs via `irq` and reschedules via `sched` when needed. */
-void timers_step(Timers *t, uint32_t cycles, Irq *irq, Scheduler *sched);
+void timers_step(Timers *t, uint32_t cycles, uint32_t dotclock_ticks,
+                 uint32_t hblank_count, bool vblank_started, bool in_vblank,
+                 Irq *irq, Scheduler *sched);
 
 #endif /* TIMER_H */

@@ -17,6 +17,7 @@ bios/
 /tests/__pycache__/
 
 # Documentação e plano local
+/docs
 CONTINUAR_PROJETO.md
 guide.tex
 

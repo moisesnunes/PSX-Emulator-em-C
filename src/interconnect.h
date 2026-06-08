@@ -43,4 +43,5 @@ uint8_t interconnect_load8(Interconnect *inter, uint32_t addr);
 void interconnect_store32(Interconnect *inter, uint32_t addr, uint32_t val);
 void interconnect_store16(Interconnect *inter, uint32_t addr, uint16_t val);
 void interconnect_store8(Interconnect *inter, uint32_t addr, uint8_t val);
+void interconnect_on_scheduler_events(Interconnect *inter, uint32_t fired);
 void interconnect_destroy(Interconnect *inter);

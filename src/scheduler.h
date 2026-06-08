@@ -16,6 +16,13 @@ typedef enum
     EVENT_TIMER2,
     EVENT_CDROM_IRQ,
     EVENT_SPU_SAMPLE,
+    EVENT_DMA0,
+    EVENT_DMA1,
+    EVENT_DMA2,
+    EVENT_DMA3,
+    EVENT_DMA4,
+    EVENT_DMA5,
+    EVENT_DMA6,
     EVENT_COUNT
 } EventType;
 
@@ -35,6 +42,7 @@ typedef struct
 void scheduler_init(Scheduler *s);
 void scheduler_schedule(Scheduler *s, EventType type, uint32_t delta_cycles);
 void scheduler_cancel(Scheduler *s, EventType type);
+uint32_t scheduler_cycles_until_next_event(const Scheduler *s);
 
 /* Advance by `cycles`, fire elapsed events, assert IRQs.
    Returns bitmask of EVENT_* that fired (1 << EventType). */

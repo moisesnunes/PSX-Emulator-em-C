@@ -11,8 +11,8 @@
 #define VRAM_H 512
 #define MAX_PRIMITIVE_WIDTH 1024
 #define MAX_PRIMITIVE_HEIGHT 512
-#define GPU_CPU_CYCLES_PER_FRAME (33868800 / 60)
 #define GPU_NTSC_LINES_PER_FRAME 263u
+#define GPU_PAL_LINES_PER_FRAME 314u
 
 static uint32_t g_trace_prims_limit = 0;
 static uint32_t g_trace_prims_count = 0;
@@ -625,7 +625,9 @@ void gpu_init(Gpu *gpu, SDL_Window *window)
     gpu->dma_direction = DMA_DIR_OFF;
     gpu->hres = hres_from_fields(0, 0);
     gpu->gp0_mode = GP0_MODE_COMMAND;
-    gpu->vblank_cycles_left = GPU_CPU_CYCLES_PER_FRAME;
+    gpu->scanline = 0;
+    gpu->line_phase = 0;
+    gpu->dotclock_phase = 0;
     if (window)
         renderer_init(&gpu->renderer, window);
 }
@@ -642,14 +644,7 @@ static uint32_t gpu_status_odd_line(const Gpu *gpu)
 {
     if (gpu->vres == VRES_480)
         return gpu->field == FIELD_TOP ? (1u << 31) : 0;
-
-    uint32_t cycles_into_frame = 0;
-    if (gpu->vblank_cycles_left > 0 && gpu->vblank_cycles_left <= GPU_CPU_CYCLES_PER_FRAME)
-        cycles_into_frame = (uint32_t)(GPU_CPU_CYCLES_PER_FRAME - gpu->vblank_cycles_left);
-
-    uint32_t cycles_per_line = GPU_CPU_CYCLES_PER_FRAME / GPU_NTSC_LINES_PER_FRAME;
-    uint32_t line = cycles_per_line ? (cycles_into_frame / cycles_per_line) : 0;
-    return (line & 1u) ? (1u << 31) : 0;
+    return (gpu->scanline & 1u) ? (1u << 31) : 0;
 }
 
 uint32_t gpu_status(const Gpu *gpu)
@@ -2137,18 +2132,56 @@ static void gp1_reset_command_buffer(Gpu *gpu)
     gpu->polyline_next_color = 0;
 }
 
-bool gpu_step(Gpu *gpu, uint32_t cycles)
+static uint32_t gpu_lines_per_frame(const Gpu *gpu)
 {
-    gpu->vblank_cycles_left -= (int32_t)cycles;
-    if (gpu->vblank_cycles_left > 0)
-        return false;
+    return gpu->vmode == VMODE_PAL ? GPU_PAL_LINES_PER_FRAME
+                                   : GPU_NTSC_LINES_PER_FRAME;
+}
 
-    do
+static uint32_t gpu_cpu_cycles_per_frame(const Gpu *gpu)
+{
+    return gpu->vmode == VMODE_PAL ? 33868800u / 50u : 33868800u / 60u;
+}
+
+static uint32_t gpu_dotclock_divider(const Gpu *gpu)
+{
+    return display_dotclock_divider(gpu);
+}
+
+bool gpu_in_vblank(const Gpu *gpu)
+{
+    return gpu->scanline >= 240u;
+}
+
+GpuTimingEvents gpu_step(Gpu *gpu, uint32_t cycles)
+{
+    GpuTimingEvents events = {0};
+    uint32_t lines = gpu_lines_per_frame(gpu);
+    uint32_t frame_cycles = gpu_cpu_cycles_per_frame(gpu);
+    uint32_t dotclock_denominator = 7u * gpu_dotclock_divider(gpu);
+
+    gpu->dotclock_phase += (uint64_t)cycles * 11u;
+    events.dotclock_ticks = (uint32_t)(gpu->dotclock_phase / dotclock_denominator);
+    gpu->dotclock_phase %= dotclock_denominator;
+
+    gpu->line_phase += (uint64_t)cycles * lines;
+    while (gpu->line_phase >= frame_cycles)
     {
-        gpu->vblank_cycles_left += GPU_CPU_CYCLES_PER_FRAME;
-    } while (gpu->vblank_cycles_left <= 0);
-    gpu->frames++;
-    return true;
+        gpu->line_phase -= frame_cycles;
+        gpu->scanline++;
+        events.hblank_count++;
+
+        if (gpu->scanline == 240u)
+            events.vblank_started = true;
+        if (gpu->scanline >= lines)
+        {
+            gpu->scanline = 0;
+            gpu->frames++;
+            events.frame_ended = true;
+        }
+    }
+
+    return events;
 }
 
 /* Called externally (e.g. from scheduler VBlank) to present the frame */

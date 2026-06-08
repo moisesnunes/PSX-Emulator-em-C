@@ -455,26 +455,41 @@ static void maybe_dump_ram(Cpu *cpu)
     fclose(f);
 }
 
-static void advance_system_quantum(Cpu *cpu)
+static void advance_system_cycles(Cpu *cpu, uint32_t cycles)
 {
-    const uint32_t SYSTEM_CYCLE_QUANTUM = 300;
-
     dma_step(&cpu->inter.dma, &cpu->inter.irq);
-    uint32_t fired = scheduler_step(&cpu->inter.scheduler, SYSTEM_CYCLE_QUANTUM, &cpu->inter.irq);
-
-    if (fired & (1u << EVENT_CDROM_IRQ))
-        cdrom_on_scheduler_event(&cpu->inter.cdrom, &cpu->inter.irq,
-                                 &cpu->inter.scheduler);
-
-    timers_step(&cpu->inter.timers, SYSTEM_CYCLE_QUANTUM, &cpu->inter.irq, &cpu->inter.scheduler);
-    sio_step(&cpu->inter.sio, &cpu->inter.irq);
-    spu_step(&cpu->inter.spu, SYSTEM_CYCLE_QUANTUM);
-
-    if (gpu_step(&cpu->inter.gpu, SYSTEM_CYCLE_QUANTUM))
+    uint32_t remaining = cycles;
+    while (remaining > 0)
     {
-        irq_assert(&cpu->inter.irq, IRQ_VBLANK);
-        input_update_pad_script(&cpu->inter.sio, cpu->inter.gpu.frames);
-        gpu_vblank(&cpu->inter.gpu);
+        uint32_t slice = remaining;
+        uint32_t until_event = scheduler_cycles_until_next_event(&cpu->inter.scheduler);
+        if (until_event < slice)
+            slice = until_event;
+
+        uint32_t fired = scheduler_step(&cpu->inter.scheduler, slice, &cpu->inter.irq);
+        if (slice > 0)
+        {
+            GpuTimingEvents gpu_events = gpu_step(&cpu->inter.gpu, slice);
+            timers_step(&cpu->inter.timers, slice, gpu_events.dotclock_ticks,
+                        gpu_events.hblank_count, gpu_events.vblank_started,
+                        gpu_in_vblank(&cpu->inter.gpu),
+                        &cpu->inter.irq, &cpu->inter.scheduler);
+            sio_step(&cpu->inter.sio, &cpu->inter.irq, slice);
+            spu_step(&cpu->inter.spu, slice);
+
+            if (gpu_events.frame_ended)
+            {
+                irq_assert(&cpu->inter.irq, IRQ_VBLANK);
+                input_update_pad_script(&cpu->inter.sio, cpu->inter.gpu.frames);
+                gpu_vblank(&cpu->inter.gpu);
+            }
+            remaining -= slice;
+        }
+
+        if (fired & (1u << EVENT_CDROM_IRQ))
+            cdrom_on_scheduler_event(&cpu->inter.cdrom, &cpu->inter.irq,
+                                     &cpu->inter.scheduler);
+        interconnect_on_scheduler_events(&cpu->inter, fired);
     }
 }
 
@@ -695,7 +710,7 @@ int main(int argc, char **argv)
             cpu_quantum_cycles += cycles;
             while (cpu_quantum_cycles >= CPU_CYCLE_QUANTUM)
             {
-                advance_system_quantum(cpu);
+                advance_system_cycles(cpu, CPU_CYCLE_QUANTUM);
                 cpu_quantum_cycles -= CPU_CYCLE_QUANTUM;
             }
             count++;
@@ -824,7 +839,7 @@ int main(int argc, char **argv)
             input_poll_cycles += cycles;
             while (cpu_quantum_cycles >= CPU_CYCLE_QUANTUM)
             {
-                advance_system_quantum(cpu);
+                advance_system_cycles(cpu, CPU_CYCLE_QUANTUM);
                 cpu_quantum_cycles -= CPU_CYCLE_QUANTUM;
             }
 

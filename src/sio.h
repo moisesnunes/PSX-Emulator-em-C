@@ -54,7 +54,7 @@ typedef struct
     bool pad_access;
     bool ack_active;
     bool irq_pending;
-    uint8_t irq_timer;
+    uint32_t irq_cycles_remaining;
 
     uint16_t keyboard_buttons;
     uint16_t controller_buttons;
@@ -67,7 +67,7 @@ uint8_t sio_load8(Sio *sio, uint32_t off);
 void sio_store8(Sio *sio, uint32_t off, uint8_t val, Irq *irq);
 uint16_t sio_load16(Sio *sio, uint32_t off);
 void sio_store16(Sio *sio, uint32_t off, uint16_t val, Irq *irq);
-void sio_step(Sio *sio, Irq *irq);
+void sio_step(Sio *sio, Irq *irq, uint32_t cycles);
 
 void sio_set_button(Sio *sio, uint16_t mask, bool pressed);
 void sio_set_controller_state(Sio *sio, uint16_t pressed_mask);

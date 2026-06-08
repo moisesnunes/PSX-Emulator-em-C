@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include "cpu_timing.h"
 #include "gte.h"
 #include "log.h"
 #include <stdio.h>
@@ -38,9 +39,14 @@ static inline uint32_t cpu_external_irq_cause(const Cpu *cpu)
     return irq_pending(&cpu->inter.irq) ? (1u << 10) : 0;
 }
 
+static inline uint32_t cpu_pending_irq_cause(const Cpu *cpu)
+{
+    return (cpu->cause & 0x300u) | cpu_external_irq_cause(cpu);
+}
+
 static inline bool cpu_irq_enabled(const Cpu *cpu)
 {
-    return (cpu->sr & 0x1u) && (cpu->sr & cpu_external_irq_cause(cpu)) != 0;
+    return (cpu->sr & 0x1u) && (cpu->sr & cpu_pending_irq_cause(cpu)) != 0;
 }
 
 static inline bool cpu_is_bios_vector(uint32_t pc)
@@ -140,14 +146,29 @@ static void cpu_stall_until_gte_complete(Cpu *cpu)
     cpu->gte_busy_cycles = 0;
 }
 
+static void cpu_stall_until_muldiv_complete(Cpu *cpu)
+{
+    if (cpu->muldiv_busy_cycles == 0)
+        return;
+    cpu->extra_cycles += cpu->muldiv_busy_cycles;
+    cpu->muldiv_busy_cycles = 0;
+}
+
+static void consume_busy_cycles(uint32_t *busy_cycles, uint32_t elapsed)
+{
+    if (*busy_cycles > elapsed)
+        *busy_cycles -= elapsed;
+    else
+        *busy_cycles = 0;
+}
+
 static uint32_t cpu_finish_instruction_cycles(Cpu *cpu, uint32_t base_cycles)
 {
-    if (cpu->gte_busy_cycles > base_cycles)
-        cpu->gte_busy_cycles -= base_cycles;
-    else
-        cpu->gte_busy_cycles = 0;
+    uint32_t elapsed = base_cycles + cpu->extra_cycles;
+    consume_busy_cycles(&cpu->gte_busy_cycles, elapsed);
+    consume_busy_cycles(&cpu->muldiv_busy_cycles, elapsed);
 
-    return base_cycles + cpu->extra_cycles;
+    return elapsed;
 }
 
 static void cpu_exception(Cpu *cpu, Exception cause)
@@ -155,7 +176,9 @@ static void cpu_exception(Cpu *cpu, Exception cause)
     uint32_t handler = (cpu->sr & (1 << 22)) ? 0xBFC00180 : 0x80000080;
     uint32_t mode = cpu->sr & 0x3F;
     cpu->sr = (cpu->sr & ~0x3Fu) | ((mode << 2) & 0x3F);
-    cpu->cause = ((uint32_t)cause << 2) | cpu_external_irq_cause(cpu);
+    cpu->cause = (cpu->cause & 0x300u) |
+                 ((uint32_t)cause << 2) |
+                 cpu_external_irq_cause(cpu);
     cpu->epc = cpu->current_pc;
     if (cpu->delay_slot)
     {
@@ -472,6 +495,7 @@ int cpu_init(Cpu *cpu, const char *bios_path, SDL_Window *window, bool headless,
     cpu->load_reg = 0;
     cpu->load_val = 0;
     cpu->hi = cpu->lo = 0xDEADBEEF;
+    cpu->muldiv_busy_cycles = 0;
     cpu->branch = false;
     cpu->delay_slot = false;
     cpu->hle_bios_vectors = false;
@@ -544,14 +568,7 @@ uint32_t cpu_run_next_instruction(Cpu *cpu)
     decode_and_execute(cpu, op);
     memcpy(cpu->regs, cpu->out_regs, sizeof(cpu->regs));
 
-    /* Approximate cycle cost: loads/stores cost more than ALU ops. */
-    uint32_t fn = instr_function(op);
-    uint32_t base_cycles = 2;
-    if (fn == 0x20 || fn == 0x21 || fn == 0x22 || fn == 0x23 ||
-        fn == 0x24 || fn == 0x25 || fn == 0x26 ||
-        fn == 0x28 || fn == 0x29 || fn == 0x2A || fn == 0x2B || fn == 0x2E)
-        base_cycles = 4; /* loads and stores */
-    return cpu_finish_instruction_cycles(cpu, base_cycles);
+    return cpu_finish_instruction_cycles(cpu, cpu_instruction_base_cycles(op));
 }
 
 /* ---- Opcode implementations ---- */
@@ -612,25 +629,18 @@ static void op_mtc0(Cpu *cpu, uint32_t op)
     case 7:
     case 9:
     case 11:
-        if (v != 0)
-        {
-            fprintf(stderr, "Unhandled write to cop0r%u\n", cop_r);
-            exit(1);
-        }
+        /* Breakpoint/cache registers are not implemented yet. */
         break;
     case 12:
         cpu->sr = v;
         break;
     case 13:
-        if (v != 0)
-        {
-            fprintf(stderr, "Unhandled write to CAUSE\n");
-            exit(1);
-        }
+        /* Only software interrupt pending bits are writable. */
+        cpu->cause = (cpu->cause & ~0x300u) | (v & 0x300u);
         break;
     default:
-        fprintf(stderr, "Unhandled cop0 register: %u\n", cop_r);
-        exit(1);
+        LOG(LOG_CPU, "ignored write to cop0r%u value=0x%08X", cop_r, v);
+        break;
     }
 }
 
@@ -648,8 +658,8 @@ static void op_cop0(Cpu *cpu, uint32_t op)
         op_rfe(cpu, op);
         break;
     default:
-        fprintf(stderr, "Unhandled cop0: %08X\n", op);
-        exit(1);
+        cpu_exception(cpu, EXC_ILLEGAL_INSTRUCTION);
+        break;
     }
 }
 
@@ -658,11 +668,11 @@ static void op_cop0(Cpu *cpu, uint32_t op)
 static void op_cop2(Cpu *cpu, uint32_t op)
 {
     uint32_t cop_op = instr_cop_opcode(op);
+    cpu_stall_until_gte_complete(cpu);
     if (cop_op & 0x10)
     {
         /* bit 25 set → execute GTE command */
         uint32_t cmd = op & 0x1FFFFFF;
-        cpu_stall_until_gte_complete(cpu);
         gte_execute(&cpu->gte, cmd);
         cpu->gte_busy_cycles = gte_command_cycles(cmd);
         return;
@@ -671,12 +681,10 @@ static void op_cop2(Cpu *cpu, uint32_t op)
     switch (cop_op)
     {
     case 0b00000: /* MFC2 — move from GTE data reg */
-        cpu_stall_until_gte_complete(cpu);
         cpu->load_reg = instr_t(op);
         cpu->load_val = gte_read_data(&cpu->gte, reg);
         break;
     case 0b00010: /* CFC2 — move from GTE ctrl reg */
-        cpu_stall_until_gte_complete(cpu);
         cpu->load_reg = instr_t(op);
         cpu->load_val = gte_read_ctrl(&cpu->gte, reg);
         break;
@@ -703,6 +711,7 @@ static void op_lwc2(Cpu *cpu, uint32_t op)
         cpu_exception(cpu, EXC_LOAD_ADDRESS_ERROR);
         return;
     }
+    cpu_stall_until_gte_complete(cpu);
     uint32_t val = cpu_load32(cpu, addr);
     gte_load(&cpu->gte, instr_t(op), val);
 }
@@ -846,8 +855,9 @@ static void op_mfc0(Cpu *cpu, uint32_t op)
         v = 0x00000002; /* PRId: R3000A */
         break;
     default:
-        fprintf(stderr, "Unhandled mfc0 r%u\n", cop_r);
-        exit(1);
+        v = 0;
+        LOG(LOG_CPU, "unimplemented mfc0 r%u returns zero", cop_r);
+        break;
     }
     cpu->load_reg = instr_t(op);
     cpu->load_val = v;
@@ -924,6 +934,7 @@ static void op_sra(Cpu *cpu, uint32_t op)
 
 static void op_div(Cpu *cpu, uint32_t op)
 {
+    cpu->muldiv_busy_cycles = 37;
     int32_t n = (int32_t)cpu_reg(cpu, instr_s(op));
     int32_t d = (int32_t)cpu_reg(cpu, instr_t(op));
     if (d == 0)
@@ -943,8 +954,17 @@ static void op_div(Cpu *cpu, uint32_t op)
     }
 }
 
-static void op_mflo(Cpu *cpu, uint32_t op) { cpu_set_reg(cpu, instr_d(op), cpu->lo); }
-static void op_mfhi(Cpu *cpu, uint32_t op) { cpu_set_reg(cpu, instr_d(op), cpu->hi); }
+static void op_mflo(Cpu *cpu, uint32_t op)
+{
+    cpu_stall_until_muldiv_complete(cpu);
+    cpu_set_reg(cpu, instr_d(op), cpu->lo);
+}
+
+static void op_mfhi(Cpu *cpu, uint32_t op)
+{
+    cpu_stall_until_muldiv_complete(cpu);
+    cpu_set_reg(cpu, instr_d(op), cpu->hi);
+}
 
 static void op_srl(Cpu *cpu, uint32_t op)
 {
@@ -958,6 +978,7 @@ static void op_sltiu(Cpu *cpu, uint32_t op)
 
 static void op_divu(Cpu *cpu, uint32_t op)
 {
+    cpu->muldiv_busy_cycles = 37;
     uint32_t n = cpu_reg(cpu, instr_s(op));
     uint32_t d = cpu_reg(cpu, instr_t(op));
     if (d == 0)
@@ -1010,8 +1031,8 @@ static void op_rfe(Cpu *cpu, uint32_t op)
 {
     if ((op & 0x3F) != 0b010000)
     {
-        fprintf(stderr, "Invalid cop0 RFE: %08X\n", op);
-        exit(1);
+        cpu_exception(cpu, EXC_ILLEGAL_INSTRUCTION);
+        return;
     }
     uint32_t mode = cpu->sr & 0x3F;
     cpu->sr = (cpu->sr & ~0x3Fu) | (mode >> 2);
@@ -1066,6 +1087,8 @@ static void op_srlv(Cpu *cpu, uint32_t op)
 
 static void op_multu(Cpu *cpu, uint32_t op)
 {
+    cpu->muldiv_busy_cycles =
+        cpu_multiply_cycles_unsigned(cpu_reg(cpu, instr_s(op)));
     uint64_t v = (uint64_t)cpu_reg(cpu, instr_s(op)) * (uint64_t)cpu_reg(cpu, instr_t(op));
     cpu->hi = (uint32_t)(v >> 32);
     cpu->lo = (uint32_t)v;
@@ -1078,6 +1101,8 @@ static void op_xor(Cpu *cpu, uint32_t op)
 
 static void op_mult(Cpu *cpu, uint32_t op)
 {
+    cpu->muldiv_busy_cycles =
+        cpu_multiply_cycles_signed(cpu_reg(cpu, instr_s(op)));
     int64_t a = (int64_t)(int32_t)cpu_reg(cpu, instr_s(op));
     int64_t b = (int64_t)(int32_t)cpu_reg(cpu, instr_t(op));
     uint64_t v = (uint64_t)(a * b);

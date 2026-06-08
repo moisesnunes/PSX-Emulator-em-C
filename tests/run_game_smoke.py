@@ -305,8 +305,8 @@ def main() -> int:
     parser.add_argument(
         "--dump-frame",
         type=int,
-        default=int(os.getenv("GAME_SMOKE_DUMP_FRAME", "5000")),
-        help="GPU frame to capture. Default 5000, after the known BIOS/license logos for the current games.",
+        default=int(os.getenv("GAME_SMOKE_DUMP_FRAME", "2000")),
+        help="GPU frame to capture. Default 2000 with the corrected CPU/device clock ratio.",
     )
     parser.add_argument("--no-screenshot", action="store_true", help="Do not capture display.ppm/png")
     parser.add_argument("--full-vram", action="store_true")

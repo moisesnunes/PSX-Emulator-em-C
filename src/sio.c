@@ -19,7 +19,7 @@
 
 /* Digital pad device-id response byte */
 #define PAD_ID_DIGITAL 0x41
-#define ACK_DELAY_STEPS 15
+#define ACK_DELAY_CYCLES 535u
 
 /* Key map: SDL scancode → button bitmask */
 static const struct
@@ -86,7 +86,7 @@ static void reset_transaction(Sio *sio)
 
 static void schedule_ack_irq(Sio *sio)
 {
-    sio->irq_timer = ACK_DELAY_STEPS;
+    sio->irq_cycles_remaining = ACK_DELAY_CYCLES;
 }
 
 static uint32_t build_stat(const Sio *sio)
@@ -210,7 +210,7 @@ void sio_store16(Sio *sio, uint32_t off, uint16_t val, Irq *irq)
         {
             reset_transaction(sio);
             sio->irq_pending = false;
-            sio->irq_timer = 0;
+            sio->irq_cycles_remaining = 0;
             sio->ctrl = 0;
         }
         else if (val & CTRL_ACK_RESET)
@@ -249,16 +249,20 @@ void sio_store16(Sio *sio, uint32_t off, uint16_t val, Irq *irq)
     }
 }
 
-void sio_step(Sio *sio, Irq *irq)
+void sio_step(Sio *sio, Irq *irq, uint32_t cycles)
 {
-    if (sio->irq_timer > 0)
+    if (sio->irq_cycles_remaining > 0)
     {
-        sio->irq_timer--;
-        if (sio->irq_timer == 0)
+        if (cycles >= sio->irq_cycles_remaining)
         {
+            sio->irq_cycles_remaining = 0;
             sio->irq_pending = true;
             sio->ack_active = true;
             sio->stat = build_stat(sio);
+        }
+        else
+        {
+            sio->irq_cycles_remaining -= cycles;
         }
     }
     if (sio->irq_pending)
