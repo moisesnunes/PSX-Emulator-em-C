@@ -21,10 +21,16 @@ typedef struct
 {
     SDL_GameController *pad;
     SDL_JoystickID instance_id;
+    unsigned port;
     uint16_t button_state;
     uint16_t axis_state;
+    uint8_t left_x;
+    uint8_t left_y;
+    uint8_t right_x;
+    uint8_t right_y;
 } InputController;
 
+#define INPUT_CONTROLLER_COUNT 2
 #define PAD_SCRIPT_MAX_EVENTS 64
 typedef struct
 {
@@ -52,6 +58,7 @@ static void usage(const char *prog)
             "  --bios <path>              BIOS ROM path (default: bios/BIOS.ROM)\n"
             "  --exe  <path>              PS-X EXE to load after BIOS init\n"
             "  --disc <path>              Disc image (.bin) to mount\n"
+            "  --memcard <path>           Slot 1 raw 128 KiB memory card\n"
             "  --headless                 Run without window or audio\n"
             "  --max-instructions <N>     Exit after N instructions (headless smoke test)\n"
             "\n"
@@ -73,31 +80,73 @@ static void input_controller_close(InputController *ctl)
     ctl->instance_id = -1;
     ctl->button_state = 0;
     ctl->axis_state = 0;
+    ctl->left_x = ctl->left_y = 0x80;
+    ctl->right_x = ctl->right_y = 0x80;
 }
 
 static void input_controller_apply(InputController *ctl, Sio *sio)
 {
-    sio_set_controller_state(sio, ctl->button_state | ctl->axis_state);
+    sio_set_port_controller_state(sio, ctl->port,
+                                  ctl->button_state | ctl->axis_state);
+    sio_set_port_analog_state(sio, ctl->port, ctl->left_x, ctl->left_y,
+                              ctl->right_x, ctl->right_y);
 }
 
-static void input_controller_open_first(InputController *ctl)
+static bool input_controller_instance_open(const InputController *ctls,
+                                           SDL_JoystickID instance_id)
 {
-    if (ctl->pad)
-        return;
+    for (unsigned port = 0; port < INPUT_CONTROLLER_COUNT; port++)
+    {
+        if (ctls[port].pad && ctls[port].instance_id == instance_id)
+            return true;
+    }
+    return false;
+}
 
+static void input_controllers_open_available(InputController *ctls)
+{
     int count = SDL_NumJoysticks();
     for (int i = 0; i < count; i++)
     {
         if (!SDL_IsGameController(i))
             continue;
-        ctl->pad = SDL_GameControllerOpen(i);
-        if (!ctl->pad)
+        SDL_JoystickID instance_id = SDL_JoystickGetDeviceInstanceID(i);
+        if (input_controller_instance_open(ctls, instance_id))
             continue;
-        SDL_Joystick *joy = SDL_GameControllerGetJoystick(ctl->pad);
-        ctl->instance_id = joy ? SDL_JoystickInstanceID(joy) : -1;
-        fprintf(stderr, "Using controller: %s\n",
-                SDL_GameControllerName(ctl->pad));
-        return;
+        for (unsigned port = 0; port < INPUT_CONTROLLER_COUNT; port++)
+        {
+            InputController *ctl = &ctls[port];
+            if (ctl->pad)
+                continue;
+            ctl->pad = SDL_GameControllerOpen(i);
+            if (!ctl->pad)
+                break;
+            SDL_Joystick *joy = SDL_GameControllerGetJoystick(ctl->pad);
+            ctl->instance_id = joy ? SDL_JoystickInstanceID(joy) : -1;
+            fprintf(stderr, "Using controller on port %u: %s\n", port + 1,
+                    SDL_GameControllerName(ctl->pad));
+            break;
+        }
+    }
+}
+
+static void input_controllers_close(InputController *ctls)
+{
+    for (unsigned port = 0; port < INPUT_CONTROLLER_COUNT; port++)
+        input_controller_close(&ctls[port]);
+}
+
+static void input_clear_live_state(InputController *ctls, Sio *sio)
+{
+    sio_clear_keyboard_state(sio);
+    for (unsigned port = 0; port < INPUT_CONTROLLER_COUNT; port++)
+    {
+        InputController *ctl = &ctls[port];
+        ctl->button_state = 0;
+        ctl->axis_state = 0;
+        ctl->left_x = ctl->left_y = 0x80;
+        ctl->right_x = ctl->right_y = 0x80;
+        input_controller_apply(ctl, sio);
     }
 }
 
@@ -134,6 +183,11 @@ static uint16_t input_controller_button_mask(SDL_GameControllerButton button)
     }
 }
 
+static uint8_t input_axis_byte(int16_t value)
+{
+    return (uint8_t)(((int32_t)value + 32768) >> 8);
+}
+
 static void input_controller_handle_button(InputController *ctl, Sio *sio,
                                            SDL_GameControllerButton button,
                                            bool pressed)
@@ -159,6 +213,7 @@ static void input_controller_handle_axis(InputController *ctl, Sio *sio,
     switch (axis)
     {
     case SDL_CONTROLLER_AXIS_LEFTX:
+        ctl->left_x = input_axis_byte(value);
         clear = SIO_PAD_LEFT | SIO_PAD_RIGHT;
         if (value <= -deadzone)
             set = SIO_PAD_LEFT;
@@ -166,6 +221,7 @@ static void input_controller_handle_axis(InputController *ctl, Sio *sio,
             set = SIO_PAD_RIGHT;
         break;
     case SDL_CONTROLLER_AXIS_LEFTY:
+        ctl->left_y = input_axis_byte(value);
         clear = SIO_PAD_UP | SIO_PAD_DOWN;
         if (value <= -deadzone)
             set = SIO_PAD_UP;
@@ -177,6 +233,14 @@ static void input_controller_handle_axis(InputController *ctl, Sio *sio,
         if (value >= deadzone)
             set = SIO_PAD_L2;
         break;
+    case SDL_CONTROLLER_AXIS_RIGHTX:
+        ctl->right_x = input_axis_byte(value);
+        input_controller_apply(ctl, sio);
+        return;
+    case SDL_CONTROLLER_AXIS_RIGHTY:
+        ctl->right_y = input_axis_byte(value);
+        input_controller_apply(ctl, sio);
+        return;
     case SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
         clear = SIO_PAD_R2;
         if (value >= deadzone)
@@ -206,6 +270,8 @@ static void input_controller_poll_state(InputController *ctl, Sio *sio)
     const int16_t deadzone = 12000;
     int16_t lx = SDL_GameControllerGetAxis(ctl->pad, SDL_CONTROLLER_AXIS_LEFTX);
     int16_t ly = SDL_GameControllerGetAxis(ctl->pad, SDL_CONTROLLER_AXIS_LEFTY);
+    int16_t rx = SDL_GameControllerGetAxis(ctl->pad, SDL_CONTROLLER_AXIS_RIGHTX);
+    int16_t ry = SDL_GameControllerGetAxis(ctl->pad, SDL_CONTROLLER_AXIS_RIGHTY);
     int16_t lt = SDL_GameControllerGetAxis(ctl->pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
     int16_t rt = SDL_GameControllerGetAxis(ctl->pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
 
@@ -224,55 +290,77 @@ static void input_controller_poll_state(InputController *ctl, Sio *sio)
 
     ctl->button_state = buttons;
     ctl->axis_state = axes;
+    ctl->left_x = input_axis_byte(lx);
+    ctl->left_y = input_axis_byte(ly);
+    ctl->right_x = input_axis_byte(rx);
+    ctl->right_y = input_axis_byte(ry);
     input_controller_apply(ctl, sio);
 }
 
-static bool process_sdl_events(Cpu *cpu, InputController *input_ctl)
+static bool process_sdl_events(Cpu *cpu, InputController *input_ctls)
 {
     SDL_Event event;
     while (SDL_PollEvent(&event))
     {
         if (event.type == SDL_QUIT)
             return false;
+        if (event.type == SDL_WINDOWEVENT &&
+            event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+            input_clear_live_state(input_ctls, &cpu->inter.sio);
         if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP)
             sio_on_key(&cpu->inter.sio, event.key.keysym.scancode,
                        event.type == SDL_KEYDOWN);
         else if (event.type == SDL_CONTROLLERDEVICEADDED)
         {
-            input_controller_open_first(input_ctl);
-            input_controller_apply(input_ctl, &cpu->inter.sio);
+            input_controllers_open_available(input_ctls);
+            for (unsigned port = 0; port < INPUT_CONTROLLER_COUNT; port++)
+                input_controller_apply(&input_ctls[port], &cpu->inter.sio);
         }
         else if (event.type == SDL_CONTROLLERDEVICEREMOVED)
         {
-            if (input_ctl->pad && input_ctl->instance_id == event.cdevice.which)
+            for (unsigned port = 0; port < INPUT_CONTROLLER_COUNT; port++)
             {
-                input_controller_close(input_ctl);
-                input_controller_apply(input_ctl, &cpu->inter.sio);
-                input_controller_open_first(input_ctl);
+                InputController *ctl = &input_ctls[port];
+                if (!ctl->pad || ctl->instance_id != event.cdevice.which)
+                    continue;
+                input_controller_close(ctl);
+                input_controller_apply(ctl, &cpu->inter.sio);
             }
+            input_controllers_open_available(input_ctls);
         }
         else if (event.type == SDL_CONTROLLERBUTTONDOWN ||
                  event.type == SDL_CONTROLLERBUTTONUP)
         {
-            if (input_ctl->pad && input_ctl->instance_id == event.cbutton.which)
-                input_controller_handle_button(input_ctl, &cpu->inter.sio,
-                                               (SDL_GameControllerButton)event.cbutton.button,
-                                               event.type == SDL_CONTROLLERBUTTONDOWN);
+            for (unsigned port = 0; port < INPUT_CONTROLLER_COUNT; port++)
+            {
+                InputController *ctl = &input_ctls[port];
+                if (ctl->pad && ctl->instance_id == event.cbutton.which)
+                    input_controller_handle_button(
+                        ctl, &cpu->inter.sio,
+                        (SDL_GameControllerButton)event.cbutton.button,
+                        event.type == SDL_CONTROLLERBUTTONDOWN);
+            }
         }
         else if (event.type == SDL_CONTROLLERAXISMOTION)
         {
-            if (input_ctl->pad && input_ctl->instance_id == event.caxis.which)
-                input_controller_handle_axis(input_ctl, &cpu->inter.sio,
-                                             (SDL_GameControllerAxis)event.caxis.axis,
-                                             event.caxis.value);
+            for (unsigned port = 0; port < INPUT_CONTROLLER_COUNT; port++)
+            {
+                InputController *ctl = &input_ctls[port];
+                if (ctl->pad && ctl->instance_id == event.caxis.which)
+                    input_controller_handle_axis(
+                        ctl, &cpu->inter.sio,
+                        (SDL_GameControllerAxis)event.caxis.axis,
+                        event.caxis.value);
+            }
         }
     }
 
-    input_controller_poll_state(input_ctl, &cpu->inter.sio);
+    for (unsigned port = 0; port < INPUT_CONTROLLER_COUNT; port++)
+        input_controller_poll_state(&input_ctls[port], &cpu->inter.sio);
     return true;
 }
 
-static bool sleep_until_frame_deadline(Cpu *cpu, InputController *input_ctl,
+static bool sleep_until_frame_deadline(Cpu *cpu, InputController *input_ctls,
                                        uint64_t deadline)
 {
     for (;;)
@@ -281,7 +369,7 @@ static bool sleep_until_frame_deadline(Cpu *cpu, InputController *input_ctl,
         if (now >= deadline)
             return true;
 
-        if (!process_sdl_events(cpu, input_ctl))
+        if (!process_sdl_events(cpu, input_ctls))
             return false;
 
         uint64_t wait_ns = deadline - now;
@@ -465,21 +553,34 @@ static void advance_system_cycles(Cpu *cpu, uint32_t cycles)
         uint32_t until_event = scheduler_cycles_until_next_event(&cpu->inter.scheduler);
         if (until_event < slice)
             slice = until_event;
+        uint32_t until_gpu =
+            gpu_cycles_until_timing_boundary(&cpu->inter.gpu);
+        if (until_gpu < slice)
+            slice = until_gpu;
+        uint32_t until_sio = sio_cycles_until_event(&cpu->inter.sio);
+        if (until_sio < slice)
+            slice = until_sio;
 
         uint32_t fired = scheduler_step(&cpu->inter.scheduler, slice, &cpu->inter.irq);
         if (slice > 0)
         {
+            bool in_hblank = gpu_in_hblank(&cpu->inter.gpu);
+            bool in_vblank = gpu_in_vblank(&cpu->inter.gpu);
             GpuTimingEvents gpu_events = gpu_step(&cpu->inter.gpu, slice);
             timers_step(&cpu->inter.timers, slice, gpu_events.dotclock_ticks,
-                        gpu_events.hblank_count, gpu_events.vblank_started,
-                        gpu_in_vblank(&cpu->inter.gpu),
+                        gpu_events.hblank_count, in_hblank,
+                        gpu_events.vblank_started, in_vblank,
                         &cpu->inter.irq, &cpu->inter.scheduler);
             sio_step(&cpu->inter.sio, &cpu->inter.irq, slice);
             spu_step(&cpu->inter.spu, slice);
 
-            if (gpu_events.frame_ended)
+            if (gpu_events.vblank_started)
             {
                 irq_assert(&cpu->inter.irq, IRQ_VBLANK);
+                gpu_vblank_start(&cpu->inter.gpu);
+            }
+            if (gpu_events.frame_ended)
+            {
                 input_update_pad_script(&cpu->inter.sio, cpu->inter.gpu.frames);
                 gpu_vblank(&cpu->inter.gpu);
             }
@@ -498,6 +599,7 @@ int main(int argc, char **argv)
     const char *bios_path = "bios/BIOS.ROM";
     const char *exe_path = NULL;
     const char *disc_path = NULL;
+    const char *memcard_path = NULL;
     bool headless = false;
     uint64_t max_instr = 0;
 
@@ -514,6 +616,10 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--disc") == 0 && i + 1 < argc)
         {
             disc_path = argv[++i];
+        }
+        else if (strcmp(argv[i], "--memcard") == 0 && i + 1 < argc)
+        {
+            memcard_path = argv[++i];
         }
         else if (strcmp(argv[i], "--headless") == 0)
         {
@@ -577,16 +683,22 @@ int main(int argc, char **argv)
         }
     }
 
-    InputController input_ctl = {0};
-    input_ctl.instance_id = -1;
+    InputController input_ctl[INPUT_CONTROLLER_COUNT] = {0};
+    for (unsigned port = 0; port < INPUT_CONTROLLER_COUNT; port++)
+    {
+        input_ctl[port].instance_id = -1;
+        input_ctl[port].port = port;
+        input_ctl[port].left_x = input_ctl[port].left_y = 0x80;
+        input_ctl[port].right_x = input_ctl[port].right_y = 0x80;
+    }
     if (!headless)
-        input_controller_open_first(&input_ctl);
+        input_controllers_open_available(input_ctl);
 
     Cpu *cpu = (Cpu *)malloc(sizeof(Cpu));
     if (!cpu)
     {
         fprintf(stderr, "Failed to allocate CPU\n");
-        input_controller_close(&input_ctl);
+        input_controllers_close(input_ctl);
         if (window)
             SDL_DestroyWindow(window);
         if (!headless)
@@ -597,7 +709,7 @@ int main(int argc, char **argv)
     {
         fprintf(stderr, "Failed to init CPU/BIOS\n");
         free(cpu);
-        input_controller_close(&input_ctl);
+        input_controllers_close(input_ctl);
         if (window)
             SDL_DestroyWindow(window);
         if (!headless)
@@ -606,6 +718,10 @@ int main(int argc, char **argv)
     }
     input_apply_forced_env(&cpu->inter.sio);
     input_parse_pad_script();
+    if (memcard_path && sio_memory_card_load(&cpu->inter.sio, memcard_path) < 0)
+    {
+        fprintf(stderr, "Memory card unavailable: %s\n", memcard_path);
+    }
 
     if (exe_path)
     {
@@ -616,7 +732,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "Failed to load EXE: %s\n", exe_path);
             cpu_destroy(cpu);
             free(cpu);
-            input_controller_close(&input_ctl);
+            input_controllers_close(input_ctl);
             if (window)
                 SDL_DestroyWindow(window);
             if (!headless)
@@ -785,7 +901,7 @@ int main(int argc, char **argv)
                 }
                 cpu_destroy(cpu);
                 free(cpu);
-                input_controller_close(&input_ctl);
+                input_controllers_close(input_ctl);
                 return 0;
             }
             if (trace_interval > 0 && (count % trace_interval) == 0)
@@ -809,7 +925,7 @@ int main(int argc, char **argv)
                 maybe_dump_ram(cpu);
                 cpu_destroy(cpu);
                 free(cpu);
-                input_controller_close(&input_ctl);
+                input_controllers_close(input_ctl);
                 return 0;
             }
         }
@@ -827,7 +943,7 @@ int main(int argc, char **argv)
         uint32_t frame_start = cpu->inter.gpu.frames;
         uint32_t input_poll_cycles = 0;
 
-        if (!process_sdl_events(cpu, &input_ctl))
+        if (!process_sdl_events(cpu, input_ctl))
             break;
 
         /* Run in small slices until the GPU produces the next VBlank.  This
@@ -846,15 +962,15 @@ int main(int argc, char **argv)
             if (input_poll_cycles >= INPUT_POLL_CYCLES)
             {
                 input_poll_cycles = 0;
-                if (!process_sdl_events(cpu, &input_ctl))
+                if (!process_sdl_events(cpu, input_ctl))
                     goto quit_normal_loop;
             }
         }
 
-        if (!process_sdl_events(cpu, &input_ctl))
+        if (!process_sdl_events(cpu, input_ctl))
             break;
 
-        if (!sleep_until_frame_deadline(cpu, &input_ctl, frame_deadline))
+        if (!sleep_until_frame_deadline(cpu, input_ctl, frame_deadline))
             break;
         frame_deadline += FRAME_NS;
         uint64_t now = now_nanos();
@@ -865,7 +981,7 @@ int main(int argc, char **argv)
 quit_normal_loop:
     cpu_destroy(cpu);
     free(cpu);
-    input_controller_close(&input_ctl);
+    input_controllers_close(input_ctl);
     SDL_DestroyWindow(window);
     SDL_Quit();
     return 0;

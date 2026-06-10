@@ -1,5 +1,6 @@
 #pragma once
 #include "interconnect.h"
+#include "cpu_cache.h"
 #include "gte.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -12,6 +13,7 @@ typedef struct
     uint32_t out_regs[32];
     Interconnect inter;
     uint32_t next_instruction;
+    CpuICache icache;
 
     /* COP0 */
     uint32_t sr;

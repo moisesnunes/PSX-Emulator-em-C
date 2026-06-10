@@ -295,14 +295,14 @@ static void cmd_getlocl(Cdrom *cd, Scheduler *sched)
 {
     resp_clear(cd);
     Msf pos = msf_from_lba(cd->cur_lba);
-    resp_push(cd, pos.m);       /* amm */
-    resp_push(cd, pos.s);       /* ass */
-    resp_push(cd, pos.f);       /* asect */
-    resp_push(cd, 0x02);        /* amode — Mode 2 */
-    resp_push(cd, cd->xa_current_set ? cd->xa_current_file    : 0x01);
+    resp_push(cd, pos.m); /* amm */
+    resp_push(cd, pos.s); /* ass */
+    resp_push(cd, pos.f); /* asect */
+    resp_push(cd, 0x02);  /* amode — Mode 2 */
+    resp_push(cd, cd->xa_current_set ? cd->xa_current_file : 0x01);
     resp_push(cd, cd->xa_current_set ? cd->xa_current_channel : 0x00);
-    resp_push(cd, 0x08);        /* submode: data */
-    resp_push(cd, 0x00);        /* coding info */
+    resp_push(cd, 0x08); /* submode: data */
+    resp_push(cd, 0x00); /* coding info */
     queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_ACK, CDROM_ACK_DELAY);
     LOG(LOG_CDROM, "GetlocL LBA=%u %02X:%02X:%02X", cd->cur_lba, pos.m, pos.s, pos.f);
 }

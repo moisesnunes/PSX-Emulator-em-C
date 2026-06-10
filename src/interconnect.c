@@ -146,8 +146,7 @@ static uint32_t dma_reg_read(Interconnect *inter, uint32_t offset)
         case 8:
             return channel_control(ch);
         default:
-            fprintf(stderr, "Unhandled DMA read at %08X\n", offset);
-            exit(1);
+            return bus_unmapped_load(0x1F801080u + offset, 32);
         }
     }
     else if (major == 7)
@@ -159,12 +158,10 @@ static uint32_t dma_reg_read(Interconnect *inter, uint32_t offset)
         case 4:
             return dma_interrupt(&inter->dma);
         default:
-            fprintf(stderr, "Unhandled DMA read at %08X\n", offset);
-            exit(1);
+            return bus_unmapped_load(0x1F801080u + offset, 32);
         }
     }
-    fprintf(stderr, "Unhandled DMA read at %08X\n", offset);
-    exit(1);
+    return bus_unmapped_load(0x1F801080u + offset, 32);
 }
 
 static uint16_t dma_reg_read16(Interconnect *inter, uint32_t offset)
@@ -203,7 +200,8 @@ static EventType dma_event_for_port(Port port)
     return (EventType)(EVENT_DMA0 + (int)port);
 }
 
-static uint32_t dma_completion_cycles(Port port, uint32_t words)
+static uint32_t dma_completion_cycles(const Interconnect *inter, Port port,
+                                      uint32_t words)
 {
     if (words == 0)
         words = 1;
@@ -215,12 +213,7 @@ static uint32_t dma_completion_cycles(Port port, uint32_t words)
     case PORT_MDEC_OUT:
         return words * 6u + 32u;
     case PORT_GPU:
-        /*
-         * Keep CHCR busy until a scheduler boundary. A longer delay must come
-         * from actual GP0 command costs; word-count timing corrupts image-load
-         * streams because command and pixel words have very different costs.
-         */
-        return 1u;
+        return gpu_busy_cycles(&inter->gpu);
     case PORT_CDROM:
         return words * 24u;
     case PORT_SPU:
@@ -256,8 +249,8 @@ static void dma_reg_write(Interconnect *inter, uint32_t offset, uint32_t val)
             channel_set_control(ch, val);
             break;
         default:
-            fprintf(stderr, "Unhandled DMA write %08X = %08X\n", offset, val);
-            exit(1);
+            bus_unmapped_store(0x1F801080u + offset, val, 32);
+            return;
         }
         if (channel_active(ch))
         {
@@ -277,14 +270,14 @@ static void dma_reg_write(Interconnect *inter, uint32_t offset, uint32_t val)
             dma_update_irq(inter);
             break;
         default:
-            fprintf(stderr, "Unhandled DMA write %08X = %08X\n", offset, val);
-            exit(1);
+            bus_unmapped_store(0x1F801080u + offset, val, 32);
+            return;
         }
     }
     else
     {
-        fprintf(stderr, "Unhandled DMA write %08X = %08X\n", offset, val);
-        exit(1);
+        bus_unmapped_store(0x1F801080u + offset, val, 32);
+        return;
     }
 
     if (has_active)
@@ -378,8 +371,7 @@ static uint32_t gpu_reg_read(Interconnect *inter, uint32_t offset)
     case 4:
         return gpu_status(&inter->gpu);
     default:
-        fprintf(stderr, "GPU read: %08X\n", offset);
-        exit(1);
+        return bus_unmapped_load(0x1F801810u + offset, 32);
     }
 }
 
@@ -394,8 +386,8 @@ static void gpu_reg_write(Interconnect *inter, uint32_t offset, uint32_t val)
         gpu_gp1(&inter->gpu, val);
         return;
     default:
-        fprintf(stderr, "GPU write: %08X = %08X\n", offset, val);
-        exit(1);
+        bus_unmapped_store(0x1F801810u + offset, val, 32);
+        return;
     }
 }
 
@@ -481,8 +473,8 @@ static uint32_t do_dma_block(Interconnect *inter, Port port)
     {
         if (port == PORT_OTC)
             return 1;
-        fprintf(stderr, "Couldn't figure out DMA block transfer size\n");
-        exit(1);
+        LOG(LOG_DMA, "DMA unsupported sync port=%d", port);
+        return 1;
     }
     if (remsz == 0 && port == PORT_MDEC_OUT)
         remsz = channel_block_count(ch) ? channel_block_count(ch) : channel_block_size(ch);
@@ -511,8 +503,9 @@ static uint32_t do_dma_block(Interconnect *inter, Port port)
             case PORT_OTC:
                 break;
             default:
-                fprintf(stderr, "Unhandled DMA dest port %d\n", port);
-                exit(1);
+                LOG(LOG_DMA, "DMA ignored destination port=%d", port);
+                remsz = 1;
+                break;
             }
             break;
         }
@@ -538,8 +531,9 @@ static uint32_t do_dma_block(Interconnect *inter, Port port)
                 src = spu_dma_read(&inter->spu);
                 break;
             default:
-                fprintf(stderr, "Unhandled DMA src port %d\n", port);
-                exit(1);
+                LOG(LOG_DMA, "DMA open-bus source port=%d", port);
+                src = 0xFFFFFFFFu;
+                break;
             }
             ram_store32(&inter->ram, cur_addr, src);
             break;
@@ -559,13 +553,13 @@ static uint32_t do_dma_linked_list(Interconnect *inter, Port port)
     uint32_t words = 0;
     if (channel_direction(ch) == DIRECTION_TO_RAM)
     {
-        fprintf(stderr, "Invalid DMA direction for linked list\n");
-        exit(1);
+        LOG(LOG_DMA, "invalid linked-list direction port=%d", port);
+        return 1;
     }
     if (port != PORT_GPU)
     {
-        fprintf(stderr, "Linked list DMA on non-GPU port\n");
-        exit(1);
+        LOG(LOG_DMA, "linked-list DMA ignored on port=%d", port);
+        return 1;
     }
     for (;;)
     {
@@ -598,12 +592,24 @@ static uint32_t do_dma_linked_list(Interconnect *inter, Port port)
 static void do_dma(Interconnect *inter, Port port)
 {
     uint32_t words;
-    if (port != PORT_OTC && channel_sync(dma_channel(&inter->dma, port)) == SYNC_LINKED_LIST)
+    bool linked_list =
+        port != PORT_OTC &&
+        channel_sync(dma_channel(&inter->dma, port)) == SYNC_LINKED_LIST;
+    if (linked_list)
         words = do_dma_linked_list(inter, port);
     else
         words = do_dma_block(inter, port);
 
-    uint32_t cycles = dma_completion_cycles(port, words);
+    if (port == PORT_GPU)
+    {
+        uint32_t transfer_cycles =
+            linked_list ? words + 16u : words / 4u + 16u;
+        gpu_add_busy_cycles(&inter->gpu, transfer_cycles);
+    }
+
+    uint32_t cycles = dma_completion_cycles(inter, port, words);
+    if (cycles == 0)
+        cycles = 1;
     scheduler_schedule(&inter->scheduler, dma_event_for_port(port), cycles);
     LOG(LOG_DMA, "DMA scheduled port=%d words=%u cycles=%u", port, words, cycles);
 }
@@ -631,6 +637,7 @@ int interconnect_init(Interconnect *inter, const char *bios_path, SDL_Window *wi
         return -1;
     inter->mem_control[0] = 0x1F000000;
     inter->mem_control[1] = 0x1F802000;
+    inter->cache_control = 0;
     ram_init(&inter->ram);
     dma_init(&inter->dma);
     gpu_init(&inter->gpu, window);
@@ -688,7 +695,7 @@ uint32_t interconnect_load32(Interconnect *inter, uint32_t addr)
     if (range_contains(MAP_RAM_SIZE, abs, &off))
         return 0;
     if (range_contains(MAP_CACHE_CTRL, abs, &off))
-        return 0;
+        return inter->cache_control;
     if (range_contains(MAP_DMA, abs, &off))
         return dma_reg_read(inter, off);
     if (range_contains(MAP_CDROM, abs, &off))
@@ -738,7 +745,7 @@ uint16_t interconnect_load16(Interconnect *inter, uint32_t addr)
     if (range_contains(MAP_RAM_SIZE, abs, &off))
         return 0;
     if (range_contains(MAP_CACHE_CTRL, abs, &off))
-        return 0;
+        return (uint16_t)(inter->cache_control >> ((off & 2u) * 8u));
     if (range_contains(MAP_DMA, abs, &off))
         return dma_reg_read16(inter, off);
     if (range_contains(MAP_CDROM, abs, &off))
@@ -790,7 +797,7 @@ uint8_t interconnect_load8(Interconnect *inter, uint32_t addr)
     if (range_contains(MAP_RAM_SIZE, abs, &off))
         return 0;
     if (range_contains(MAP_CACHE_CTRL, abs, &off))
-        return 0;
+        return (uint8_t)(inter->cache_control >> ((off & 3u) * 8u));
     if (range_contains(MAP_DMA, abs, &off))
         return dma_reg_read8(inter, off);
     if (range_contains(MAP_SIO, abs, &off))
@@ -822,17 +829,11 @@ void interconnect_store32(Interconnect *inter, uint32_t addr, uint32_t val)
         {
         case 0:
             if (val != 0x1F000000)
-            {
-                fprintf(stderr, "Bad expansion 1 base: %08X\n", val);
-                exit(1);
-            }
+                LOG(LOG_CPU, "nonstandard expansion 1 base: %08X", val);
             break;
         case 4:
             if (val != 0x1F802000)
-            {
-                fprintf(stderr, "Bad expansion 2 base: %08X\n", val);
-                exit(1);
-            }
+                LOG(LOG_CPU, "nonstandard expansion 2 base: %08X", val);
             break;
         default:
             break;
@@ -843,7 +844,10 @@ void interconnect_store32(Interconnect *inter, uint32_t addr, uint32_t val)
     if (range_contains(MAP_RAM_SIZE, abs, &off))
         return;
     if (range_contains(MAP_CACHE_CTRL, abs, &off))
+    {
+        inter->cache_control = val;
         return;
+    }
     if (range_contains(MAP_RAM, abs, &off))
     {
         ram_store32(&inter->ram, off & 0x001FFFFF, val);
@@ -933,7 +937,12 @@ void interconnect_store16(Interconnect *inter, uint32_t addr, uint16_t val)
     if (range_contains(MAP_RAM_SIZE, abs, &off))
         return;
     if (range_contains(MAP_CACHE_CTRL, abs, &off))
+    {
+        uint32_t shift = (off & 2u) * 8u;
+        inter->cache_control =
+            (inter->cache_control & ~(0xFFFFu << shift)) | ((uint32_t)val << shift);
         return;
+    }
     if (range_contains(MAP_TIMERS, abs, &off))
     {
         timers_store16(&inter->timers, off, val, &inter->scheduler);
@@ -1034,7 +1043,12 @@ void interconnect_store8(Interconnect *inter, uint32_t addr, uint8_t val)
     if (range_contains(MAP_RAM_SIZE, abs, &off))
         return;
     if (range_contains(MAP_CACHE_CTRL, abs, &off))
+    {
+        uint32_t shift = (off & 3u) * 8u;
+        inter->cache_control =
+            (inter->cache_control & ~(0xFFu << shift)) | ((uint32_t)val << shift);
         return;
+    }
     if (range_contains(MAP_DMA, abs, &off))
     {
         dma_reg_write8(inter, off, val);

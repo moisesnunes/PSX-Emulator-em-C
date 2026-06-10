@@ -11,7 +11,9 @@ MAX_INSTRUCTIONS ?= 5000000
 SRCS = src/main.c         \
        src/cpu.c          \
        src/cpu_timing.c   \
+       src/cpu_cache.c    \
        src/bus_policy.c   \
+       src/bus_timing.c   \
        src/interconnect.c \
        src/bios.c         \
        src/ram.c          \
@@ -40,14 +42,17 @@ PSX_TEST_RUNNER = python3 tests/run_psx_tests.py
 PSX_TEST_ARGS ?=
 GAME_SMOKE_RUNNER = python3 tests/run_game_smoke.py
 GAME_SMOKE_ARGS ?=
+MEMCARD_SMOKE_RUNNER = python3 tests/run_memcard_smoke.py
+MEMCARD_SMOKE_ARGS ?=
 
 .PHONY: all clean run run-exe run-exe-headless run-psxtest-cpu run-psxtest-gpu \
-        run-psxtest-cpx run-psxtest-gte debug smoke test-cpu-timing test-bus-policy test-scheduler test-timer test-gpu-timing test-cdrom test-disc test-sio test-gte test-dma \
+        run-psxtest-cpx run-psxtest-gte debug smoke test-cpu-timing test-cpu-cache test-bus-policy test-bus-timing test-scheduler test-timer test-gpu-timing test-cdrom test-disc test-sio test-gte test-dma \
         test-psx-list test-psx-all test-psx-cdrom test-psx-cpu test-psx-dma \
         test-psx-gpu test-psx-gte test-psx-gte-fuzz test-psx-input \
         test-psx-mdec test-psx-spu test-spu test-psx-timer-dump test-psx-timers \
         test-psx-psxtest-cpu test-psx-psxtest-cpx test-psx-psxtest-gpu \
-        test-psx-psxtest-gte test-psx-resolution test-psx-extras game-smoke
+        test-psx-psxtest-gte test-psx-resolution test-psx-extras game-smoke \
+        test-memcard-games
 
 all: $(TARGET)
 
@@ -110,11 +115,23 @@ test-cpu-timing: src/cpu_timing.c tests/cpu_timing_test.c
 	    -o tests/cpu_timing_test
 	./tests/cpu_timing_test
 
+test-cpu-cache: src/cpu_cache.c tests/cpu_cache_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
+	    tests/cpu_cache_test.c src/cpu_cache.c \
+	    -o tests/cpu_cache_test
+	./tests/cpu_cache_test
+
 test-bus-policy: src/bus_policy.c tests/bus_policy_test.c
 	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
 	    tests/bus_policy_test.c src/bus_policy.c \
 	    -o tests/bus_policy_test
 	./tests/bus_policy_test
+
+test-bus-timing: src/bus_timing.c tests/bus_timing_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
+	    tests/bus_timing_test.c src/bus_timing.c \
+	    -o tests/bus_timing_test
+	./tests/bus_timing_test
 
 test-scheduler: src/scheduler.c tests/scheduler_test.c
 	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
@@ -235,5 +252,8 @@ test-psx-extras: $(TARGET)
 game-smoke: $(TARGET)
 	$(GAME_SMOKE_RUNNER) $(GAME_SMOKE_ARGS)
 
+test-memcard-games: $(TARGET)
+	$(MEMCARD_SMOKE_RUNNER) $(MEMCARD_SMOKE_ARGS)
+
 clean:
-	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cpu_timing_test tests/bus_policy_test tests/scheduler_test tests/timer_test tests/gpu_timing_test tests/cdrom_test tests/disc_test tests/sio_test tests/gte_test tests/dma_test tests/spu_test
+	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cpu_timing_test tests/cpu_cache_test tests/bus_policy_test tests/bus_timing_test tests/scheduler_test tests/timer_test tests/gpu_timing_test tests/cdrom_test tests/disc_test tests/sio_test tests/gte_test tests/dma_test tests/spu_test

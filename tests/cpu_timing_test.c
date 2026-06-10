@@ -33,12 +33,12 @@ int main(void)
 {
     expect_cycles("sll", 0x00000000u, 2);
     expect_cycles("addiu-immediate-looks-like-load", 0x24000023u, 2);
-    expect_cycles("lw", 0x8C220000u, 4);
-    expect_cycles("sw", 0xAC220000u, 4);
-    expect_cycles("lwl", 0x88220003u, 4);
-    expect_cycles("swr", 0xB8220001u, 4);
-    expect_cycles("lwc2", 0xC8220000u, 4);
-    expect_cycles("swc2", 0xE8220000u, 4);
+    expect_cycles("lw-base", 0x8C220000u, 2);
+    expect_cycles("sw-base", 0xAC220000u, 2);
+    expect_cycles("lwl-base", 0x88220003u, 2);
+    expect_cycles("swr-base", 0xB8220001u, 2);
+    expect_cycles("lwc2-base", 0xC8220000u, 2);
+    expect_cycles("swc2-base", 0xE8220000u, 2);
     expect_value("mult-signed-small-positive", cpu_multiply_cycles_signed(0), 7);
     expect_value("mult-signed-small-negative", cpu_multiply_cycles_signed(UINT32_MAX), 7);
     expect_value("mult-signed-large", cpu_multiply_cycles_signed(0x40000000u), 15);

@@ -190,7 +190,7 @@ static void update_status(Mdec *mdec)
     else if (mdec->dma_out_enabled)
         status |= MDEC_STATUS_DATA_OUT_REQ;
 
-    if (mdec->receiving || mdec->out_count != 0)
+    if (mdec->receiving)
         status |= MDEC_STATUS_BUSY;
     if (mdec->dma_in_enabled && (!mdec->receiving || mdec->words_remaining > 0))
         status |= MDEC_STATUS_DATA_IN_REQ;
@@ -268,6 +268,8 @@ static size_t decode_block(const Mdec *mdec, size_t pos, const uint8_t *qt, int1
         else
             coeff[k] = val;
 
+        if (k >= 63)
+            break;
         if (pos >= mdec->param_half_count)
             break;
         n = mdec->params[pos++];
@@ -285,8 +287,6 @@ static size_t decode_block(const Mdec *mdec, size_t pos, const uint8_t *qt, int1
     int32_t tmp[64];
     for (int pass = 0; pass < 2; pass++)
     {
-        /* The hardware does not use identical fractional rounding in both IDCT
-         * passes. These biases match the PSX MDEC mono conformance patterns. */
         static const int64_t pass_bias[2] = {0x0580, 0x0D00};
         const int32_t *src = pass == 0 ? coeff : tmp;
         int32_t dst[64];
@@ -296,14 +296,78 @@ static size_t decode_block(const Mdec *mdec, size_t pos, const uint8_t *qt, int1
             {
                 int64_t sum = 0;
                 for (int z = 0; z < 8; z++)
-                    sum += (int64_t)src[y + z * 8] * div_floor_i32(mdec->scale[x + z * 8], 8);
-                dst[x + y * 8] = idct_round(sum, pass_bias[pass]);
+                    sum += (int64_t)src[y + z * 8] *
+                           div_floor_i32(mdec->scale[x + z * 8], 8);
+                dst[x + y * 8] =
+                    idct_round(sum, pass_bias[pass]);
             }
         }
         memcpy(tmp, dst, sizeof(tmp));
     }
     for (int i = 0; i < 64; i++)
         out[i] = (int16_t)clamp_i32(tmp[i], -256, 255);
+    return pos;
+}
+
+static size_t decode_color_block(const Mdec *mdec, size_t pos,
+                                 const uint8_t *qt, int16_t out[64])
+{
+    int32_t coeff[64] = {0};
+
+    while (pos < mdec->param_half_count && mdec->params[pos] == 0xFE00u)
+        pos++;
+    if (pos >= mdec->param_half_count)
+        return pos;
+
+    uint16_t n = mdec->params[pos++];
+    uint32_t q_scale = (n >> 10) & 0x3Fu;
+    int k = 0;
+    int32_t value = sign10(n) * (q_scale == 0 ? 2 : qt[0]);
+
+    for (;;)
+    {
+        value = clamp_i32(value, -0x400, 0x3FF);
+        coeff[q_scale > 0 ? zagzig[k] : k] = value;
+        if (k >= 63 || pos >= mdec->param_half_count)
+            break;
+
+        n = mdec->params[pos++];
+        if (n == 0xFE00u)
+            break;
+        k += (int)((n >> 10) & 0x3Fu) + 1;
+        if (k > 63)
+            break;
+        value = q_scale == 0
+                    ? sign10(n) * 2
+                    : (sign10(n) * (int32_t)qt[k] *
+                           (int32_t)q_scale +
+                       4) /
+                          8;
+    }
+
+    for (int y = 0; y < 8; y++)
+    {
+        for (int x = 0; x < 8; x++)
+        {
+            int64_t sum = 0;
+            for (int v = 0; v < 8; v++)
+            {
+                for (int u = 0; u < 8; u++)
+                {
+                    sum += (int64_t)coeff[u + v * 8] *
+                           mdec->scale[u * 8 + x] *
+                           mdec->scale[v * 8 + y];
+                }
+            }
+            int32_t sample =
+                (int32_t)((sum >> 32) + ((sum >> 31) & 1));
+            sample &= 0x1FF;
+            if (sample & 0x100)
+                sample -= 0x200;
+            out[x + y * 8] =
+                (int16_t)clamp_i32(sample, -128, 127);
+        }
+    }
     return pos;
 }
 
@@ -318,12 +382,12 @@ static uint8_t mono_sample(const Mdec *mdec, int16_t y)
     return (uint8_t)v;
 }
 
-static int32_t signed9_to_s8(int16_t v)
+static int32_t signed9(int16_t v)
 {
     int32_t x = v & 0x1FF;
     if (x & 0x100)
         x -= 0x200;
-    return clamp_i32(x, -128, 127);
+    return x;
 }
 
 static uint8_t mono_nibble(const Mdec *mdec, int16_t y)
@@ -367,9 +431,9 @@ static void output_mono(Mdec *mdec, const int16_t yblk[64])
 static void yuv_to_rgb(const Mdec *mdec, int16_t y, int16_t cr, int16_t cb,
                        uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    int32_t yy = signed9_to_s8(y);
-    int32_t rr_chroma = signed9_to_s8(cr);
-    int32_t bb_chroma = signed9_to_s8(cb);
+    int32_t yy = signed9(y);
+    int32_t rr_chroma = signed9(cr);
+    int32_t bb_chroma = signed9(cb);
     int32_t rr = yy + ((rr_chroma * 359 + 0x80) >> 8);
     int32_t gg = yy + ((((-bb_chroma * 88) & ~0x1F) + ((-rr_chroma * 183) & ~0x07) + 0x80) >> 8);
     int32_t bb = yy + ((bb_chroma * 454 + 0x80) >> 8);
@@ -475,6 +539,9 @@ static void decode_all(Mdec *mdec)
                 break;
             output_mono(mdec, y);
             pos = next;
+            if (pos < mdec->param_half_count &&
+                mdec->params[pos] == 0xFE00u)
+                break;
         }
         else
         {
@@ -482,12 +549,17 @@ static void decode_all(Mdec *mdec)
             for (int i = 0; i < 6; i++)
             {
                 mdec->current_block = (uint8_t)((i < 2) ? (4 + i) : (i - 2));
-                size_t next = decode_block(mdec, pos, i < 2 ? mdec->quant_uv : mdec->quant_y, blocks[i]);
+                size_t next = decode_color_block(
+                    mdec, pos, i < 2 ? mdec->quant_uv : mdec->quant_y,
+                    blocks[i]);
                 if (next <= pos)
                     goto done;
                 pos = next;
             }
             output_color(mdec, blocks);
+            if (pos < mdec->param_half_count &&
+                mdec->params[pos] == 0xFE00u)
+                break;
         }
     }
 done:

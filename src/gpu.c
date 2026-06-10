@@ -13,6 +13,9 @@
 #define MAX_PRIMITIVE_HEIGHT 512
 #define GPU_NTSC_LINES_PER_FRAME 263u
 #define GPU_PAL_LINES_PER_FRAME 314u
+#define GPU_NTSC_CLOCKS_PER_LINE 3413u
+#define GPU_PAL_CLOCKS_PER_LINE 3406u
+#define GPU_HBLANK_START_CLOCK 2560u
 
 static uint32_t g_trace_prims_limit = 0;
 static uint32_t g_trace_prims_count = 0;
@@ -274,6 +277,15 @@ static inline int32_t gpu_xy_x(uint32_t xy) { return gpu_coord11(xy); }
 static inline int32_t gpu_xy_y(uint32_t xy) { return gpu_coord11(xy >> 16); }
 static inline int32_t gpu_truncate_coord(int32_t v) { return gpu_coord11((uint32_t)v); }
 
+static TextureDepth texture_depth_decode(uint32_t bits)
+{
+    if ((bits & 3u) == 0)
+        return TEXTURE_DEPTH_4BIT;
+    if ((bits & 3u) == 1)
+        return TEXTURE_DEPTH_8BIT;
+    return TEXTURE_DEPTH_15BIT;
+}
+
 /* ---- Texture fetch ---- */
 typedef struct
 {
@@ -431,7 +443,33 @@ static void draw_pixel(Gpu *gpu, int32_t x, int32_t y, uint16_t color, bool semi
 
 /* ---- Software rasterizer ---- */
 
-#define FRAC 16
+#define GPU_ATTR_FRAC_BITS 12
+
+typedef struct
+{
+    int32_t origin_x;
+    int32_t origin_y;
+    int64_t origin;
+    int64_t step_x;
+    int64_t step_y;
+} GpuAttributePlane;
+
+static int64_t attribute_step(int64_t numerator, uint32_t denominator)
+{
+    if (numerator == 0)
+        return 0;
+
+    uint32_t shift = (uint32_t)__builtin_clz(denominator);
+    uint32_t normalized = denominator << shift;
+    uint32_t reciprocal = (uint32_t)(
+        ((1ULL << 62) + normalized - 1u) / normalized);
+    uint32_t product_shift = 62u - shift - GPU_ATTR_FRAC_BITS;
+    uint64_t magnitude = numerator < 0
+                             ? (uint64_t)(-numerator)
+                             : (uint64_t)numerator;
+    int64_t value = (int64_t)((magnitude * reciprocal) >> product_shift);
+    return numerator < 0 ? -value : value;
+}
 
 static int64_t edge_i64(int32_t ax, int32_t ay, int32_t bx, int32_t by, int32_t px, int32_t py)
 {
@@ -447,6 +485,48 @@ static bool edge_accepts_zero(int32_t ax, int32_t ay, int32_t bx, int32_t by, bo
 {
     return neg ? edge_is_top_left(bx, by, ax, ay)
                : edge_is_top_left(ax, ay, bx, by);
+}
+
+static GpuAttributePlane attribute_plane(int32_t x0, int32_t y0, int32_t a0,
+                                         int32_t x1, int32_t y1, int32_t a1,
+                                         int32_t x2, int32_t y2, int32_t a2)
+{
+    int64_t area =
+        (int64_t)(x1 - x0) * (y2 - y0) -
+        (int64_t)(y1 - y0) * (x2 - x0);
+    int64_t numerator_x =
+        (int64_t)(a1 - a0) * (y2 - y0) -
+        (int64_t)(a2 - a0) * (y1 - y0);
+    int64_t numerator_y =
+        (int64_t)(x1 - x0) * (a2 - a0) -
+        (int64_t)(x2 - x0) * (a1 - a0);
+    uint32_t denominator = (uint32_t)(area < 0 ? -area : area);
+    if (area < 0)
+    {
+        numerator_x = -numerator_x;
+        numerator_y = -numerator_y;
+    }
+    GpuAttributePlane plane = {
+        .origin_x = x0,
+        .origin_y = y0,
+        .origin = ((int64_t)a0 << GPU_ATTR_FRAC_BITS) +
+                  (1 << (GPU_ATTR_FRAC_BITS - 1)),
+        .step_x = attribute_step(numerator_x, denominator),
+        .step_y = attribute_step(numerator_y, denominator),
+    };
+    return plane;
+}
+
+static uint8_t attribute_plane_sample(const GpuAttributePlane *plane, int32_t x, int32_t y)
+{
+    int64_t value =
+        plane->origin +
+        (int64_t)(x - plane->origin_x) * plane->step_x +
+        (int64_t)(y - plane->origin_y) * plane->step_y;
+    if (value < 0)
+        return 0;
+    value >>= GPU_ATTR_FRAC_BITS;
+    return value > 255 ? 255 : (uint8_t)value;
 }
 
 /* Filled shaded triangle via scanline rasterization */
@@ -482,6 +562,9 @@ static void fill_triangle(Gpu *gpu,
     bool tl01 = edge_accepts_zero(x0, y0, x1, y1, neg);
     bool tl12 = edge_accepts_zero(x1, y1, x2, y2, neg);
     bool tl20 = edge_accepts_zero(x2, y2, x0, y0, neg);
+    GpuAttributePlane red = attribute_plane(x0, y0, r0, x1, y1, r1, x2, y2, r2);
+    GpuAttributePlane green = attribute_plane(x0, y0, g0, x1, y1, g1, x2, y2, g2);
+    GpuAttributePlane blue = attribute_plane(x0, y0, b0, x1, y1, b1, x2, y2, b2);
 
     for (int32_t y = min_y; y <= max_y; y++)
     {
@@ -502,9 +585,9 @@ static void fill_triangle(Gpu *gpu,
                   (w2 > 0 || (w2 == 0 && tl01))))
                 continue;
 
-            uint8_t cr = (uint8_t)((w0 * r0 + w1 * r1 + w2 * r2 + area / 2) / area);
-            uint8_t cg = (uint8_t)((w0 * g0 + w1 * g1 + w2 * g2 + area / 2) / area);
-            uint8_t cb = (uint8_t)((w0 * b0 + w1 * b1 + w2 * b2 + area / 2) / area);
+            uint8_t cr = attribute_plane_sample(&red, x, y);
+            uint8_t cg = attribute_plane_sample(&green, x, y);
+            uint8_t cb = attribute_plane_sample(&blue, x, y);
             uint16_t color = (dither && gpu->dithering)
                                  ? rgb_to_1555_dither(cr, cg, cb, x, y)
                                  : rgb_to_1555(cr, cg, cb);
@@ -549,6 +632,11 @@ static void fill_triangle_tex(Gpu *gpu,
     bool tl01 = edge_accepts_zero(sx0, sy0, sx1, sy1, neg);
     bool tl12 = edge_accepts_zero(sx1, sy1, sx2, sy2, neg);
     bool tl20 = edge_accepts_zero(sx2, sy2, sx0, sy0, neg);
+    GpuAttributePlane tex_u = attribute_plane(x0, y0, u0, x1, y1, u1, x2, y2, u2);
+    GpuAttributePlane tex_v = attribute_plane(x0, y0, v0, x1, y1, v1, x2, y2, v2);
+    GpuAttributePlane red = attribute_plane(x0, y0, r0, x1, y1, r1, x2, y2, r2);
+    GpuAttributePlane green = attribute_plane(x0, y0, g0, x1, y1, g1, x2, y2, g2);
+    GpuAttributePlane blue = attribute_plane(x0, y0, b0, x1, y1, b1, x2, y2, b2);
 
     for (int32_t y = min_y; y <= max_y; y++)
     {
@@ -571,11 +659,11 @@ static void fill_triangle_tex(Gpu *gpu,
                   (w2 > 0 || (w2 == 0 && tl01))))
                 continue;
 
-            uint8_t fu = (uint8_t)((w0 * u0 + w1 * u1 + w2 * u2 + (area - 1) / 2) / area);
-            uint8_t fv = (uint8_t)((w0 * v0 + w1 * v1 + w2 * v2 + (area - 1) / 2) / area);
-            uint8_t mcr = (uint8_t)((w0 * r0 + w1 * r1 + w2 * r2 + area / 2) / area);
-            uint8_t mcg = (uint8_t)((w0 * g0 + w1 * g1 + w2 * g2 + area / 2) / area);
-            uint8_t mcb = (uint8_t)((w0 * b0 + w1 * b1 + w2 * b2 + area / 2) / area);
+            uint8_t fu = attribute_plane_sample(&tex_u, x, y);
+            uint8_t fv = attribute_plane_sample(&tex_v, x, y);
+            uint8_t mcr = attribute_plane_sample(&red, x, y);
+            uint8_t mcg = attribute_plane_sample(&green, x, y);
+            uint8_t mcb = attribute_plane_sample(&blue, x, y);
             uint16_t texel = texel_fetch(gpu, cache, fu, fv);
             if (texel == 0)
                 continue; /* transparent */
@@ -649,6 +737,14 @@ static uint32_t gpu_status_odd_line(const Gpu *gpu)
 
 uint32_t gpu_status(const Gpu *gpu)
 {
+    bool idle =
+        gpu->busy_cycles == 0 &&
+        gpu->gp0_mode != GP0_MODE_IMAGE_STORE;
+    bool ready_vram_to_cpu =
+        gpu->gp0_mode == GP0_MODE_IMAGE_STORE &&
+        gpu->image_store_words_remaining > 0;
+    bool ready_dma_block = idle && gpu->gp0_mode != GP0_MODE_IMAGE_STORE;
+
     uint32_t r =
         ((uint32_t)gpu->page_base_x << 0) |
         ((uint32_t)gpu->page_base_y << 4) |
@@ -666,7 +762,9 @@ uint32_t gpu_status(const Gpu *gpu)
         ((uint32_t)gpu->interlaced << 22) |
         ((uint32_t)gpu->display_disabled << 23) |
         ((uint32_t)gpu->interrupt << 24) |
-        (1u << 26) | (1u << 27) | (1u << 28) |
+        ((uint32_t)idle << 26) |
+        ((uint32_t)ready_vram_to_cpu << 27) |
+        ((uint32_t)ready_dma_block << 28) |
         ((uint32_t)gpu->dma_direction << 29) |
         gpu_status_odd_line(gpu);
 
@@ -680,10 +778,10 @@ uint32_t gpu_status(const Gpu *gpu)
         dma_req = 1;
         break;
     case DMA_DIR_CPU_TO_GP0:
-        dma_req = (r >> 28) & 1;
+        dma_req = ready_dma_block;
         break;
     case DMA_DIR_VRAM_TO_CPU:
-        dma_req = (r >> 27) & 1;
+        dma_req = ready_vram_to_cpu;
         break;
     default:
         dma_req = 0;
@@ -739,8 +837,12 @@ static void draw_line(Gpu *gpu,
 
     if (k == 0)
     {
-        draw_pixel(gpu, gpu_truncate_coord(x0), gpu_truncate_coord(y0),
-                   rgb_to_1555(r0, g0, b0), semi);
+        int32_t x = gpu_truncate_coord(x0);
+        int32_t y = gpu_truncate_coord(y0);
+        uint16_t color = gpu->dithering
+                             ? rgb_to_1555_dither(r0, g0, b0, x, y)
+                             : rgb_to_1555(r0, g0, b0);
+        draw_pixel(gpu, x, y, color, semi);
         return;
     }
 
@@ -839,6 +941,78 @@ static inline bool gp0_polyline_terminator(uint32_t val)
     return (val & 0xF000F000u) == 0x50005000u;
 }
 
+void gpu_add_busy_cycles(Gpu *gpu, uint32_t cycles)
+{
+    if (UINT32_MAX - gpu->busy_cycles < cycles)
+        gpu->busy_cycles = UINT32_MAX;
+    else
+        gpu->busy_cycles += cycles;
+}
+
+uint32_t gpu_busy_cycles(const Gpu *gpu)
+{
+    return gpu->busy_cycles;
+}
+
+static uint32_t gp0_clamp_cost(uint64_t cycles)
+{
+    return cycles > 512u ? 512u : (uint32_t)cycles;
+}
+
+static uint32_t gp0_command_cost(const CommandBuffer *command)
+{
+    uint8_t op = (uint8_t)(command->buffer[0] >> 24);
+    uint32_t w;
+    uint32_t h;
+
+    switch (op)
+    {
+    case 0x02:
+        w = ((command->buffer[2] & 0x3FFu) + 15u) & ~15u;
+        h = (command->buffer[2] >> 16) & 0x1FFu;
+        return gp0_clamp_cost(23u + (4u + (w + 15u) / 16u) * (uint64_t)h);
+    case 0x20 ... 0x23:
+    case 0x28 ... 0x2B:
+        return 23u;
+    case 0x24 ... 0x27:
+    case 0x2C ... 0x2F:
+        return 113u;
+    case 0x30 ... 0x33:
+    case 0x38 ... 0x3B:
+        return 167u;
+    case 0x34 ... 0x37:
+    case 0x3C ... 0x3F:
+        return 248u;
+    case 0x40 ... 0x47:
+    case 0x50 ... 0x57:
+        return 8u;
+    case 0x60 ... 0x63:
+        w = command->buffer[2] & 0x3FFu;
+        h = (command->buffer[2] >> 16) & 0x1FFu;
+        return gp0_clamp_cost(8u + ((uint64_t)w / 2u) * h);
+    case 0x64 ... 0x67:
+        w = command->buffer[3] & 0x3FFu;
+        h = (command->buffer[3] >> 16) & 0x1FFu;
+        return gp0_clamp_cost(8u + ((uint64_t)w / 2u) * h);
+    case 0x68 ... 0x6F:
+        return 8u;
+    case 0x70 ... 0x77:
+        return 8u + 4u * 8u;
+    case 0x78 ... 0x7F:
+        return 8u + 8u * 16u;
+    case 0x80:
+        w = command->buffer[3] & 0x3FFu;
+        h = (command->buffer[3] >> 16) & 0x1FFu;
+        if (w == 0)
+            w = 1024;
+        if (h == 0)
+            h = 512;
+        return gp0_clamp_cost((uint64_t)w * h);
+    default:
+        return 0;
+    }
+}
+
 static void gp0_polyline_word(Gpu *gpu, uint32_t val)
 {
     if (!gpu->polyline_shaded)
@@ -862,6 +1036,7 @@ static void gp0_polyline_word(Gpu *gpu, uint32_t val)
                   x, y,
                   c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF,
                   gpu->polyline_semi);
+        gpu_add_busy_cycles(gpu, 8u);
         gpu->polyline_last_x = x;
         gpu->polyline_last_y = y;
         return;
@@ -901,6 +1076,7 @@ static void gp0_polyline_word(Gpu *gpu, uint32_t val)
               x, y,
               c1 & 0xFF, (c1 >> 8) & 0xFF, (c1 >> 16) & 0xFF,
               gpu->polyline_semi);
+    gpu_add_busy_cycles(gpu, 8u);
     gpu->polyline_last_x = x;
     gpu->polyline_last_y = y;
     gpu->polyline_last_color = c1;
@@ -1170,6 +1346,7 @@ void gpu_gp0(Gpu *gpu, uint32_t val)
                             gpu->drawing_area_left, gpu->drawing_area_top,
                             gpu->drawing_area_right, gpu->drawing_area_bottom);
             gpu->gp0_command_method(gpu);
+            gpu_add_busy_cycles(gpu, gp0_command_cost(&gpu->gp0_command));
         }
         break;
     case GP0_MODE_IMAGE_LOAD:
@@ -1243,23 +1420,11 @@ static void gp0_draw_mode(Gpu *gpu)
     gpu->page_base_x = v & 0x0F;
     gpu->page_base_y = (v >> 4) & 1;
     gpu->semi_transparency = (v >> 5) & 3;
-    switch ((v >> 7) & 3)
-    {
-    case 0:
-        gpu->texture_depth = TEXTURE_DEPTH_4BIT;
-        break;
-    case 1:
-        gpu->texture_depth = TEXTURE_DEPTH_8BIT;
-        break;
-    case 2:
-        gpu->texture_depth = TEXTURE_DEPTH_15BIT;
-        break;
-    default:
-        break;
-    }
+    gpu->texture_depth = texture_depth_decode(v >> 7);
     gpu->dithering = ((v >> 9) & 1) != 0;
     gpu->draw_to_display = ((v >> 10) & 1) != 0;
-    gpu->texture_disable = ((v >> 11) & 1) != 0;
+    gpu->texture_disable =
+        gpu->allow_texture_disable && ((v >> 11) & 1) != 0;
     gpu->rectangle_texture_x_flip = ((v >> 12) & 1) != 0;
     gpu->rectangle_texture_y_flip = ((v >> 13) & 1) != 0;
 }
@@ -1417,18 +1582,7 @@ static void gp0_triangle_tex_opaque(Gpu *gpu)
     uint16_t page_raw = (w3 >> 16) & 0xFFFF;
     gpu->page_base_x = page_raw & 0x0F;
     gpu->page_base_y = (page_raw >> 4) & 1;
-    switch ((page_raw >> 7) & 3)
-    {
-    case 0:
-        gpu->texture_depth = TEXTURE_DEPTH_4BIT;
-        break;
-    case 1:
-        gpu->texture_depth = TEXTURE_DEPTH_8BIT;
-        break;
-    case 2:
-        gpu->texture_depth = TEXTURE_DEPTH_15BIT;
-        break;
-    }
+    gpu->texture_depth = texture_depth_decode(page_raw >> 7);
 
     int32_t x2 = gpu_xy_x(w4), y2 = gpu_xy_y(w4);
     uint8_t u2 = w5 & 0xFF, v2 = (w5 >> 8) & 0xFF;
@@ -1474,18 +1628,7 @@ static void gp0_quad_tex_opaque(Gpu *gpu)
     uint16_t page_raw = (uint16_t)(w >> 16);
     gpu->page_base_x = page_raw & 0x0F;
     gpu->page_base_y = (page_raw >> 4) & 1;
-    switch ((page_raw >> 7) & 3)
-    {
-    case 0:
-        gpu->texture_depth = TEXTURE_DEPTH_4BIT;
-        break;
-    case 1:
-        gpu->texture_depth = TEXTURE_DEPTH_8BIT;
-        break;
-    case 2:
-        gpu->texture_depth = TEXTURE_DEPTH_15BIT;
-        break;
-    }
+    gpu->texture_depth = texture_depth_decode(page_raw >> 7);
 
     w = gpu->gp0_command.buffer[5];
     xs[2] = gpu_xy_x(w);
@@ -1546,18 +1689,7 @@ static void gp0_triangle_shaded_tex_opaque(Gpu *gpu)
     uint16_t page_raw = (uint16_t)(uv1p >> 16);
     gpu->page_base_x = page_raw & 0x0F;
     gpu->page_base_y = (page_raw >> 4) & 1;
-    switch ((page_raw >> 7) & 3)
-    {
-    case 0:
-        gpu->texture_depth = TEXTURE_DEPTH_4BIT;
-        break;
-    case 1:
-        gpu->texture_depth = TEXTURE_DEPTH_8BIT;
-        break;
-    case 2:
-        gpu->texture_depth = TEXTURE_DEPTH_15BIT;
-        break;
-    }
+    gpu->texture_depth = texture_depth_decode(page_raw >> 7);
 
     uint32_t c2 = gpu->gp0_command.buffer[6];
     uint8_t r2 = c2 & 0xFF, g2 = (c2 >> 8) & 0xFF, b2 = (c2 >> 16) & 0xFF;
@@ -1604,18 +1736,7 @@ static void gp0_quad_shaded_tex_opaque(Gpu *gpu)
             uint16_t pr = (uint16_t)(uv >> 16);
             gpu->page_base_x = pr & 0x0F;
             gpu->page_base_y = (pr >> 4) & 1;
-            switch ((pr >> 7) & 3)
-            {
-            case 0:
-                gpu->texture_depth = TEXTURE_DEPTH_4BIT;
-                break;
-            case 1:
-                gpu->texture_depth = TEXTURE_DEPTH_8BIT;
-                break;
-            case 2:
-                gpu->texture_depth = TEXTURE_DEPTH_15BIT;
-                break;
-            }
+            gpu->texture_depth = texture_depth_decode(pr >> 7);
         }
         apply_offset(gpu, &xs[i], &ys[i]);
     }
@@ -2039,6 +2160,9 @@ void gpu_gp1(Gpu *gpu, uint32_t val)
         gpu->interlaced = (val & 0x20) != 0;
         break;
     }
+    case 0x09:
+        gpu->allow_texture_disable = (val & 1u) != 0;
+        break;
     case 0x10:
         switch (val & 0x0F)
         {
@@ -2097,6 +2221,7 @@ static void gp1_reset(Gpu *gpu)
     gpu->texture_window_x_mask = gpu->texture_window_y_mask = 0;
     gpu->texture_window_x_offset = gpu->texture_window_y_offset = 0;
     gpu->dithering = gpu->draw_to_display = gpu->texture_disable = false;
+    gpu->allow_texture_disable = false;
     gpu->rectangle_texture_x_flip = gpu->rectangle_texture_y_flip = false;
     gpu->drawing_area_left = gpu->drawing_area_top = 0;
     gpu->drawing_area_right = gpu->drawing_area_bottom = 0;
@@ -2114,6 +2239,7 @@ static void gp1_reset(Gpu *gpu)
     gpu->display_line_start = 0x0010;
     gpu->display_line_end = 0x0100;
     gpu->display_depth = DISPLAY_DEPTH_15;
+    gpu->busy_cycles = 0;
     texture_clut_cache_invalidate(gpu);
     gp1_reset_command_buffer(gpu);
 }
@@ -2130,6 +2256,7 @@ static void gp1_reset_command_buffer(Gpu *gpu)
     gpu->polyline_last_y = 0;
     gpu->polyline_last_color = 0;
     gpu->polyline_next_color = 0;
+    gpu->busy_cycles = 0;
 }
 
 static uint32_t gpu_lines_per_frame(const Gpu *gpu)
@@ -2148,9 +2275,41 @@ static uint32_t gpu_dotclock_divider(const Gpu *gpu)
     return display_dotclock_divider(gpu);
 }
 
+static uint32_t gpu_clocks_per_line(const Gpu *gpu)
+{
+    return gpu->vmode == VMODE_PAL ? GPU_PAL_CLOCKS_PER_LINE
+                                   : GPU_NTSC_CLOCKS_PER_LINE;
+}
+
+static uint64_t gpu_hblank_phase(const Gpu *gpu)
+{
+    return (uint64_t)gpu_cpu_cycles_per_frame(gpu) *
+           GPU_HBLANK_START_CLOCK / gpu_clocks_per_line(gpu);
+}
+
+bool gpu_in_hblank(const Gpu *gpu)
+{
+    return gpu->hblank;
+}
+
 bool gpu_in_vblank(const Gpu *gpu)
 {
     return gpu->scanline >= 240u;
+}
+
+uint32_t gpu_cycles_until_timing_boundary(const Gpu *gpu)
+{
+    uint64_t target = gpu->hblank ? gpu_cpu_cycles_per_frame(gpu)
+                                  : gpu_hblank_phase(gpu);
+    if (gpu->line_phase >= target)
+        return 1;
+
+    uint64_t phase_left = target - gpu->line_phase;
+    uint32_t lines = gpu_lines_per_frame(gpu);
+    uint64_t cycles = (phase_left + lines - 1u) / lines;
+    if (cycles == 0)
+        return 1;
+    return cycles > UINT32_MAX ? UINT32_MAX : (uint32_t)cycles;
 }
 
 GpuTimingEvents gpu_step(Gpu *gpu, uint32_t cycles)
@@ -2160,17 +2319,38 @@ GpuTimingEvents gpu_step(Gpu *gpu, uint32_t cycles)
     uint32_t frame_cycles = gpu_cpu_cycles_per_frame(gpu);
     uint32_t dotclock_denominator = 7u * gpu_dotclock_divider(gpu);
 
+    if (gpu->busy_cycles > cycles)
+        gpu->busy_cycles -= cycles;
+    else
+        gpu->busy_cycles = 0;
+
     gpu->dotclock_phase += (uint64_t)cycles * 11u;
     events.dotclock_ticks = (uint32_t)(gpu->dotclock_phase / dotclock_denominator);
     gpu->dotclock_phase %= dotclock_denominator;
 
-    gpu->line_phase += (uint64_t)cycles * lines;
-    while (gpu->line_phase >= frame_cycles)
+    uint64_t phase_advance = (uint64_t)cycles * lines;
+    while (phase_advance > 0)
     {
-        gpu->line_phase -= frame_cycles;
-        gpu->scanline++;
-        events.hblank_count++;
+        uint64_t target = gpu->hblank ? frame_cycles : gpu_hblank_phase(gpu);
+        uint64_t phase_left = target - gpu->line_phase;
+        if (phase_advance < phase_left)
+        {
+            gpu->line_phase += phase_advance;
+            break;
+        }
 
+        gpu->line_phase = target;
+        phase_advance -= phase_left;
+        if (!gpu->hblank)
+        {
+            gpu->hblank = true;
+            events.hblank_count++;
+            continue;
+        }
+
+        gpu->line_phase = 0;
+        gpu->hblank = false;
+        gpu->scanline++;
         if (gpu->scanline == 240u)
             events.vblank_started = true;
         if (gpu->scanline >= lines)
@@ -2184,16 +2364,17 @@ GpuTimingEvents gpu_step(Gpu *gpu, uint32_t cycles)
     return events;
 }
 
-/* Called externally (e.g. from scheduler VBlank) to present the frame */
+void gpu_vblank_start(Gpu *gpu)
+{
+    if (gpu->interlaced)
+        gpu->field = (gpu->field == FIELD_TOP) ? FIELD_BOTTOM : FIELD_TOP;
+}
+
+/* Present the completed frame after the vertical blank interval. */
 void gpu_vblank(Gpu *gpu)
 {
     static bool dumped = false;
     static uint32_t frame_count = 0;
-
-    /* Toggle interlace field each VBlank so GPUSTAT bit 13 reflects the current
-       field. The BIOS checks this to decide which scanlines to draw into. */
-    if (gpu->interlaced)
-        gpu->field = (gpu->field == FIELD_TOP) ? FIELD_BOTTOM : FIELD_TOP;
 
     DisplayRect display = display_rect_from_gpu(gpu);
     uint16_t display_x = display.x;

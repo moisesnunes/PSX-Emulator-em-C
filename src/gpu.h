@@ -82,6 +82,7 @@ struct Gpu
     bool force_set_mask_bit;
     bool preserve_masked_pixels;
     Field field;
+    bool allow_texture_disable;
     bool texture_disable;
     bool rectangle_texture_x_flip;
     bool rectangle_texture_y_flip;
@@ -155,6 +156,8 @@ struct Gpu
     uint32_t scanline;
     uint64_t line_phase;
     uint64_t dotclock_phase;
+    uint32_t busy_cycles;
+    bool hblank;
     uint32_t frames;
 };
 
@@ -164,7 +167,12 @@ uint32_t gpu_read(Gpu *gpu);
 void gpu_gp0(Gpu *gpu, uint32_t val);
 void gpu_gp1(Gpu *gpu, uint32_t val);
 void gpu_gp1_reset_consecutive(void);
+void gpu_add_busy_cycles(Gpu *gpu, uint32_t cycles);
+uint32_t gpu_busy_cycles(const Gpu *gpu);
+uint32_t gpu_cycles_until_timing_boundary(const Gpu *gpu);
 GpuTimingEvents gpu_step(Gpu *gpu, uint32_t cycles);
+bool gpu_in_hblank(const Gpu *gpu);
 bool gpu_in_vblank(const Gpu *gpu);
+void gpu_vblank_start(Gpu *gpu);
 void gpu_vblank(Gpu *gpu);
 void gpu_destroy(Gpu *gpu);

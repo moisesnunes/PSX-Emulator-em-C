@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include "bus_timing.h"
 #include "cpu_timing.h"
 #include "gte.h"
 #include "log.h"
@@ -60,28 +61,57 @@ static inline void cpu_set_reg(Cpu *cpu, uint32_t idx, uint32_t val)
     cpu->out_regs[0] = 0;
 }
 
+static void cpu_add_bus_cycles(Cpu *cpu, uint32_t addr, unsigned width_bytes)
+{
+    uint32_t access_cycles = bus_access_cycles(addr, width_bytes);
+    if (access_cycles > 2)
+        cpu->extra_cycles += access_cycles - 2;
+}
+
 static uint32_t cpu_load32(Cpu *cpu, uint32_t addr)
 {
+    cpu_add_bus_cycles(cpu, addr, 4);
     return interconnect_load32(&cpu->inter, addr);
+}
+
+static uint32_t cpu_fetch32(Cpu *cpu, uint32_t addr)
+{
+    uint32_t value;
+    if (!cpu_icache_is_cacheable(addr))
+        return interconnect_load32(&cpu->inter, addr);
+    if (cpu_icache_lookup(&cpu->icache, addr, &value))
+        return value;
+
+    uint32_t line_addr = addr & ~0xFu;
+    uint32_t words[CPU_ICACHE_WORDS_PER_LINE];
+    for (uint32_t i = 0; i < CPU_ICACHE_WORDS_PER_LINE; i++)
+        words[i] = interconnect_load32(&cpu->inter, line_addr + i * 4u);
+    cpu_icache_fill(&cpu->icache, line_addr, words);
+    return words[(addr >> 2) & 3u];
 }
 static uint16_t cpu_load16(Cpu *cpu, uint32_t addr)
 {
+    cpu_add_bus_cycles(cpu, addr, 2);
     return interconnect_load16(&cpu->inter, addr);
 }
 static uint8_t cpu_load8(Cpu *cpu, uint32_t addr)
 {
+    cpu_add_bus_cycles(cpu, addr, 1);
     return interconnect_load8(&cpu->inter, addr);
 }
 static void cpu_store32(Cpu *cpu, uint32_t addr, uint32_t val)
 {
+    cpu_add_bus_cycles(cpu, addr, 4);
     interconnect_store32(&cpu->inter, addr, val);
 }
 static void cpu_store16(Cpu *cpu, uint32_t addr, uint16_t val)
 {
+    cpu_add_bus_cycles(cpu, addr, 2);
     interconnect_store16(&cpu->inter, addr, val);
 }
 static void cpu_store8(Cpu *cpu, uint32_t addr, uint8_t val)
 {
+    cpu_add_bus_cycles(cpu, addr, 1);
     interconnect_store8(&cpu->inter, addr, val);
 }
 
@@ -171,7 +201,7 @@ static uint32_t cpu_finish_instruction_cycles(Cpu *cpu, uint32_t base_cycles)
     return elapsed;
 }
 
-static void cpu_exception(Cpu *cpu, Exception cause)
+static void cpu_exception_with_ce(Cpu *cpu, Exception cause, uint32_t coprocessor)
 {
     uint32_t handler = (cpu->sr & (1 << 22)) ? 0xBFC00180 : 0x80000080;
     uint32_t mode = cpu->sr & 0x3F;
@@ -179,6 +209,8 @@ static void cpu_exception(Cpu *cpu, Exception cause)
     cpu->cause = (cpu->cause & 0x300u) |
                  ((uint32_t)cause << 2) |
                  cpu_external_irq_cause(cpu);
+    if (cause == EXC_COPROCESSOR_ERROR)
+        cpu->cause |= (coprocessor & 3u) << 28;
     cpu->epc = cpu->current_pc;
     if (cpu->delay_slot)
     {
@@ -189,6 +221,16 @@ static void cpu_exception(Cpu *cpu, Exception cause)
     cpu->next_pc = handler + 4;
     LOG(LOG_CPU, "exception cause=%u pc=0x%08X epc=0x%08X handler=0x%08X sr=0x%08X",
         cause, cpu->current_pc, cpu->epc, handler, cpu->sr);
+}
+
+static void cpu_exception(Cpu *cpu, Exception cause)
+{
+    cpu_exception_with_ce(cpu, cause, 0);
+}
+
+static void cpu_coprocessor_exception(Cpu *cpu, uint32_t coprocessor)
+{
+    cpu_exception_with_ce(cpu, EXC_COPROCESSOR_ERROR, coprocessor);
 }
 
 /* ---- Opcode handlers (forward declarations) ---- */
@@ -402,13 +444,18 @@ static void decode_and_execute(Cpu *cpu, uint32_t op)
         op_cop0(cpu, op);
         break;
     case 0x11:
-        cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
+        if (!(cpu->sr & (1u << 29)))
+            cpu_coprocessor_exception(cpu, 1);
         break;
     case 0x12:
-        op_cop2(cpu, op);
+        if (cpu->sr & (1u << 30))
+            op_cop2(cpu, op);
+        else
+            cpu_coprocessor_exception(cpu, 2);
         break;
     case 0x13:
-        cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
+        if (!(cpu->sr & (1u << 31)))
+            cpu_coprocessor_exception(cpu, 3);
         break;
     case 0x20:
         op_lb(cpu, op);
@@ -447,28 +494,34 @@ static void decode_and_execute(Cpu *cpu, uint32_t op)
         op_swr(cpu, op);
         break;
     case 0x30:
-        cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
+        cpu_coprocessor_exception(cpu, 0);
         break;
     case 0x31:
-        cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
+        cpu_coprocessor_exception(cpu, 1);
         break;
     case 0x32:
-        op_lwc2(cpu, op);
+        if (cpu->sr & (1u << 30))
+            op_lwc2(cpu, op);
+        else
+            cpu_coprocessor_exception(cpu, 2);
         break;
     case 0x33:
-        cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
+        cpu_coprocessor_exception(cpu, 3);
         break;
     case 0x38:
-        cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
+        cpu_coprocessor_exception(cpu, 0);
         break;
     case 0x39:
-        cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
+        cpu_coprocessor_exception(cpu, 1);
         break;
     case 0x3A:
-        op_swc2(cpu, op);
+        if (cpu->sr & (1u << 30))
+            op_swc2(cpu, op);
+        else
+            cpu_coprocessor_exception(cpu, 2);
         break;
     case 0x3B:
-        cpu_exception(cpu, EXC_COPROCESSOR_ERROR);
+        cpu_coprocessor_exception(cpu, 3);
         break;
     default:
         op_illegal(cpu, op);
@@ -499,6 +552,7 @@ int cpu_init(Cpu *cpu, const char *bios_path, SDL_Window *window, bool headless,
     cpu->branch = false;
     cpu->delay_slot = false;
     cpu->hle_bios_vectors = false;
+    cpu_icache_init(&cpu->icache);
     gte_init(&cpu->gte);
 
     return interconnect_init(&cpu->inter, bios_path, window, headless, disc_path);
@@ -553,7 +607,7 @@ uint32_t cpu_run_next_instruction(Cpu *cpu)
         memcpy(cpu->regs, cpu->out_regs, sizeof(cpu->regs));
         return 2;
     }
-    uint32_t op = cpu_load32(cpu, cpu->pc);
+    uint32_t op = cpu_fetch32(cpu, cpu->pc);
     cpu->pc = cpu->next_pc;
     cpu->next_pc = cpu->next_pc + 4;
     cpu->extra_cycles = 0;
@@ -632,8 +686,13 @@ static void op_mtc0(Cpu *cpu, uint32_t op)
         /* Breakpoint/cache registers are not implemented yet. */
         break;
     case 12:
+    {
+        bool entering_isolation = !(cpu->sr & 0x10000u) && (v & 0x10000u);
         cpu->sr = v;
+        if (entering_isolation)
+            cpu_icache_init(&cpu->icache);
         break;
+    }
     case 13:
         /* Only software interrupt pending bits are writable. */
         cpu->cause = (cpu->cause & ~0x300u) | (v & 0x300u);

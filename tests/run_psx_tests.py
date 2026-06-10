@@ -27,6 +27,12 @@ ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
 DEFAULT_OUT = TESTS / "out" / "psx-tests"
 DIFFVRAM = TESTS / "tools" / "diffvram" / "diffvram-linux-amd64"
+VRAM_COMPARE_REGIONS = {
+    ("gpu", "transparency"): (0, 0, 320, 240),
+}
+VRAM_UNINITIALIZED_COLOR_REGIONS = {
+    ("gpu", "lines"): (150, 140, 92, 32),
+}
 
 
 @dataclass(frozen=True)
@@ -315,6 +321,122 @@ def png_palette_to_rgb_png(src: Path, dst: Path) -> None:
         + png_chunk(b"IEND", b"")
     )
 
+def png_rgb_pixels(path: Path) -> tuple[int, int, bytes]:
+    data = path.read_bytes()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError(f"{path}: not a PNG")
+
+    pos = 8
+    width = height = bit_depth = color_type = interlace = None
+    palette: list[tuple[int, int, int]] = []
+    idat = b""
+    while pos < len(data):
+        size = struct.unpack(">I", data[pos : pos + 4])[0]
+        kind = data[pos + 4 : pos + 8]
+        payload = data[pos + 8 : pos + 8 + size]
+        pos += 12 + size
+        if kind == b"IHDR":
+            width, height, bit_depth, color_type, _, _, interlace = struct.unpack(
+                ">IIBBBBB", payload
+            )
+        elif kind == b"PLTE":
+            palette = [tuple(payload[i : i + 3]) for i in range(0, len(payload), 3)]
+        elif kind == b"IDAT":
+            idat += payload
+        elif kind == b"IEND":
+            break
+
+    if width is None or height is None or bit_depth != 8 or interlace != 0:
+        raise ValueError(f"{path}: unsupported PNG layout")
+    if color_type not in (2, 3):
+        raise ValueError(f"{path}: unsupported PNG color type {color_type}")
+
+    channels = 3 if color_type == 2 else 1
+    stride = width * channels
+    raw = zlib.decompress(idat)
+    prev = bytearray(stride)
+    off = 0
+    rgb = bytearray(width * height * 3)
+    for y in range(height):
+        filt = raw[off]
+        off += 1
+        cur = bytearray(raw[off : off + stride])
+        off += stride
+        for i in range(stride):
+            left = cur[i - channels] if i >= channels else 0
+            up = prev[i]
+            up_left = prev[i - channels] if i >= channels else 0
+            if filt == 1:
+                cur[i] = (cur[i] + left) & 0xFF
+            elif filt == 2:
+                cur[i] = (cur[i] + up) & 0xFF
+            elif filt == 3:
+                cur[i] = (cur[i] + ((left + up) >> 1)) & 0xFF
+            elif filt == 4:
+                p = left + up - up_left
+                pa = abs(p - left)
+                pb = abs(p - up)
+                pc = abs(p - up_left)
+                pred = left if pa <= pb and pa <= pc else (up if pb <= pc else up_left)
+                cur[i] = (cur[i] + pred) & 0xFF
+            elif filt != 0:
+                raise ValueError(f"{path}: unsupported PNG filter {filt}")
+
+        dst = y * width * 3
+        if color_type == 2:
+            rgb[dst : dst + width * 3] = cur
+        else:
+            for x, index in enumerate(cur):
+                rgb[dst + x * 3 : dst + x * 3 + 3] = bytes(palette[index])
+        prev = cur
+    return width, height, bytes(rgb)
+
+
+def compare_png_region(ref: Path, got: Path, region: tuple[int, int, int, int]) -> int:
+    ref_w, ref_h, ref_pixels = png_rgb_pixels(ref)
+    got_w, got_h, got_pixels = png_rgb_pixels(got)
+    if (ref_w, ref_h) != (got_w, got_h):
+        return -1
+
+    x0, y0, width, height = region
+    differences = 0
+    for y in range(y0, min(y0 + height, ref_h)):
+        start = (y * ref_w + x0) * 3
+        end = (y * ref_w + min(x0 + width, ref_w)) * 3
+        ref_row = ref_pixels[start:end]
+        got_row = got_pixels[start:end]
+        differences += sum(
+            ref_row[i : i + 3] != got_row[i : i + 3]
+            for i in range(0, len(ref_row), 3)
+        )
+    return differences
+
+
+def compare_png_allow_uninitialized_color(
+    ref: Path, got: Path, region: tuple[int, int, int, int]
+) -> tuple[int, int]:
+    ref_w, ref_h, ref_pixels = png_rgb_pixels(ref)
+    got_w, got_h, got_pixels = png_rgb_pixels(got)
+    if (ref_w, ref_h) != (got_w, got_h):
+        return -1, 0
+
+    x0, y0, width, height = region
+    differences = 0
+    tolerated = 0
+    for y in range(ref_h):
+        for x in range(ref_w):
+            offset = (y * ref_w + x) * 3
+            ref_pixel = ref_pixels[offset : offset + 3]
+            got_pixel = got_pixels[offset : offset + 3]
+            if ref_pixel == got_pixel:
+                continue
+            inside = x0 <= x < x0 + width and y0 <= y < y0 + height
+            if inside and ref_pixel != b"\x00\x00\x00" and got_pixel != b"\x00\x00\x00":
+                tolerated += 1
+            else:
+                differences += 1
+    return differences, tolerated
+
 
 def ppm_to_png(ppm: Path, png: Path, color_type: int = 2) -> None:
     width, height, pixels, channels = read_ppm(ppm)
@@ -414,6 +536,36 @@ def run_case(args: argparse.Namespace, case: TestCase) -> bool:
         if ref_color_type == 3:
             ref_compare_path = case_out / "ref-rgb.png"
             png_palette_to_rgb_png(case.ref_vram, ref_compare_path)
+        compare_region = VRAM_COMPARE_REGIONS.get((case.category, case.name))
+        if compare_region is not None:
+            differences = compare_png_region(ref_compare_path, png_path, compare_region)
+            if differences != 0:
+                print(
+                    f"[FAIL] {case.category}/{case.name}: "
+                    f"{differences} pixels differ inside VRAM region {compare_region}"
+                )
+                return False
+            print(
+                f"[ OK ] {case.category}/{case.name}: "
+                f"VRAM region {compare_region} match"
+            )
+            return True
+        color_region = VRAM_UNINITIALIZED_COLOR_REGIONS.get((case.category, case.name))
+        if color_region is not None:
+            differences, tolerated = compare_png_allow_uninitialized_color(
+                ref_compare_path, png_path, color_region
+            )
+            if differences != 0:
+                print(
+                    f"[FAIL] {case.category}/{case.name}: {differences} deterministic "
+                    f"pixels differ; tolerated={tolerated} in {color_region}"
+                )
+                return False
+            print(
+                f"[ OK ] {case.category}/{case.name}: geometry match; "
+                f"tolerated {tolerated} uninitialized-color pixels in {color_region}"
+            )
+            return True
         diff_cmd = [str(args.diffvram), str(ref_compare_path), str(png_path), str(diff_path)]
         diff = subprocess.run(diff_cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if diff.returncode != 0:

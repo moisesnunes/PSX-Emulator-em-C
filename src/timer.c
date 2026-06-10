@@ -4,17 +4,7 @@
 
 #define OVERFLOW_TICKS 0x10000u
 
-/*
- * Clock source encoding per timer (TMODE_CLK_SRC bits 9:8):
- *
- *  Timer 0:  0/2 = system clock   1/3 = dotclock  (no /8; treat as 1:1)
- *  Timer 1:  0/2 = system clock   1/3 = hblank    (hblank not counted here; treat as 1:1)
- *  Timer 2:  0/1 = system clock   2/3 = system/8
- *
- * For Timer 0/1 external sources (dotclock, hblank) we still use system
- * cycles but at 1:1 — accurate emulation would require pixel/line tracking.
- * For Timer 2 /8 we accumulate a remainder to avoid losing sub-cycle ticks.
- */
+/* Timer0 uses system/dotclock, Timer1 system/HBlank, Timer2 system/system/8. */
 static bool timer2_div8(const TimerUnit *u)
 {
     uint32_t src = (u->mode & TMODE_CLK_SRC) >> 8;
@@ -95,6 +85,7 @@ void timers_store32(Timers *t, uint32_t offset, uint32_t val, Scheduler *sched)
         u->frac_rem = 0;
         u->fired = false;
         u->sync_started = false;
+        u->reset_pending = false;
         u->mode = (uint16_t)(val & 0x1FFF);
         u->mode &= (uint16_t)~(TMODE_TARGET_REACHED | TMODE_OVERFLOW_REACHED);
         /* IRQ bit starts high (not firing) */
@@ -175,16 +166,13 @@ static uint32_t timer_ticks(TimerUnit *u, int idx, uint32_t cycles,
     return cycles;
 }
 
-static uint32_t apply_sync_mode(TimerUnit *u, int idx, uint32_t ticks,
-                                uint32_t hblank_count, bool vblank_started,
-                                bool in_vblank)
+static uint32_t apply_sync_period(TimerUnit *u, int idx, uint32_t ticks,
+                                  bool in_hblank, bool in_vblank)
 {
     if (!(u->mode & TMODE_SYNC_ENABLE))
         return ticks;
 
     uint32_t sync_mode = (u->mode & TMODE_SYNC_MODE) >> 1;
-    bool sync_event = idx == 0 ? hblank_count != 0 : vblank_started;
-    bool in_sync_period = idx == 0 ? hblank_count != 0 : in_vblank;
     if (idx == 2)
     {
         if (sync_mode == 0 || sync_mode == 3)
@@ -192,34 +180,75 @@ static uint32_t apply_sync_mode(TimerUnit *u, int idx, uint32_t ticks,
         return ticks;
     }
 
+    bool in_sync_period = idx == 0 ? in_hblank : in_vblank;
     switch (sync_mode)
     {
     case 0: /* pause during HBlank/VBlank */
         return in_sync_period ? 0 : ticks;
     case 1: /* reset at HBlank/VBlank */
-        if (sync_event)
-            u->value = 0;
         return ticks;
     case 2: /* count only during HBlank/VBlank and reset at entry */
-        if (!sync_event)
-            return 0;
-        u->value = 0;
-        return ticks;
+        return in_sync_period ? ticks : 0;
     case 3: /* pause until first HBlank/VBlank, then free run */
-        if (!u->sync_started)
-        {
-            if (!sync_event)
-                return 0;
-            u->sync_started = true;
-        }
-        return ticks;
+        return u->sync_started ? ticks : 0;
     default:
         return ticks;
     }
 }
 
+static void apply_sync_edge(TimerUnit *u, int idx, bool sync_started)
+{
+    if (!(u->mode & TMODE_SYNC_ENABLE) || idx == 2 || !sync_started)
+        return;
+
+    uint32_t sync_mode = (u->mode & TMODE_SYNC_MODE) >> 1;
+    if (sync_mode == 1 || sync_mode == 2)
+    {
+        u->value = 0;
+        u->reset_pending = false;
+    }
+    else if (sync_mode == 3)
+    {
+        u->sync_started = true;
+    }
+}
+
+static void timer_advance(TimerUnit *u, int idx, uint32_t ticks, Irq *irq)
+{
+    while (ticks-- > 0)
+    {
+        if (u->reset_pending)
+        {
+            u->value = 0;
+            u->reset_pending = false;
+            continue;
+        }
+
+        uint16_t old_value = u->value;
+        u->value++;
+
+        bool target_hit = u->value == u->target;
+        if (target_hit)
+        {
+            u->mode |= TMODE_TARGET_REACHED;
+            if (u->mode & TMODE_IRQ_TARGET)
+                fire_irq(u, idx, irq);
+            if (u->mode & TMODE_RESET_TARGET)
+                u->reset_pending = true;
+        }
+
+        if (old_value == 0xFFFFu)
+        {
+            u->mode |= TMODE_OVERFLOW_REACHED;
+            if (u->mode & TMODE_IRQ_OVERFLOW)
+                fire_irq(u, idx, irq);
+        }
+    }
+}
+
 void timers_step(Timers *t, uint32_t cycles, uint32_t dotclock_ticks,
-                 uint32_t hblank_count, bool vblank_started, bool in_vblank,
+                 uint32_t hblank_count, bool in_hblank,
+                 bool vblank_started, bool in_vblank,
                  Irq *irq, Scheduler *sched)
 {
     (void)sched; /* scheduler not used for per-tick timer events */
@@ -229,49 +258,10 @@ void timers_step(Timers *t, uint32_t cycles, uint32_t dotclock_ticks,
         TimerUnit *u = &t->units[idx];
 
         uint32_t ticks = timer_ticks(u, idx, cycles, dotclock_ticks, hblank_count);
-        ticks = apply_sync_mode(u, idx, ticks, hblank_count,
-                                vblank_started, in_vblank);
+        ticks = apply_sync_period(u, idx, ticks, in_hblank, in_vblank);
+        timer_advance(u, idx, ticks, irq);
 
-        if (ticks == 0)
-            continue;
-
-        /* Counters always advance regardless of IRQ enable bits */
-        uint32_t new_val = (uint32_t)u->value + ticks;
-
-        /* --- Target match --- */
-        bool target_hit = false;
-        if (u->target > 0 && u->value < u->target && new_val >= u->target)
-        {
-            target_hit = true;
-            u->mode |= TMODE_TARGET_REACHED;
-            if (u->mode & TMODE_RESET_TARGET)
-            {
-                /* reset counter to 0 after target */
-                new_val = new_val - u->target;
-            }
-        }
-
-        /* --- Overflow --- */
-        bool overflow_hit = false;
-        if (new_val >= OVERFLOW_TICKS)
-        {
-            overflow_hit = true;
-            u->mode |= TMODE_OVERFLOW_REACHED;
-            new_val &= 0xFFFF;
-        }
-
-        u->value = (uint16_t)new_val;
-
-        /* --- Fire IRQ if enabled --- */
-        if (target_hit && (u->mode & TMODE_IRQ_TARGET))
-        {
-            LOG(LOG_IRQ, "Timer%d target IRQ val=%04X", idx, u->value);
-            fire_irq(u, idx, irq);
-        }
-        if (overflow_hit && (u->mode & TMODE_IRQ_OVERFLOW))
-        {
-            LOG(LOG_IRQ, "Timer%d overflow IRQ", idx);
-            fire_irq(u, idx, irq);
-        }
+        bool sync_edge = idx == 0 ? hblank_count != 0 : vblank_started;
+        apply_sync_edge(u, idx, sync_edge);
     }
 }

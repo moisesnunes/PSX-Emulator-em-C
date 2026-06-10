@@ -20,6 +20,7 @@ typedef struct
     Ram ram;
     uint8_t scratchpad[1024];
     uint32_t mem_control[9];
+    uint32_t cache_control;
     Dma dma;
     Gpu gpu;
     Spu spu;

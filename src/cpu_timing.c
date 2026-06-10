@@ -7,28 +7,8 @@ static uint32_t count_leading_zeroes(uint32_t value)
 
 uint32_t cpu_instruction_base_cycles(uint32_t instruction)
 {
-    uint32_t opcode = instruction >> 26;
-
-    switch (opcode)
-    {
-    case 0x20: /* LB */
-    case 0x21: /* LH */
-    case 0x22: /* LWL */
-    case 0x23: /* LW */
-    case 0x24: /* LBU */
-    case 0x25: /* LHU */
-    case 0x26: /* LWR */
-    case 0x28: /* SB */
-    case 0x29: /* SH */
-    case 0x2A: /* SWL */
-    case 0x2B: /* SW */
-    case 0x2E: /* SWR */
-    case 0x32: /* LWC2 */
-    case 0x3A: /* SWC2 */
-        return 4;
-    default:
-        return 2;
-    }
+    (void)instruction;
+    return 2;
 }
 
 uint32_t cpu_multiply_cycles_signed(uint32_t operand)
