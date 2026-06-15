@@ -471,22 +471,6 @@ static int64_t attribute_step(int64_t numerator, uint32_t denominator)
     return numerator < 0 ? -value : value;
 }
 
-static int64_t edge_i64(int32_t ax, int32_t ay, int32_t bx, int32_t by, int32_t px, int32_t py)
-{
-    return (int64_t)(px - ax) * (by - ay) - (int64_t)(py - ay) * (bx - ax);
-}
-
-static bool edge_is_top_left(int32_t ax, int32_t ay, int32_t bx, int32_t by)
-{
-    return (ay == by && ax > bx) || (ay < by);
-}
-
-static bool edge_accepts_zero(int32_t ax, int32_t ay, int32_t bx, int32_t by, bool neg)
-{
-    return neg ? edge_is_top_left(bx, by, ax, ay)
-               : edge_is_top_left(ax, ay, bx, by);
-}
-
 static GpuAttributePlane attribute_plane(int32_t x0, int32_t y0, int32_t a0,
                                          int32_t x1, int32_t y1, int32_t a1,
                                          int32_t x2, int32_t y2, int32_t a2)
@@ -517,7 +501,8 @@ static GpuAttributePlane attribute_plane(int32_t x0, int32_t y0, int32_t a0,
     return plane;
 }
 
-static uint8_t attribute_plane_sample(const GpuAttributePlane *plane, int32_t x, int32_t y)
+static uint8_t attribute_plane_sample(const GpuAttributePlane *plane,
+                                      int32_t x, int32_t y)
 {
     int64_t value =
         plane->origin +
@@ -527,6 +512,22 @@ static uint8_t attribute_plane_sample(const GpuAttributePlane *plane, int32_t x,
         return 0;
     value >>= GPU_ATTR_FRAC_BITS;
     return value > 255 ? 255 : (uint8_t)value;
+}
+
+static int64_t edge_i64(int32_t ax, int32_t ay, int32_t bx, int32_t by, int32_t px, int32_t py)
+{
+    return (int64_t)(px - ax) * (by - ay) - (int64_t)(py - ay) * (bx - ax);
+}
+
+static bool edge_is_top_left(int32_t ax, int32_t ay, int32_t bx, int32_t by)
+{
+    return (ay == by && ax > bx) || (ay < by);
+}
+
+static bool edge_accepts_zero(int32_t ax, int32_t ay, int32_t bx, int32_t by, bool neg)
+{
+    return neg ? edge_is_top_left(bx, by, ax, ay)
+               : edge_is_top_left(ax, ay, bx, by);
 }
 
 /* Filled shaded triangle via scanline rasterization */
@@ -562,9 +563,12 @@ static void fill_triangle(Gpu *gpu,
     bool tl01 = edge_accepts_zero(x0, y0, x1, y1, neg);
     bool tl12 = edge_accepts_zero(x1, y1, x2, y2, neg);
     bool tl20 = edge_accepts_zero(x2, y2, x0, y0, neg);
-    GpuAttributePlane red = attribute_plane(x0, y0, r0, x1, y1, r1, x2, y2, r2);
-    GpuAttributePlane green = attribute_plane(x0, y0, g0, x1, y1, g1, x2, y2, g2);
-    GpuAttributePlane blue = attribute_plane(x0, y0, b0, x1, y1, b1, x2, y2, b2);
+    GpuAttributePlane red =
+        attribute_plane(x0, y0, r0, x1, y1, r1, x2, y2, r2);
+    GpuAttributePlane green =
+        attribute_plane(x0, y0, g0, x1, y1, g1, x2, y2, g2);
+    GpuAttributePlane blue =
+        attribute_plane(x0, y0, b0, x1, y1, b1, x2, y2, b2);
 
     for (int32_t y = min_y; y <= max_y; y++)
     {
@@ -632,11 +636,10 @@ static void fill_triangle_tex(Gpu *gpu,
     bool tl01 = edge_accepts_zero(sx0, sy0, sx1, sy1, neg);
     bool tl12 = edge_accepts_zero(sx1, sy1, sx2, sy2, neg);
     bool tl20 = edge_accepts_zero(sx2, sy2, sx0, sy0, neg);
-    GpuAttributePlane tex_u = attribute_plane(x0, y0, u0, x1, y1, u1, x2, y2, u2);
-    GpuAttributePlane tex_v = attribute_plane(x0, y0, v0, x1, y1, v1, x2, y2, v2);
-    GpuAttributePlane red = attribute_plane(x0, y0, r0, x1, y1, r1, x2, y2, r2);
-    GpuAttributePlane green = attribute_plane(x0, y0, g0, x1, y1, g1, x2, y2, g2);
-    GpuAttributePlane blue = attribute_plane(x0, y0, b0, x1, y1, b1, x2, y2, b2);
+    GpuAttributePlane tex_u =
+        attribute_plane(x0, y0, u0, x1, y1, u1, x2, y2, u2);
+    GpuAttributePlane tex_v =
+        attribute_plane(x0, y0, v0, x1, y1, v1, x2, y2, v2);
 
     for (int32_t y = min_y; y <= max_y; y++)
     {
@@ -661,9 +664,9 @@ static void fill_triangle_tex(Gpu *gpu,
 
             uint8_t fu = attribute_plane_sample(&tex_u, x, y);
             uint8_t fv = attribute_plane_sample(&tex_v, x, y);
-            uint8_t mcr = attribute_plane_sample(&red, x, y);
-            uint8_t mcg = attribute_plane_sample(&green, x, y);
-            uint8_t mcb = attribute_plane_sample(&blue, x, y);
+            uint8_t mcr = (uint8_t)((w0 * r0 + w1 * r1 + w2 * r2 + area / 2) / area);
+            uint8_t mcg = (uint8_t)((w0 * g0 + w1 * g1 + w2 * g2 + area / 2) / area);
+            uint8_t mcb = (uint8_t)((w0 * b0 + w1 * b1 + w2 * b2 + area / 2) / area);
             uint16_t texel = texel_fetch(gpu, cache, fu, fv);
             if (texel == 0)
                 continue; /* transparent */
@@ -713,9 +716,6 @@ void gpu_init(Gpu *gpu, SDL_Window *window)
     gpu->dma_direction = DMA_DIR_OFF;
     gpu->hres = hres_from_fields(0, 0);
     gpu->gp0_mode = GP0_MODE_COMMAND;
-    gpu->scanline = 0;
-    gpu->line_phase = 0;
-    gpu->dotclock_phase = 0;
     if (window)
         renderer_init(&gpu->renderer, window);
 }
@@ -732,6 +732,7 @@ static uint32_t gpu_status_odd_line(const Gpu *gpu)
 {
     if (gpu->vres == VRES_480)
         return gpu->field == FIELD_TOP ? (1u << 31) : 0;
+
     return (gpu->scanline & 1u) ? (1u << 31) : 0;
 }
 
@@ -941,6 +942,76 @@ static inline bool gp0_polyline_terminator(uint32_t val)
     return (val & 0xF000F000u) == 0x50005000u;
 }
 
+static void gp0_polyline_word(Gpu *gpu, uint32_t val)
+{
+    if (!gpu->polyline_shaded)
+    {
+        if (gp0_polyline_terminator(val))
+        {
+            gpu->gp0_mode = GP0_MODE_COMMAND;
+            return;
+        }
+
+        int32_t x = gpu_xy_x(val);
+        int32_t y = gpu_xy_y(val);
+        apply_offset(gpu, &x, &y);
+        uint32_t c = gpu->polyline_last_color;
+        trace_prim("poly_mono seg (%d,%d)->(%d,%d) color=%02X,%02X,%02X",
+                   gpu->polyline_last_x, gpu->polyline_last_y, x, y,
+                   c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF);
+        draw_line(gpu,
+                  gpu->polyline_last_x, gpu->polyline_last_y,
+                  c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF,
+                  x, y,
+                  c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF,
+                  gpu->polyline_semi);
+        gpu_add_busy_cycles(gpu, 8u);
+        gpu->polyline_last_x = x;
+        gpu->polyline_last_y = y;
+        return;
+    }
+
+    if (gpu->polyline_expect_color)
+    {
+        if (gp0_polyline_terminator(val))
+        {
+            gpu->gp0_mode = GP0_MODE_COMMAND;
+            return;
+        }
+
+        gpu->polyline_next_color = val & 0x00FFFFFFu;
+        trace_prim("poly_shaded next_color raw=0x%08X rgb=%02X,%02X,%02X",
+                   val,
+                   gpu->polyline_next_color & 0xFF,
+                   (gpu->polyline_next_color >> 8) & 0xFF,
+                   (gpu->polyline_next_color >> 16) & 0xFF);
+        gpu->polyline_expect_color = false;
+        return;
+    }
+
+    int32_t x = gpu_xy_x(val);
+    int32_t y = gpu_xy_y(val);
+    apply_offset(gpu, &x, &y);
+    uint32_t c0 = gpu->polyline_last_color;
+    uint32_t c1 = gpu->polyline_next_color;
+    trace_prim("poly_shaded seg raw_v=0x%08X (%d,%d)->(%d,%d) c0=%02X,%02X,%02X c1=%02X,%02X,%02X",
+               val,
+               gpu->polyline_last_x, gpu->polyline_last_y, x, y,
+               c0 & 0xFF, (c0 >> 8) & 0xFF, (c0 >> 16) & 0xFF,
+               c1 & 0xFF, (c1 >> 8) & 0xFF, (c1 >> 16) & 0xFF);
+    draw_line(gpu,
+              gpu->polyline_last_x, gpu->polyline_last_y,
+              c0 & 0xFF, (c0 >> 8) & 0xFF, (c0 >> 16) & 0xFF,
+              x, y,
+              c1 & 0xFF, (c1 >> 8) & 0xFF, (c1 >> 16) & 0xFF,
+              gpu->polyline_semi);
+    gpu_add_busy_cycles(gpu, 8u);
+    gpu->polyline_last_x = x;
+    gpu->polyline_last_y = y;
+    gpu->polyline_last_color = c1;
+    gpu->polyline_expect_color = true;
+}
+
 void gpu_add_busy_cycles(Gpu *gpu, uint32_t cycles)
 {
     if (UINT32_MAX - gpu->busy_cycles < cycles)
@@ -1011,76 +1082,6 @@ static uint32_t gp0_command_cost(const CommandBuffer *command)
     default:
         return 0;
     }
-}
-
-static void gp0_polyline_word(Gpu *gpu, uint32_t val)
-{
-    if (!gpu->polyline_shaded)
-    {
-        if (gp0_polyline_terminator(val))
-        {
-            gpu->gp0_mode = GP0_MODE_COMMAND;
-            return;
-        }
-
-        int32_t x = gpu_xy_x(val);
-        int32_t y = gpu_xy_y(val);
-        apply_offset(gpu, &x, &y);
-        uint32_t c = gpu->polyline_last_color;
-        trace_prim("poly_mono seg (%d,%d)->(%d,%d) color=%02X,%02X,%02X",
-                   gpu->polyline_last_x, gpu->polyline_last_y, x, y,
-                   c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF);
-        draw_line(gpu,
-                  gpu->polyline_last_x, gpu->polyline_last_y,
-                  c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF,
-                  x, y,
-                  c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF,
-                  gpu->polyline_semi);
-        gpu_add_busy_cycles(gpu, 8u);
-        gpu->polyline_last_x = x;
-        gpu->polyline_last_y = y;
-        return;
-    }
-
-    if (gpu->polyline_expect_color)
-    {
-        if (gp0_polyline_terminator(val))
-        {
-            gpu->gp0_mode = GP0_MODE_COMMAND;
-            return;
-        }
-
-        gpu->polyline_next_color = val & 0x00FFFFFFu;
-        trace_prim("poly_shaded next_color raw=0x%08X rgb=%02X,%02X,%02X",
-                   val,
-                   gpu->polyline_next_color & 0xFF,
-                   (gpu->polyline_next_color >> 8) & 0xFF,
-                   (gpu->polyline_next_color >> 16) & 0xFF);
-        gpu->polyline_expect_color = false;
-        return;
-    }
-
-    int32_t x = gpu_xy_x(val);
-    int32_t y = gpu_xy_y(val);
-    apply_offset(gpu, &x, &y);
-    uint32_t c0 = gpu->polyline_last_color;
-    uint32_t c1 = gpu->polyline_next_color;
-    trace_prim("poly_shaded seg raw_v=0x%08X (%d,%d)->(%d,%d) c0=%02X,%02X,%02X c1=%02X,%02X,%02X",
-               val,
-               gpu->polyline_last_x, gpu->polyline_last_y, x, y,
-               c0 & 0xFF, (c0 >> 8) & 0xFF, (c0 >> 16) & 0xFF,
-               c1 & 0xFF, (c1 >> 8) & 0xFF, (c1 >> 16) & 0xFF);
-    draw_line(gpu,
-              gpu->polyline_last_x, gpu->polyline_last_y,
-              c0 & 0xFF, (c0 >> 8) & 0xFF, (c0 >> 16) & 0xFF,
-              x, y,
-              c1 & 0xFF, (c1 >> 8) & 0xFF, (c1 >> 16) & 0xFF,
-              gpu->polyline_semi);
-    gpu_add_busy_cycles(gpu, 8u);
-    gpu->polyline_last_x = x;
-    gpu->polyline_last_y = y;
-    gpu->polyline_last_color = c1;
-    gpu->polyline_expect_color = true;
 }
 
 void gpu_gp0(Gpu *gpu, uint32_t val)
@@ -2370,7 +2371,7 @@ void gpu_vblank_start(Gpu *gpu)
         gpu->field = (gpu->field == FIELD_TOP) ? FIELD_BOTTOM : FIELD_TOP;
 }
 
-/* Present the completed frame after the vertical blank interval. */
+/* Called externally (e.g. from scheduler VBlank) to present the frame */
 void gpu_vblank(Gpu *gpu)
 {
     static bool dumped = false;

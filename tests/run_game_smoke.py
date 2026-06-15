@@ -191,7 +191,7 @@ def run_case(case: GameCase, args: argparse.Namespace) -> GameResult:
     log_path = out_dir / "run.log"
     ppm_path = out_dir / "display.ppm"
     png_path = out_dir / "display.png"
-    trace_path = out_dir / "gpu_gte.jsonl"
+    trace_path = out_dir / "visual_trace.jsonl"
     for old_capture in (ppm_path, png_path, trace_path):
         try:
             old_capture.unlink()
@@ -210,13 +210,13 @@ def run_case(case: GameCase, args: argparse.Namespace) -> GameResult:
         if args.full_vram:
             env["PS1_DUMP_FULL_VRAM"] = "1"
     if args.trace_gpu_gte:
-        env["PS1_TRACE_GPU_GTE"] = str(trace_path)
+        env["PS1_TRACE_VISUAL"] = str(trace_path)
         if args.trace_limit:
-            env["PS1_TRACE_GPU_GTE_LIMIT"] = str(args.trace_limit)
+            env["PS1_TRACE_VISUAL_LIMIT"] = str(args.trace_limit)
         if args.trace_start_frame:
-            env["PS1_TRACE_GPU_GTE_START_FRAME"] = str(args.trace_start_frame)
+            env["PS1_TRACE_VISUAL_START_FRAME"] = str(args.trace_start_frame)
         if args.trace_events:
-            env["PS1_TRACE_GPU_GTE_EVENTS"] = args.trace_events
+            env["PS1_TRACE_VISUAL_EVENTS"] = args.trace_events
 
     cmd = [
         str(args.emulator),
@@ -313,13 +313,13 @@ def main() -> int:
     parser.add_argument("--png-scale", type=int, default=2)
     parser.add_argument("--pad-script", default="")
     parser.add_argument("--pad-held", default="")
-    parser.add_argument("--trace-gpu-gte", action="store_true", help="Write per-game GPU/GTE JSONL traces")
-    parser.add_argument("--trace-limit", type=int, default=0, help="Maximum GPU/GTE trace rows per game")
-    parser.add_argument("--trace-start-frame", type=int, default=0, help="Skip GPU/GTE trace rows before this GPU frame")
+    parser.add_argument("--trace-gpu-gte", action="store_true", help="Write per-game visual JSONL traces")
+    parser.add_argument("--trace-limit", type=int, default=0, help="Maximum visual trace rows per game")
+    parser.add_argument("--trace-start-frame", type=int, default=0, help="Skip visual trace rows before this GPU frame")
     parser.add_argument(
         "--trace-events",
         default="",
-        help="Comma-separated GPU/GTE trace events to keep: frame,gp0,gte",
+        help="Comma-separated visual trace events to keep: frame,gp0,gte",
     )
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()

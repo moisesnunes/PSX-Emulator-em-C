@@ -30,6 +30,11 @@ bool cpu_icache_is_cacheable(uint32_t addr)
     return addr < 0xA0000000u && physical_address(addr) < RAM_MIRROR_END;
 }
 
+bool cpu_cache_isolation_blocks_store(uint32_t status, uint32_t addr)
+{
+    return (status & 0x00010000u) != 0 && cpu_icache_is_cacheable(addr);
+}
+
 bool cpu_icache_lookup(const CpuICache *cache, uint32_t addr, uint32_t *value)
 {
     if (!cpu_icache_is_cacheable(addr))

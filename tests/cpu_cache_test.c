@@ -34,6 +34,12 @@ int main(void)
     EXPECT_EQ(cpu_icache_is_cacheable(0x80001000u), 1);
     EXPECT_EQ(cpu_icache_is_cacheable(0xA0001000u), 0);
     EXPECT_EQ(cpu_icache_is_cacheable(0xBFC00000u), 0);
+    EXPECT_EQ(cpu_cache_isolation_blocks_store(0, 0x80001000u), 0);
+    EXPECT_EQ(cpu_cache_isolation_blocks_store(0x00010000u, 0x00001000u), 1);
+    EXPECT_EQ(cpu_cache_isolation_blocks_store(0x00010000u, 0x80001000u), 1);
+    EXPECT_EQ(cpu_cache_isolation_blocks_store(0x00010000u, 0xA0001000u), 0);
+    EXPECT_EQ(cpu_cache_isolation_blocks_store(0x00010000u, 0x1F800000u), 0);
+    EXPECT_EQ(cpu_cache_isolation_blocks_store(0x00010000u, 0xBFC00000u), 0);
     EXPECT_EQ(cpu_icache_lookup(&cache, 0x80001000u, &value), 0);
 
     cpu_icache_fill(&cache, 0x80001000u, words);

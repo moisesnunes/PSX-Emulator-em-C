@@ -19,6 +19,7 @@ typedef struct
 
 void cpu_icache_init(CpuICache *cache);
 bool cpu_icache_is_cacheable(uint32_t addr);
+bool cpu_cache_isolation_blocks_store(uint32_t status, uint32_t addr);
 bool cpu_icache_lookup(const CpuICache *cache, uint32_t addr, uint32_t *value);
 void cpu_icache_fill(CpuICache *cache, uint32_t line_addr,
                      const uint32_t words[CPU_ICACHE_WORDS_PER_LINE]);

@@ -10,8 +10,10 @@
 #define CDROM_ACK_DELAY (PS1_CPU_HZ / 1000)
 /* GetID / Init take a bit longer (~5 ms) */
 #define CDROM_CMD_DELAY (PS1_CPU_HZ / 200)
-/* SeekL completes after a nominal seek time (~20 ms) */
-#define CDROM_SEEK_DELAY (PS1_CPU_HZ / 50)
+#define CDROM_MIN_SEEK_DELAY 20000u
+#define CDROM_LONG_SEEK_SECTORS 7200u
+
+static uint32_t seek_delay_for_lba(const Cdrom *cd, uint32_t target_lba);
 
 #define XA_SECTOR_SUBHEADER_OFFSET 16u
 #define XA_SECTOR_DATA_OFFSET 24u
@@ -475,8 +477,14 @@ static void cmd_play(Cdrom *cd, Scheduler *sched)
 {
     if (cd->seek_pending)
     {
-        cd->cur_lba = msf_to_lba(cd->seek_target);
+        uint32_t target_lba = msf_to_lba(cd->seek_target);
+        cd->read_seek_delay = seek_delay_for_lba(cd, target_lba);
+        cd->cur_lba = target_lba;
         cd->seek_pending = false;
+    }
+    else
+    {
+        cd->read_seek_delay = 0;
     }
     cd->state = CDROM_STATE_READING;
     cd->playing_cdda = true;
@@ -537,21 +545,40 @@ static void cmd_setloc(Cdrom *cd, Scheduler *sched)
         cd->seek_target.m, cd->seek_target.s, cd->seek_target.f);
 }
 
+static uint32_t seek_delay_for_lba(const Cdrom *cd, uint32_t target_lba)
+{
+    uint32_t distance = cd->cur_lba > target_lba
+                            ? cd->cur_lba - target_lba
+                            : target_lba - cd->cur_lba;
+    uint64_t delay = (uint64_t)distance *
+                     (CDROM_CYCLES_PER_SECTOR_1X / 2000u);
+
+    if (distance >= CDROM_LONG_SEEK_SECTORS)
+        delay = PS1_CPU_HZ / 7u + (uint64_t)distance * 64u;
+    else if (delay < CDROM_MIN_SEEK_DELAY)
+        delay = CDROM_MIN_SEEK_DELAY;
+
+    uint32_t rotation = cd->double_speed ? CDROM_CYCLES_PER_SECTOR_2X
+                                         : CDROM_CYCLES_PER_SECTOR_1X;
+    delay += cd->state == CDROM_STATE_READING ? rotation / 2u : rotation;
+    return delay > UINT32_MAX ? UINT32_MAX : (uint32_t)delay;
+}
+
 /* SeekL (0x15):
    event 1 (SEEK_ACK phase)  → INT3 + seeking stat
    event 2 (SEEK_DONE phase) → INT2 + idle stat */
 static void cmd_seek(Cdrom *cd, Scheduler *sched, const char *name)
 {
-    if (cd->seek_pending)
-    {
-        cd->cur_lba = msf_to_lba(cd->seek_target);
-        cd->seek_pending = false;
-    }
+    cd->seek_lba = cd->seek_pending ? msf_to_lba(cd->seek_target)
+                                    : cd->cur_lba;
+    cd->seek_delay = seek_delay_for_lba(cd, cd->seek_lba);
+    cd->seek_pending = false;
     cd->state = CDROM_STATE_SEEKING;
     resp_clear(cd);
     resp_push(cd, make_stat(cd)); /* stat with SEEKING bit set */
     queue_event(cd, sched, CDROM_INT3, CDROM_PHASE_SEEK_ACK, CDROM_ACK_DELAY);
-    LOG(LOG_CDROM, "%s LBA=%u", name, cd->cur_lba);
+    LOG(LOG_CDROM, "%s LBA=%u->%u delay=%u", name, cd->cur_lba,
+        cd->seek_lba, cd->seek_delay);
 }
 
 static void cmd_seekl(Cdrom *cd, Scheduler *sched)
@@ -572,8 +599,14 @@ static void cmd_read(Cdrom *cd, uint8_t cmd, Scheduler *sched)
 {
     if (cd->seek_pending)
     {
-        cd->cur_lba = msf_to_lba(cd->seek_target);
+        uint32_t target_lba = msf_to_lba(cd->seek_target);
+        cd->read_seek_delay = seek_delay_for_lba(cd, target_lba);
+        cd->cur_lba = target_lba;
         cd->seek_pending = false;
+    }
+    else
+    {
+        cd->read_seek_delay = 0;
     }
     cd->state = CDROM_STATE_READING;
     cd->playing_cdda = false;
@@ -1007,18 +1040,20 @@ void cdrom_on_scheduler_event(Cdrom *cd, Irq *irq, Scheduler *sched)
         /* Deliver INT3 ack (seeking stat already in resp FIFO). */
         commit_irq(cd, irq, ev.int_type);
         log_irq_event(ev.int_type);
-        evq_push(&cd->evq, CDROM_INT2, CDROM_PHASE_SEEK_DONE, CDROM_SEEK_DELAY);
-        LOG(LOG_CDROM, "SeekL ack INT3, queued INT2 LBA=%u", cd->cur_lba);
+        evq_push(&cd->evq, CDROM_INT2, CDROM_PHASE_SEEK_DONE, cd->seek_delay);
+        LOG(LOG_CDROM, "Seek ack INT3, queued INT2 LBA=%u delay=%u",
+            cd->seek_lba, cd->seek_delay);
         break;
 
     case CDROM_PHASE_SEEK_DONE:
         /* Prepare and deliver INT2 seek-complete. */
+        cd->cur_lba = cd->seek_lba;
         cd->state = CDROM_STATE_IDLE;
         resp_clear(cd);
         resp_push(cd, make_stat(cd));
         commit_irq(cd, irq, ev.int_type);
         log_irq_event(ev.int_type);
-        LOG(LOG_CDROM, "SeekL complete INT2 LBA=%u", cd->cur_lba);
+        LOG(LOG_CDROM, "Seek complete INT2 LBA=%u", cd->cur_lba);
         break;
 
     case CDROM_PHASE_GETID_ACK:
@@ -1061,7 +1096,8 @@ void cdrom_on_scheduler_event(Cdrom *cd, Irq *irq, Scheduler *sched)
     case CDROM_PHASE_READTOC_ACK:
         commit_irq(cd, irq, ev.int_type);
         log_irq_event(ev.int_type);
-        evq_push(&cd->evq, CDROM_INT2, CDROM_PHASE_READTOC_DONE, CDROM_SEEK_DELAY);
+        evq_push(&cd->evq, CDROM_INT2, CDROM_PHASE_READTOC_DONE,
+                 PS1_CPU_HZ * 3u / 5u);
         break;
 
     case CDROM_PHASE_READTOC_DONE:
@@ -1096,7 +1132,12 @@ void cdrom_on_scheduler_event(Cdrom *cd, Irq *irq, Scheduler *sched)
         {
             uint32_t period = cd->double_speed ? CDROM_CYCLES_PER_SECTOR_2X
                                                : CDROM_CYCLES_PER_SECTOR_1X;
-            evq_push(&cd->evq, CDROM_INT1, CDROM_PHASE_SECTOR, period);
+            uint64_t first_sector_delay = (uint64_t)period + cd->read_seek_delay;
+            evq_push(&cd->evq, CDROM_INT1, CDROM_PHASE_SECTOR,
+                     first_sector_delay > UINT32_MAX
+                         ? UINT32_MAX
+                         : (uint32_t)first_sector_delay);
+            cd->read_seek_delay = 0;
         }
         LOG(LOG_CDROM, "ReadN ack INT3, queued sector LBA=%u", cd->cur_lba);
         break;

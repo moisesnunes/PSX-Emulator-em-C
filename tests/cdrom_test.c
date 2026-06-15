@@ -296,6 +296,96 @@ static void test_seekl(void)
     printf("ok\n");
 }
 
+static uint32_t prepare_seek(Cdrom *cd, Irq *irq, Scheduler *sched,
+                             uint8_t minute, uint8_t second, uint8_t frame)
+{
+    push_param(cd, minute, irq, sched);
+    push_param(cd, second, irq, sched);
+    push_param(cd, frame, irq, sched);
+    send_cmd(cd, 0x02, irq, sched);
+    run_until_quiet(cd, irq, sched, (uint64_t)PS1_CPU_HZ);
+    ack_cdrom_irq(cd, irq, sched);
+
+    uint32_t old_lba = cd->cur_lba;
+    send_cmd(cd, 0x15, irq, sched);
+    EXPECT_EQ(cd->cur_lba, old_lba);
+    EXPECT_TRUE(cd->seek_delay > 0);
+    return cd->seek_delay;
+}
+
+static void test_seek_timing_scales_with_distance(void)
+{
+    printf("test_seek_timing_scales_with_distance ... ");
+    Cdrom cd;
+    Irq irq;
+    Scheduler sched;
+    Disc disc;
+    setup(&cd, &irq, &sched, &disc);
+
+    uint32_t near_delay = prepare_seek(&cd, &irq, &sched, 0x00, 0x02, 0x01);
+    run_until_quiet(&cd, &irq, &sched, 2ULL * PS1_CPU_HZ);
+    ack_cdrom_irq(&cd, &irq, &sched);
+
+    cd.cur_lba = 0;
+    uint32_t far_delay = prepare_seek(&cd, &irq, &sched, 0x02, 0x00, 0x00);
+    EXPECT_TRUE(far_delay > near_delay);
+    EXPECT_EQ(cd.cur_lba, 0u);
+    run_until_quiet(&cd, &irq, &sched, 2ULL * PS1_CPU_HZ);
+    EXPECT_EQ(cd.cur_lba, msf_to_lba((Msf){0x02, 0x00, 0x00}));
+    printf("ok\n");
+}
+
+static void test_seek_timing_accounts_for_drive_state(void)
+{
+    printf("test_seek_timing_accounts_for_drive_state ... ");
+    Cdrom cd;
+    Irq irq;
+    Scheduler sched;
+    Disc disc;
+    setup(&cd, &irq, &sched, &disc);
+
+    uint32_t idle_delay = prepare_seek(&cd, &irq, &sched, 0x00, 0x03, 0x00);
+
+    setup(&cd, &irq, &sched, &disc);
+    cd.state = CDROM_STATE_READING;
+    uint32_t reading_delay = prepare_seek(&cd, &irq, &sched, 0x00, 0x03, 0x00);
+    EXPECT_TRUE(reading_delay < idle_delay);
+    printf("ok\n");
+}
+
+static void test_readn_first_sector_includes_seek(void)
+{
+    printf("test_readn_first_sector_includes_seek ... ");
+    Cdrom cd;
+    Irq irq;
+    Scheduler sched;
+    Disc disc;
+    setup(&cd, &irq, &sched, &disc);
+
+    push_param(&cd, 0x02, &irq, &sched);
+    push_param(&cd, 0x00, &irq, &sched);
+    push_param(&cd, 0x00, &irq, &sched);
+    send_cmd(&cd, 0x02, &irq, &sched);
+    run_until_quiet(&cd, &irq, &sched, (uint64_t)PS1_CPU_HZ);
+    ack_cdrom_irq(&cd, &irq, &sched);
+
+    send_cmd(&cd, 0x06, &irq, &sched);
+    uint32_t seek_delay = cd.read_seek_delay;
+    EXPECT_TRUE(seek_delay > 0);
+
+    uint32_t ack_cycles =
+        (uint32_t)(sched.events[EVENT_CDROM_IRQ].fire_at - sched.current_cycle);
+    uint32_t fired = scheduler_step(&sched, ack_cycles, &irq);
+    EXPECT_TRUE(fired & (1u << EVENT_CDROM_IRQ));
+    cdrom_on_scheduler_event(&cd, &irq, &sched);
+
+    EXPECT_EQ(cd.evq.count, 1u);
+    EXPECT_EQ(cd.evq.slots[cd.evq.head].phase, CDROM_PHASE_SECTOR);
+    EXPECT_EQ(cd.evq.slots[cd.evq.head].delay,
+              PS1_CPU_HZ / 75u + seek_delay);
+    printf("ok\n");
+}
+
 static void test_readn(void)
 {
     printf("test_readn ... ");
@@ -723,6 +813,9 @@ int main(void)
     printf("=== cdrom unit tests ===\n");
     test_getstat();
     test_seekl();
+    test_seek_timing_scales_with_distance();
+    test_seek_timing_accounts_for_drive_state();
+    test_readn_first_sector_includes_seek();
     test_readn();
     test_getid_no_disc();
     test_getid_disc();

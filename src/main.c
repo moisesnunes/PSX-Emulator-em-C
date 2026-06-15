@@ -673,8 +673,10 @@ int main(int argc, char **argv)
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
         window = SDL_CreateWindow("PSX",
                                   SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                  1024, 512,
-                                  SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+                                  960, 720,
+                                  SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN |
+                                      SDL_WINDOW_RESIZABLE |
+                                      SDL_WINDOW_ALLOW_HIGHDPI);
         if (!window)
         {
             fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());

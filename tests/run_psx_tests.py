@@ -33,6 +33,14 @@ VRAM_COMPARE_REGIONS = {
 VRAM_UNINITIALIZED_COLOR_REGIONS = {
     ("gpu", "lines"): (150, 140, 92, 32),
 }
+CASE_DUMP_FRAMES = {
+    ("mdec", "movie/movie-15bit"): 536,
+    ("mdec", "movie/movie-24bit"): 531,
+}
+CASE_MAX_INSTRUCTIONS = {
+    ("mdec", "movie/movie-15bit"): 180_000_000,
+    ("mdec", "movie/movie-24bit"): 180_000_000,
+}
 
 
 @dataclass(frozen=True)
@@ -44,7 +52,10 @@ class TestCase:
 
 
 def rel(path: Path) -> str:
-    return str(path.relative_to(ROOT))
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
 
 
 def find_tests() -> list[TestCase]:
@@ -348,7 +359,7 @@ def png_rgb_pixels(path: Path) -> tuple[int, int, bytes]:
 
     if width is None or height is None or bit_depth != 8 or interlace != 0:
         raise ValueError(f"{path}: unsupported PNG layout")
-    if color_type not in (2, 3):
+    if color_type not in (0, 2, 3):
         raise ValueError(f"{path}: unsupported PNG color type {color_type}")
 
     channels = 3 if color_type == 2 else 1
@@ -385,9 +396,12 @@ def png_rgb_pixels(path: Path) -> tuple[int, int, bytes]:
         dst = y * width * 3
         if color_type == 2:
             rgb[dst : dst + width * 3] = cur
-        else:
+        elif color_type == 3:
             for x, index in enumerate(cur):
                 rgb[dst + x * 3 : dst + x * 3 + 3] = bytes(palette[index])
+        else:
+            for x, value in enumerate(cur):
+                rgb[dst + x * 3 : dst + x * 3 + 3] = bytes((value, value, value))
         prev = cur
     return width, height, bytes(rgb)
 
@@ -491,12 +505,26 @@ def run_case(args: argparse.Namespace, case: TestCase) -> bool:
     png_path = case_out / "vram.png"
     diff_path = case_out / "diff.png"
     ref_compare_path = case.ref_vram
+    for stale in (
+        ppm_path,
+        png_path,
+        diff_path,
+        case_out / "diffvram.log",
+        case_out / "ref-rgb.png",
+    ):
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            pass
 
     env = os.environ.copy()
+    case_key = (case.category, case.name)
+    dump_frame = CASE_DUMP_FRAMES.get(case_key, args.dump_frame)
+    max_instructions = CASE_MAX_INSTRUCTIONS.get(case_key, args.max_instructions)
     if case.ref_vram and not args.no_diff:
         env["PS1_DUMP_VRAM_PPM"] = str(ppm_path)
         env["PS1_DUMP_FULL_VRAM"] = "1"
-        env["PS1_DUMP_FRAME"] = str(args.dump_frame)
+        env["PS1_DUMP_FRAME"] = str(dump_frame)
         if case.ref_vram and png_color_type(case.ref_vram) == 6 and png_rgba_has_variable_alpha(case.ref_vram):
             env["PS1_DUMP_STP_ALPHA"] = "1"
 
@@ -508,7 +536,7 @@ def run_case(args: argparse.Namespace, case: TestCase) -> bool:
         str(case.exe),
         "--headless",
         "--max-instructions",
-        str(args.max_instructions),
+        str(max_instructions),
     ]
 
     print(f"[RUN] {case.category}/{case.name}")
@@ -570,8 +598,17 @@ def run_case(args: argparse.Namespace, case: TestCase) -> bool:
         diff = subprocess.run(diff_cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if diff.returncode != 0:
             (case_out / "diffvram.log").write_bytes(diff.stdout)
+            ref_w, ref_h, ref_pixels = png_rgb_pixels(ref_compare_path)
+            got_w, got_h, got_pixels = png_rgb_pixels(png_path)
+            differences = -1
+            if (ref_w, ref_h) == (got_w, got_h):
+                differences = sum(
+                    ref_pixels[i : i + 3] != got_pixels[i : i + 3]
+                    for i in range(0, len(ref_pixels), 3)
+                )
             print(
                 f"[FAIL] {case.category}/{case.name}: VRAM differs "
+                f"pixels={differences} "
                 f"ref={rel(case.ref_vram)} got={rel(png_path)} diff={rel(diff_path)}"
             )
             return False

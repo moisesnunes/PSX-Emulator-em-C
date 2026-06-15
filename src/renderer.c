@@ -63,6 +63,31 @@ static GLuint make_program(void)
     return p;
 }
 
+void renderer_compute_viewport(int drawable_w, int drawable_h,
+                               int *x, int *y, int *w, int *h)
+{
+    if (drawable_w <= 0 || drawable_h <= 0)
+    {
+        *x = 0;
+        *y = 0;
+        *w = drawable_w > 0 ? drawable_w : 1;
+        *h = drawable_h > 0 ? drawable_h : 1;
+        return;
+    }
+
+    int viewport_w = drawable_w;
+    int viewport_h = drawable_h;
+    if ((int64_t)drawable_w * 3 > (int64_t)drawable_h * 4)
+        viewport_w = drawable_h * 4 / 3;
+    else
+        viewport_h = drawable_w * 3 / 4;
+
+    *x = (drawable_w - viewport_w) / 2;
+    *y = (drawable_h - viewport_h) / 2;
+    *w = viewport_w;
+    *h = viewport_h;
+}
+
 void renderer_init(Renderer *r, SDL_Window *window)
 {
     r->window = window;
@@ -136,6 +161,7 @@ void renderer_init(Renderer *r, SDL_Window *window)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glBindTexture(GL_TEXTURE_2D, 0);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 }
 
 void renderer_upload_frame(Renderer *r,
@@ -212,7 +238,16 @@ void renderer_upload_frame(Renderer *r,
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(quad), quad);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
+    int drawable_w, drawable_h;
+    int viewport_x, viewport_y, viewport_w, viewport_h;
+    SDL_GL_GetDrawableSize(r->window, &drawable_w, &drawable_h);
+    renderer_compute_viewport(drawable_w, drawable_h,
+                              &viewport_x, &viewport_y,
+                              &viewport_w, &viewport_h);
+
+    glViewport(0, 0, drawable_w, drawable_h);
     glClear(GL_COLOR_BUFFER_BIT);
+    glViewport(viewport_x, viewport_y, viewport_w, viewport_h);
     glUseProgram(r->program);
     glBindTexture(GL_TEXTURE_2D, r->texture);
     glBindVertexArray(r->vao);

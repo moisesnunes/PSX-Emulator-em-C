@@ -50,7 +50,9 @@ static void debug_trace_init(void)
     g_trace.initialized = true;
     g_trace.event_mask = TRACE_EVENT_ALL;
 
-    const char *path = getenv("PS1_TRACE_GPU_GTE");
+    const char *path = getenv("PS1_TRACE_VISUAL");
+    if (!path || !path[0])
+        path = getenv("PS1_TRACE_GPU_GTE");
     if (!path || !path[0])
         return;
 
@@ -68,13 +70,19 @@ static void debug_trace_init(void)
         }
     }
 
-    const char *limit = getenv("PS1_TRACE_GPU_GTE_LIMIT");
+    const char *limit = getenv("PS1_TRACE_VISUAL_LIMIT");
+    if (!limit || !limit[0])
+        limit = getenv("PS1_TRACE_GPU_GTE_LIMIT");
     if (limit && limit[0])
         g_trace.limit = strtoull(limit, NULL, 10);
-    const char *start_frame = getenv("PS1_TRACE_GPU_GTE_START_FRAME");
+    const char *start_frame = getenv("PS1_TRACE_VISUAL_START_FRAME");
+    if (!start_frame || !start_frame[0])
+        start_frame = getenv("PS1_TRACE_GPU_GTE_START_FRAME");
     if (start_frame && start_frame[0])
         g_trace.start_frame = (uint32_t)strtoul(start_frame, NULL, 10);
-    const char *events = getenv("PS1_TRACE_GPU_GTE_EVENTS");
+    const char *events = getenv("PS1_TRACE_VISUAL_EVENTS");
+    if (!events || !events[0])
+        events = getenv("PS1_TRACE_GPU_GTE_EVENTS");
     if (events && events[0])
     {
         uint32_t mask = 0;

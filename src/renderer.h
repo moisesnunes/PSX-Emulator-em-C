@@ -17,6 +17,9 @@ typedef struct
     uint8_t *rgb_buffer;
 } Renderer;
 
+void renderer_compute_viewport(int drawable_w, int drawable_h,
+                               int *x, int *y, int *w, int *h);
+
 void renderer_init(Renderer *r, SDL_Window *window);
 
 /* Upload VRAM and draw the PSX frame — does NOT call SwapWindow.

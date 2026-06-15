@@ -29,19 +29,19 @@ typedef enum
 /* What the event handler should do when it fires. */
 typedef enum
 {
-    CDROM_PHASE_ACK = 0,       /* deliver irq_type from queue, done */
-    CDROM_PHASE_INIT_ACK,      /* deliver INT3 init ack, enqueue complete */
-    CDROM_PHASE_INIT_DONE,     /* prepare idle stat and deliver INT2 */
-    CDROM_PHASE_SEEK_ACK,      /* deliver INT3 seek ack, enqueue seek-done */
-    CDROM_PHASE_SEEK_DONE,     /* prepare idle stat and deliver INT2 */
-    CDROM_PHASE_GETID_ACK,     /* deliver INT3 ID ack, enqueue ID result */
-    CDROM_PHASE_GETID_DONE,    /* prepare ID bytes and deliver INT2/INT5 */
-    CDROM_PHASE_READTOC_ACK,   /* deliver INT3 TOC ack, enqueue complete */
-    CDROM_PHASE_READTOC_DONE,  /* prepare idle stat and deliver INT2 */
-    CDROM_PHASE_PAUSE_ACK,     /* deliver INT3 pause ack, enqueue complete */
-    CDROM_PHASE_PAUSE_DONE,    /* prepare idle stat and deliver INT2 */
-    CDROM_PHASE_READ_DATA,     /* deliver INT3 ack, enqueue first SECTOR event */
-    CDROM_PHASE_SECTOR,        /* load + deliver one sector (INT1), re-enqueue self */
+    CDROM_PHASE_ACK = 0,      /* deliver irq_type from queue, done */
+    CDROM_PHASE_INIT_ACK,     /* deliver INT3 init ack, enqueue complete */
+    CDROM_PHASE_INIT_DONE,    /* prepare idle stat and deliver INT2 */
+    CDROM_PHASE_SEEK_ACK,     /* deliver INT3 seek ack, enqueue seek-done */
+    CDROM_PHASE_SEEK_DONE,    /* prepare idle stat and deliver INT2 */
+    CDROM_PHASE_GETID_ACK,    /* deliver INT3 ID ack, enqueue ID result */
+    CDROM_PHASE_GETID_DONE,   /* prepare ID bytes and deliver INT2/INT5 */
+    CDROM_PHASE_READTOC_ACK,  /* deliver INT3 TOC ack, enqueue complete */
+    CDROM_PHASE_READTOC_DONE, /* prepare idle stat and deliver INT2 */
+    CDROM_PHASE_PAUSE_ACK,    /* deliver INT3 pause ack, enqueue complete */
+    CDROM_PHASE_PAUSE_DONE,   /* prepare idle stat and deliver INT2 */
+    CDROM_PHASE_READ_DATA,    /* deliver INT3 ack, enqueue first SECTOR event */
+    CDROM_PHASE_SECTOR,       /* load + deliver one sector (INT1), re-enqueue self */
 } CdromPhase;
 
 /* One pending event: an INT type and what the handler should do with it. */
@@ -116,6 +116,9 @@ typedef struct
     /* ---- Seek target (from Setloc) ---- */
     Msf seek_target;
     bool seek_pending;
+    uint32_t seek_lba;
+    uint32_t seek_delay;
+    uint32_t read_seek_delay;
 
     /* ---- Current position ---- */
     uint32_t cur_lba;

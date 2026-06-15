@@ -101,16 +101,22 @@ static uint8_t cpu_load8(Cpu *cpu, uint32_t addr)
 }
 static void cpu_store32(Cpu *cpu, uint32_t addr, uint32_t val)
 {
+    if (cpu_cache_isolation_blocks_store(cpu->sr, addr))
+        return;
     cpu_add_bus_cycles(cpu, addr, 4);
     interconnect_store32(&cpu->inter, addr, val);
 }
 static void cpu_store16(Cpu *cpu, uint32_t addr, uint16_t val)
 {
+    if (cpu_cache_isolation_blocks_store(cpu->sr, addr))
+        return;
     cpu_add_bus_cycles(cpu, addr, 2);
     interconnect_store16(&cpu->inter, addr, val);
 }
 static void cpu_store8(Cpu *cpu, uint32_t addr, uint8_t val)
 {
+    if (cpu_cache_isolation_blocks_store(cpu->sr, addr))
+        return;
     cpu_add_bus_cycles(cpu, addr, 1);
     interconnect_store8(&cpu->inter, addr, val);
 }
@@ -638,8 +644,6 @@ static void op_ori(Cpu *cpu, uint32_t op)
 
 static void op_sw(Cpu *cpu, uint32_t op)
 {
-    if (cpu->sr & 0x10000)
-        return;
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     if (addr % 4 != 0)
     {
@@ -761,8 +765,6 @@ static void op_cop2(Cpu *cpu, uint32_t op)
 
 static void op_lwc2(Cpu *cpu, uint32_t op)
 {
-    if (cpu->sr & 0x10000)
-        return; /* cache isolated */
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     if (addr % 4 != 0)
     {
@@ -777,8 +779,6 @@ static void op_lwc2(Cpu *cpu, uint32_t op)
 
 static void op_swc2(Cpu *cpu, uint32_t op)
 {
-    if (cpu->sr & 0x10000)
-        return;
     cpu_stall_until_gte_complete(cpu);
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     if (addr % 4 != 0)
@@ -809,8 +809,6 @@ static void op_addi(Cpu *cpu, uint32_t op)
 
 static void op_lw(Cpu *cpu, uint32_t op)
 {
-    if (cpu->sr & 0x10000)
-        return;
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     if (addr % 4 != 0)
     {
@@ -834,8 +832,6 @@ static void op_addu(Cpu *cpu, uint32_t op)
 
 static void op_sh(Cpu *cpu, uint32_t op)
 {
-    if (cpu->sr & 0x10000)
-        return;
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     if (addr % 2 != 0)
     {
@@ -859,8 +855,6 @@ static void op_andi(Cpu *cpu, uint32_t op)
 
 static void op_sb(Cpu *cpu, uint32_t op)
 {
-    if (cpu->sr & 0x10000)
-        return;
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
     cpu_store8(cpu, addr, (uint8_t)cpu_reg(cpu, instr_t(op)));
 }
@@ -1243,9 +1237,9 @@ static void op_lwr(Cpu *cpu, uint32_t op)
 
 static void op_swl(Cpu *cpu, uint32_t op)
 {
-    if (cpu->sr & 0x10000)
-        return;
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
+    if (cpu_cache_isolation_blocks_store(cpu->sr, addr))
+        return;
     uint32_t v = cpu_reg(cpu, instr_t(op));
     uint32_t aligned = addr & ~3u;
     uint32_t mem = cpu_load32(cpu, aligned);
@@ -1272,9 +1266,9 @@ static void op_swl(Cpu *cpu, uint32_t op)
 
 static void op_swr(Cpu *cpu, uint32_t op)
 {
-    if (cpu->sr & 0x10000)
-        return;
     uint32_t addr = cpu_reg(cpu, instr_s(op)) + instr_imm_se(op);
+    if (cpu_cache_isolation_blocks_store(cpu->sr, addr))
+        return;
     uint32_t v = cpu_reg(cpu, instr_t(op));
     uint32_t aligned = addr & ~3u;
     uint32_t mem = cpu_load32(cpu, aligned);

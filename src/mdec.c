@@ -10,6 +10,14 @@
 #define MDEC_STATUS_DATA_IN_REQ (1u << 28)
 #define MDEC_STATUS_DATA_OUT_REQ (1u << 27)
 
+#ifndef MDEC_COLOR_IDCT_FIRST_PASS_BIAS
+#define MDEC_COLOR_IDCT_FIRST_PASS_BIAS 0x20000
+#endif
+#ifndef MDEC_COLOR_IDCT_SECOND_PASS_BIAS
+#define MDEC_COLOR_IDCT_SECOND_PASS_BIAS 0x20000
+#endif
+#define MDEC_COLOR_IDCT_SHIFT 18
+
 static const uint8_t zagzig[64] = {
     0,
     1,
@@ -75,6 +83,17 @@ static const uint8_t zagzig[64] = {
     55,
     62,
     63,
+};
+
+static const uint8_t color_zigzag[64] = {
+    0,  8,  1,  2,  9,  16, 24, 17,
+    10, 3,  4,  11, 18, 25, 32, 40,
+    33, 26, 19, 12, 5,  6,  13, 20,
+    27, 34, 41, 48, 56, 49, 42, 35,
+    28, 21, 14, 7,  15, 22, 29, 36,
+    43, 50, 57, 58, 51, 44, 37, 30,
+    23, 31, 38, 45, 52, 59, 60, 53,
+    46, 39, 47, 54, 61, 62, 55, 63,
 };
 
 static const int16_t default_scale[64] = {
@@ -166,17 +185,26 @@ static int32_t div_floor_i32(int32_t v, int32_t d)
     return -(((-v) + d - 1) / d);
 }
 
-static int32_t idct_round(int64_t sum, int64_t bias)
+static int32_t div_floor_i64(int64_t v, int64_t d)
 {
-    if (sum >= 0)
-        return (int32_t)((sum + bias) / 0x2000);
-    return -(int32_t)(((-sum) + bias) / 0x2000);
+    if (v >= 0)
+        return (int32_t)(v / d);
+    return -(int32_t)(((-v) + d - 1) / d);
+}
+
+static int32_t signed9(int16_t v)
+{
+    int32_t x = v & 0x1FF;
+    if (x & 0x100)
+        x -= 0x200;
+    return x;
 }
 
 static void push_output(Mdec *mdec, uint32_t word)
 {
     if (mdec->out_count >= MDEC_OUTPUT_WORD_CAP)
         return;
+    mdec->data_out_empty_delay = 0;
     mdec->output[mdec->out_write] = word;
     mdec->out_write = (mdec->out_write + 1u) % MDEC_OUTPUT_WORD_CAP;
     mdec->out_count++;
@@ -185,14 +213,21 @@ static void push_output(Mdec *mdec, uint32_t word)
 static void update_status(Mdec *mdec)
 {
     uint32_t status = 0;
-    if (mdec->out_count == 0)
+    bool data_in_full =
+        mdec->receiving &&
+        mdec->param_half_count + 2u > MDEC_PARAM_HALF_CAP;
+    if (mdec->out_count == 0 && mdec->dma_out_count == 0 &&
+        mdec->data_out_empty_delay == 0)
         status |= MDEC_STATUS_DATA_OUT_EMPTY;
     else if (mdec->dma_out_enabled)
         status |= MDEC_STATUS_DATA_OUT_REQ;
 
+    if (data_in_full)
+        status |= MDEC_STATUS_DATA_IN_FULL;
     if (mdec->receiving)
         status |= MDEC_STATUS_BUSY;
-    if (mdec->dma_in_enabled && (!mdec->receiving || mdec->words_remaining > 0))
+    if (mdec->dma_in_enabled && !data_in_full &&
+        (!mdec->receiving || mdec->words_remaining > 0))
         status |= MDEC_STATUS_DATA_IN_REQ;
     status |= ((uint32_t)mdec->output_depth & 3u) << 25;
     if (mdec->output_signed)
@@ -245,7 +280,44 @@ static void set_scale_table(Mdec *mdec)
         mdec->scale[i] = (int16_t)mdec->params[i];
 }
 
-static size_t decode_block(const Mdec *mdec, size_t pos, const uint8_t *qt, int16_t out[64])
+static int32_t idct_round(int64_t sum, int64_t bias)
+{
+    if (sum >= 0)
+        return (int32_t)((sum + bias) / 0x2000);
+    return -(int32_t)(((-sum) + bias) / 0x2000);
+}
+
+static void run_idct(const Mdec *mdec, const int32_t coeff[64],
+                     int16_t out[64], int32_t lo, int32_t hi,
+                     int64_t first_pass_bias, int64_t second_pass_bias)
+{
+    int32_t tmp[64];
+    for (int pass = 0; pass < 2; pass++)
+    {
+        const int64_t pass_bias =
+            pass == 0 ? first_pass_bias : second_pass_bias;
+        const int32_t *src = pass == 0 ? coeff : tmp;
+        int32_t dst[64];
+        for (int x = 0; x < 8; x++)
+        {
+            for (int y = 0; y < 8; y++)
+            {
+                int64_t sum = 0;
+                for (int z = 0; z < 8; z++)
+                    sum += (int64_t)src[y + z * 8] *
+                           div_floor_i32(mdec->scale[x + z * 8], 8);
+                dst[x + y * 8] = idct_round(sum, pass_bias);
+            }
+        }
+        memcpy(tmp, dst, sizeof(tmp));
+    }
+    for (int i = 0; i < 64; i++)
+        out[i] = (int16_t)clamp_i32(tmp[i], lo, hi);
+}
+
+static bool decode_block(const Mdec *mdec, size_t pos, const uint8_t *qt,
+                         bool input_complete, int16_t out[64],
+                         size_t *next_pos)
 {
     int32_t coeff[64];
     memset(coeff, 0, sizeof(coeff));
@@ -253,7 +325,7 @@ static size_t decode_block(const Mdec *mdec, size_t pos, const uint8_t *qt, int1
     while (pos < mdec->param_half_count && mdec->params[pos] == 0xFE00u)
         pos++;
     if (pos >= mdec->param_half_count)
-        return pos;
+        return false;
 
     uint16_t n = mdec->params[pos++];
     uint32_t q_scale = (n >> 10) & 0x3Fu;
@@ -271,7 +343,11 @@ static size_t decode_block(const Mdec *mdec, size_t pos, const uint8_t *qt, int1
         if (k >= 63)
             break;
         if (pos >= mdec->param_half_count)
+        {
+            if (!input_complete)
+                return false;
             break;
+        }
         n = mdec->params[pos++];
         if (n == 0xFE00u)
             break;
@@ -284,52 +360,44 @@ static size_t decode_block(const Mdec *mdec, size_t pos, const uint8_t *qt, int1
             val = div_floor_i32(sign10(n) * (int32_t)qt[k] * (int32_t)q_scale + 4, 8);
     }
 
-    int32_t tmp[64];
-    for (int pass = 0; pass < 2; pass++)
-    {
-        static const int64_t pass_bias[2] = {0x0580, 0x0D00};
-        const int32_t *src = pass == 0 ? coeff : tmp;
-        int32_t dst[64];
-        for (int x = 0; x < 8; x++)
-        {
-            for (int y = 0; y < 8; y++)
-            {
-                int64_t sum = 0;
-                for (int z = 0; z < 8; z++)
-                    sum += (int64_t)src[y + z * 8] *
-                           div_floor_i32(mdec->scale[x + z * 8], 8);
-                dst[x + y * 8] =
-                    idct_round(sum, pass_bias[pass]);
-            }
-        }
-        memcpy(tmp, dst, sizeof(tmp));
-    }
-    for (int i = 0; i < 64; i++)
-        out[i] = (int16_t)clamp_i32(tmp[i], -256, 255);
-    return pos;
+    run_idct(mdec, coeff, out, -256, 255, 0x0580, 0x0D00);
+    *next_pos = pos;
+    return true;
 }
 
-static size_t decode_color_block(const Mdec *mdec, size_t pos,
-                                 const uint8_t *qt, int16_t out[64])
+static bool decode_color_block(const Mdec *mdec, size_t pos,
+                               const uint8_t *qt, bool input_complete,
+                               int16_t out[64], size_t *next_pos)
 {
-    int32_t coeff[64] = {0};
+    int16_t coeff[64] = {0};
 
     while (pos < mdec->param_half_count && mdec->params[pos] == 0xFE00u)
         pos++;
     if (pos >= mdec->param_half_count)
-        return pos;
+        return false;
 
     uint16_t n = mdec->params[pos++];
     uint32_t q_scale = (n >> 10) & 0x3Fu;
     int k = 0;
-    int32_t value = sign10(n) * (q_scale == 0 ? 2 : qt[0]);
+    int32_t sample = sign10(n);
+    int32_t value =
+        q_scale == 0
+            ? sample * 32
+            : sample * (int32_t)qt[0] * 16 +
+                  (sample < 0 ? 8 : sample > 0 ? -8 : 0);
 
     for (;;)
     {
-        value = clamp_i32(value, -0x400, 0x3FF);
-        coeff[q_scale > 0 ? zagzig[k] : k] = value;
-        if (k >= 63 || pos >= mdec->param_half_count)
+        value = clamp_i32(value, -0x4000, 0x3FFF);
+        coeff[color_zigzag[k]] = (int16_t)value;
+        if (k >= 63)
             break;
+        if (pos >= mdec->param_half_count)
+        {
+            if (!input_complete)
+                return false;
+            break;
+        }
 
         n = mdec->params[pos++];
         if (n == 0xFE00u)
@@ -337,38 +405,57 @@ static size_t decode_color_block(const Mdec *mdec, size_t pos,
         k += (int)((n >> 10) & 0x3Fu) + 1;
         if (k > 63)
             break;
-        value = q_scale == 0
-                    ? sign10(n) * 2
-                    : (sign10(n) * (int32_t)qt[k] *
-                           (int32_t)q_scale +
-                       4) /
-                          8;
-    }
-
-    for (int y = 0; y < 8; y++)
-    {
-        for (int x = 0; x < 8; x++)
+        sample = sign10(n);
+        if (q_scale == 0)
         {
-            int64_t sum = 0;
-            for (int v = 0; v < 8; v++)
-            {
-                for (int u = 0; u < 8; u++)
-                {
-                    sum += (int64_t)coeff[u + v * 8] *
-                           mdec->scale[u * 8 + x] *
-                           mdec->scale[v * 8 + y];
-                }
-            }
-            int32_t sample =
-                (int32_t)((sum >> 32) + ((sum >> 31) & 1));
-            sample &= 0x1FF;
-            if (sample & 0x100)
-                sample -= 0x200;
-            out[x + y * 8] =
-                (int16_t)clamp_i32(sample, -128, 127);
+            value = sample * 32;
+        }
+        else
+        {
+            value = div_floor_i32(
+                        sample * (int32_t)qt[k] * (int32_t)q_scale,
+                        8) *
+                        16 +
+                    (sample < 0 ? 8 : sample > 0 ? -8 : 0);
         }
     }
-    return pos;
+
+    int16_t tmp[64];
+    for (int x = 0; x < 8; x++)
+    {
+        for (int y = 0; y < 8; y++)
+        {
+            int64_t sum = 0;
+            for (int z = 0; z < 8; z++)
+                sum += (int64_t)coeff[x * 8 + z] *
+                       mdec->scale[z * 8 + y];
+            tmp[y * 8 + x] =
+                (int16_t)div_floor_i64(
+                    sum + MDEC_COLOR_IDCT_FIRST_PASS_BIAS,
+                    1 << MDEC_COLOR_IDCT_SHIFT);
+        }
+    }
+    for (int x = 0; x < 8; x++)
+    {
+        for (int y = 0; y < 8; y++)
+        {
+            int64_t sum = 0;
+            for (int z = 0; z < 8; z++)
+                sum += (int64_t)tmp[x * 8 + z] *
+                       mdec->scale[z * 8 + y];
+            int32_t decoded =
+                div_floor_i64(
+                    sum + MDEC_COLOR_IDCT_SECOND_PASS_BIAS,
+                    1 << MDEC_COLOR_IDCT_SHIFT);
+            decoded &= 0x1FF;
+            if (decoded & 0x100)
+                decoded -= 0x200;
+            out[x * 8 + y] =
+                (int16_t)clamp_i32(decoded, -128, 127);
+        }
+    }
+    *next_pos = pos;
+    return true;
 }
 
 static uint8_t mono_sample(const Mdec *mdec, int16_t y)
@@ -380,14 +467,6 @@ static uint8_t mono_sample(const Mdec *mdec, int16_t y)
     if (!mdec->output_signed)
         v ^= 0x80;
     return (uint8_t)v;
-}
-
-static int32_t signed9(int16_t v)
-{
-    int32_t x = v & 0x1FF;
-    if (x & 0x100)
-        x -= 0x200;
-    return x;
 }
 
 static uint8_t mono_nibble(const Mdec *mdec, int16_t y)
@@ -434,9 +513,27 @@ static void yuv_to_rgb(const Mdec *mdec, int16_t y, int16_t cr, int16_t cb,
     int32_t yy = signed9(y);
     int32_t rr_chroma = signed9(cr);
     int32_t bb_chroma = signed9(cb);
-    int32_t rr = yy + ((rr_chroma * 359 + 0x80) >> 8);
-    int32_t gg = yy + ((((-bb_chroma * 88) & ~0x1F) + ((-rr_chroma * 183) & ~0x07) + 0x80) >> 8);
-    int32_t bb = yy + ((bb_chroma * 454 + 0x80) >> 8);
+    int32_t rr;
+    int32_t gg;
+    int32_t bb;
+    if (mdec->output_depth == 3)
+    {
+        rr = yy + ((rr_chroma * 1435) >> 10);
+        gg = yy + ((-bb_chroma * 351) >> 10) +
+             ((-rr_chroma * 731) >> 10);
+        bb = yy + ((bb_chroma * 1814) >> 10);
+    }
+    else
+    {
+        rr = yy + ((rr_chroma * 359 + 0x80) >> 8);
+        gg = yy + ((((-bb_chroma * 88) & ~0x1F) +
+                    ((-rr_chroma * 183) & ~0x07) + 0x80) >>
+                   8);
+        bb = yy + ((bb_chroma * 454 + 0x80) >> 8);
+        rr = signed9((int16_t)rr);
+        gg = signed9((int16_t)gg);
+        bb = signed9((int16_t)bb);
+    }
     rr = clamp_i32(rr, -128, 127);
     gg = clamp_i32(gg, -128, 127);
     bb = clamp_i32(bb, -128, 127);
@@ -484,35 +581,41 @@ static void output_color(Mdec *mdec, int16_t blocks[6][64])
 {
     uint8_t bytes[8];
     int byte_count = 0;
-    for (int py = 0; py < 16; py++)
+    for (int block = 0; block < 4; block++)
     {
-        for (int px = 0; px < 16; px++)
+        int block_x = (block & 1) * 8;
+        int block_y = (block >> 1) * 8;
+        for (int y = 0; y < 8; y++)
         {
-            int block = (px >= 8 ? 1 : 0) + (py >= 8 ? 2 : 0);
-            int x = px & 7;
-            int y = py & 7;
-            int yi = x + y * 8;
-            int ci = (px / 2) + (py / 2) * 8;
-            uint8_t r, g, b;
-            yuv_to_rgb(mdec, blocks[2 + block][yi], blocks[0][ci], blocks[1][ci], &r, &g, &b);
+            for (int x = 0; x < 8; x++)
+            {
+                int yi = x + y * 8;
+                int ci = ((x + block_x) / 2) +
+                         ((y + block_y) / 2) * 8;
+                uint8_t r, g, b;
+                yuv_to_rgb(mdec, blocks[2 + block][yi],
+                           blocks[0][ci], blocks[1][ci], &r, &g, &b);
 
-            if (mdec->output_depth == 3)
-            {
-                uint16_t pix = rgb_to_1555_mdec(r, g, b);
-                if (mdec->output_bit15)
-                    pix |= 0x8000u;
-                bytes[byte_count++] = (uint8_t)pix;
-                bytes[byte_count++] = (uint8_t)(pix >> 8);
-                if (byte_count == 4)
+                if (mdec->output_depth == 3)
                 {
-                    push_output(mdec, (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
-                                          ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24));
-                    byte_count = 0;
+                    uint16_t pix = rgb_to_1555_mdec(r, g, b);
+                    if (mdec->output_bit15)
+                        pix |= 0x8000u;
+                    bytes[byte_count++] = (uint8_t)pix;
+                    bytes[byte_count++] = (uint8_t)(pix >> 8);
+                    if (byte_count == 4)
+                    {
+                        push_output(mdec, (uint32_t)bytes[0] |
+                                              ((uint32_t)bytes[1] << 8) |
+                                              ((uint32_t)bytes[2] << 16) |
+                                              ((uint32_t)bytes[3] << 24));
+                        byte_count = 0;
+                    }
                 }
-            }
-            else
-            {
-                append_rgb_pixel(mdec, r, g, b, bytes, &byte_count);
+                else
+                {
+                    append_rgb_pixel(mdec, r, g, b, bytes, &byte_count);
+                }
             }
         }
     }
@@ -525,46 +628,56 @@ static void output_color(Mdec *mdec, int16_t blocks[6][64])
     }
 }
 
-static void decode_all(Mdec *mdec)
+static void decode_available(Mdec *mdec, bool input_complete)
 {
-    size_t pos = 0;
+    size_t pos = mdec->decode_half_pos;
     while (pos < mdec->param_half_count)
     {
         if (mdec->output_depth == 0 || mdec->output_depth == 1)
         {
             int16_t y[64];
             mdec->current_block = 4;
-            size_t next = decode_block(mdec, pos, mdec->quant_y, y);
-            if (next <= pos)
+            size_t next;
+            if (!decode_block(mdec, pos, mdec->quant_y, input_complete,
+                              y, &next))
                 break;
             output_mono(mdec, y);
             pos = next;
-            if (pos < mdec->param_half_count &&
-                mdec->params[pos] == 0xFE00u)
-                break;
+            mdec->decode_half_pos = pos;
         }
         else
         {
             int16_t blocks[6][64];
+            size_t macroblock_pos = pos;
             for (int i = 0; i < 6; i++)
             {
                 mdec->current_block = (uint8_t)((i < 2) ? (4 + i) : (i - 2));
-                size_t next = decode_color_block(
-                    mdec, pos, i < 2 ? mdec->quant_uv : mdec->quant_y,
-                    blocks[i]);
-                if (next <= pos)
+                size_t next;
+                if (!decode_color_block(
+                        mdec, pos,
+                        i < 2 ? mdec->quant_uv : mdec->quant_y,
+                        input_complete, blocks[i], &next))
+                {
+                    pos = macroblock_pos;
                     goto done;
+                }
                 pos = next;
             }
             output_color(mdec, blocks);
-            if (pos < mdec->param_half_count &&
-                mdec->params[pos] == 0xFE00u)
-                break;
+            mdec->decode_half_pos = pos;
         }
     }
 done:
-    mdec->receiving = false;
-    mdec->words_remaining = 0;
+    if (mdec->decode_half_pos > 0)
+    {
+        size_t remaining =
+            mdec->param_half_count - mdec->decode_half_pos;
+        memmove(mdec->params,
+                &mdec->params[mdec->decode_half_pos],
+                remaining * sizeof(mdec->params[0]));
+        mdec->param_half_count = remaining;
+        mdec->decode_half_pos = 0;
+    }
     mdec->current_block = 4;
     update_status(mdec);
 }
@@ -576,7 +689,9 @@ static void finish_command(Mdec *mdec)
     switch (mdec->active_command)
     {
     case 1:
-        decode_all(mdec);
+        decode_available(mdec, true);
+        mdec->receiving = false;
+        mdec->words_remaining = 0;
         break;
     case 2:
         set_quant_table(mdec);
@@ -603,6 +718,7 @@ static void start_command(Mdec *mdec, uint32_t word)
     mdec->output_signed = (word & (1u << 26)) != 0;
     mdec->output_bit15 = (word & (1u << 25)) != 0;
     mdec->param_half_count = 0;
+    mdec->decode_half_pos = 0;
 
     switch (mdec->active_command)
     {
@@ -632,10 +748,18 @@ uint32_t mdec_load32(Mdec *mdec, uint32_t off)
     switch (off)
     {
     case 0:
-        return mdec_dma_read(mdec);
+        return mdec_cpu_read(mdec);
     case 4:
         update_status(mdec);
-        return mdec->status;
+        {
+            uint32_t status = mdec->status;
+            if (mdec->data_out_empty_delay > 0)
+            {
+                mdec->data_out_empty_delay--;
+                update_status(mdec);
+            }
+            return status;
+        }
     default:
         return 0xFFFFFFFF;
     }
@@ -683,10 +807,14 @@ void mdec_dma_write(Mdec *mdec, uint32_t word)
     if (mdec->words_remaining == 0)
         finish_command(mdec);
     else
+    {
+        if (mdec->active_command == 1)
+            decode_available(mdec, false);
         update_status(mdec);
+    }
 }
 
-uint32_t mdec_dma_read(Mdec *mdec)
+static uint32_t pop_output(Mdec *mdec, bool delay_empty)
 {
     uint32_t word = 0;
     if (mdec->out_count > 0)
@@ -694,7 +822,79 @@ uint32_t mdec_dma_read(Mdec *mdec)
         word = mdec->output[mdec->out_read];
         mdec->out_read = (mdec->out_read + 1u) % MDEC_OUTPUT_WORD_CAP;
         mdec->out_count--;
+        if (delay_empty && mdec->out_count == 0)
+            mdec->data_out_empty_delay = 1;
     }
     update_status(mdec);
     return word;
+}
+
+uint32_t mdec_cpu_read(Mdec *mdec)
+{
+    return pop_output(mdec, true);
+}
+
+static bool stage_dma_macroblock(Mdec *mdec)
+{
+    if (mdec->output_depth != 2 && mdec->output_depth != 3)
+        return false;
+
+    const size_t bytes_per_pixel = mdec->output_depth == 3 ? 2u : 3u;
+    const size_t macroblock_bytes = 16u * 16u * bytes_per_pixel;
+    const size_t macroblock_words = macroblock_bytes / 4u;
+    if (mdec->out_count < macroblock_words)
+        return false;
+
+    uint8_t raw[16u * 16u * 3u];
+    uint8_t ordered[16u * 16u * 3u];
+    for (size_t i = 0; i < macroblock_words; i++)
+    {
+        uint32_t word = pop_output(mdec, false);
+        raw[i * 4u + 0u] = (uint8_t)word;
+        raw[i * 4u + 1u] = (uint8_t)(word >> 8);
+        raw[i * 4u + 2u] = (uint8_t)(word >> 16);
+        raw[i * 4u + 3u] = (uint8_t)(word >> 24);
+    }
+
+    for (size_t y = 0; y < 16u; y++)
+    {
+        for (size_t x = 0; x < 16u; x++)
+        {
+            size_t block = (x >= 8u ? 1u : 0u) +
+                           (y >= 8u ? 2u : 0u);
+            size_t source_pixel =
+                block * 64u + (y & 7u) * 8u + (x & 7u);
+            size_t destination_pixel = y * 16u + x;
+            memcpy(&ordered[destination_pixel * bytes_per_pixel],
+                   &raw[source_pixel * bytes_per_pixel],
+                   bytes_per_pixel);
+        }
+    }
+
+    for (size_t i = 0; i < macroblock_words; i++)
+    {
+        mdec->dma_output[i] =
+            (uint32_t)ordered[i * 4u + 0u] |
+            ((uint32_t)ordered[i * 4u + 1u] << 8) |
+            ((uint32_t)ordered[i * 4u + 2u] << 16) |
+            ((uint32_t)ordered[i * 4u + 3u] << 24);
+    }
+    mdec->dma_out_read = 0;
+    mdec->dma_out_count = macroblock_words;
+    update_status(mdec);
+    return true;
+}
+
+uint32_t mdec_dma_read(Mdec *mdec)
+{
+    if (mdec->output_depth == 2 || mdec->output_depth == 3)
+    {
+        if (mdec->dma_out_count == 0 && !stage_dma_macroblock(mdec))
+            return 0;
+        uint32_t word = mdec->dma_output[mdec->dma_out_read++];
+        mdec->dma_out_count--;
+        update_status(mdec);
+        return word;
+    }
+    return pop_output(mdec, false);
 }

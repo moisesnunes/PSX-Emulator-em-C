@@ -126,6 +126,29 @@ Every test runs as a headless PS-X EXE smoke test. Tests that include a
 reference `vram.png`/`vram-15bit.png`/`vram-24bit.png` also dump full VRAM and
 compare it with `tests/tools/diffvram/diffvram-linux-amd64`.
 
+The host-side incremental MDEC FIFO/status regression can be run with:
+
+```
+make test-mdec
+```
+
+The host-side Gouraud regression matrix can be run separately:
+
+```
+make test-gpu-gouraud
+```
+
+It drives the public GP0 command interface and covers both windings and all
+vertex permutations, flat-top/flat-bottom/thin/degenerate triangles, clipping,
+11-bit coordinate limits, shared edges, textured and untextured Gouraud,
+dithering, all four semi-transparency modes, 4/8/15-bit textures, STP, and
+destination mask-bit behavior. Permutations require identical coverage and
+allow at most one RGB555 level of interpolation rounding difference.
+
+This matrix is a deterministic regression suite, not a hardware
+certification. Bit-exact certification still requires raw VRAM references
+captured from documented PlayStation GPU revisions.
+
 Useful overrides:
 
 ```

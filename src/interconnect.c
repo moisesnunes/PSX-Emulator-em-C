@@ -200,32 +200,6 @@ static EventType dma_event_for_port(Port port)
     return (EventType)(EVENT_DMA0 + (int)port);
 }
 
-static uint32_t dma_completion_cycles(const Interconnect *inter, Port port,
-                                      uint32_t words)
-{
-    if (words == 0)
-        words = 1;
-
-    switch (port)
-    {
-    case PORT_MDEC_IN:
-        return words;
-    case PORT_MDEC_OUT:
-        return words * 6u + 32u;
-    case PORT_GPU:
-        return gpu_busy_cycles(&inter->gpu);
-    case PORT_CDROM:
-        return words * 24u;
-    case PORT_SPU:
-        return words * 2u;
-    case PORT_OTC:
-        return words + 16u;
-    case PORT_PIO:
-    default:
-        return words;
-    }
-}
-
 static void dma_reg_write(Interconnect *inter, uint32_t offset, uint32_t val)
 {
     uint32_t major = (offset & 0x70) >> 4;
@@ -592,9 +566,10 @@ static uint32_t do_dma_linked_list(Interconnect *inter, Port port)
 static void do_dma(Interconnect *inter, Port port)
 {
     uint32_t words;
+    Channel *ch = dma_channel(&inter->dma, port);
     bool linked_list =
         port != PORT_OTC &&
-        channel_sync(dma_channel(&inter->dma, port)) == SYNC_LINKED_LIST;
+        channel_sync(ch) == SYNC_LINKED_LIST;
     if (linked_list)
         words = do_dma_linked_list(inter, port);
     else
@@ -607,11 +582,7 @@ static void do_dma(Interconnect *inter, Port port)
         gpu_add_busy_cycles(&inter->gpu, transfer_cycles);
     }
 
-    uint32_t cycles = dma_completion_cycles(inter, port, words);
-    if (cycles == 0)
-        cycles = 1;
-    scheduler_schedule(&inter->scheduler, dma_event_for_port(port), cycles);
-    LOG(LOG_DMA, "DMA scheduled port=%d words=%u cycles=%u", port, words, cycles);
+    dma_finish(inter, ch, port);
 }
 
 void interconnect_on_scheduler_events(Interconnect *inter, uint32_t fired)

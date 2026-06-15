@@ -46,10 +46,10 @@ MEMCARD_SMOKE_RUNNER = python3 tests/run_memcard_smoke.py
 MEMCARD_SMOKE_ARGS ?=
 
 .PHONY: all clean run run-exe run-exe-headless run-psxtest-cpu run-psxtest-gpu \
-        run-psxtest-cpx run-psxtest-gte debug smoke test-cpu-timing test-cpu-cache test-bus-policy test-bus-timing test-scheduler test-timer test-gpu-timing test-cdrom test-disc test-sio test-gte test-dma \
+        run-psxtest-cpx run-psxtest-gte debug smoke test-cpu-timing test-cpu-cache test-bus-policy test-bus-timing test-scheduler test-timer test-gpu-timing test-gpu-gouraud test-renderer-viewport test-cdrom test-disc test-sio test-gte test-dma \
         test-psx-list test-psx-all test-psx-cdrom test-psx-cpu test-psx-dma \
         test-psx-gpu test-psx-gte test-psx-gte-fuzz test-psx-input \
-        test-psx-mdec test-psx-spu test-spu test-psx-timer-dump test-psx-timers \
+        test-mdec test-psx-mdec test-psx-spu test-spu test-psx-timer-dump test-psx-timers \
         test-psx-psxtest-cpu test-psx-psxtest-cpx test-psx-psxtest-gpu \
         test-psx-psxtest-gte test-psx-resolution test-psx-extras game-smoke \
         test-memcard-games
@@ -152,6 +152,20 @@ test-gpu-timing: src/gpu.c tests/gpu_timing_test.c
 	    -o tests/gpu_timing_test
 	./tests/gpu_timing_test
 
+test-gpu-gouraud: src/gpu.c tests/gpu_gouraud_test.c
+	$(CC) $(CFLAGS) -Isrc \
+	    tests/gpu_gouraud_test.c src/gpu.c src/renderer.c src/debug_trace.c src/log.c \
+	    $(LDFLAGS) \
+	    -o tests/gpu_gouraud_test
+	./tests/gpu_gouraud_test
+
+test-renderer-viewport: src/renderer.c tests/renderer_viewport_test.c
+	$(CC) $(CFLAGS) -Isrc \
+	    tests/renderer_viewport_test.c src/renderer.c \
+	    $(LDFLAGS) \
+	    -o tests/renderer_viewport_test
+	./tests/renderer_viewport_test
+
 test-cdrom: src/cdrom.c src/spu.c tests/cdrom_test.c
 	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc $(shell sdl2-config --cflags) \
 	    tests/cdrom_test.c src/cdrom.c src/spu.c \
@@ -182,6 +196,12 @@ test-dma: src/dma.c src/channel.c tests/dma_test.c
 	    tests/dma_test.c src/dma.c src/channel.c src/irq.c \
 	    -o tests/dma_test
 	./tests/dma_test
+
+test-mdec: src/mdec.c tests/mdec_test.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc \
+	    tests/mdec_test.c src/mdec.c src/log.c \
+	    -o tests/mdec_test
+	./tests/mdec_test
 
 test-spu: src/spu.c tests/spu_test.c
 	$(CC) -std=c11 -Wall -Wextra -O2 -Isrc $(shell sdl2-config --cflags) \
@@ -256,4 +276,4 @@ test-memcard-games: $(TARGET)
 	$(MEMCARD_SMOKE_RUNNER) $(MEMCARD_SMOKE_ARGS)
 
 clean:
-	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cpu_timing_test tests/cpu_cache_test tests/bus_policy_test tests/bus_timing_test tests/scheduler_test tests/timer_test tests/gpu_timing_test tests/cdrom_test tests/disc_test tests/sio_test tests/gte_test tests/dma_test tests/spu_test
+	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(TARGET)_debug tests/cpu_timing_test tests/cpu_cache_test tests/bus_policy_test tests/bus_timing_test tests/scheduler_test tests/timer_test tests/gpu_timing_test tests/gpu_gouraud_test tests/renderer_viewport_test tests/cdrom_test tests/disc_test tests/sio_test tests/gte_test tests/dma_test tests/mdec_test tests/spu_test
